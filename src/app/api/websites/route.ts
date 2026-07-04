@@ -50,8 +50,6 @@ export async function POST(request: Request) {
       });
     }
 
-    console.log(data);
-
     // Check if URL already exists
     const existingWebsite = await prisma.website.findFirst({
       where: { url: data.url },

@@ -1,0 +1,212 @@
+import { PrismaClient } from "@prisma/client";
+import { createHash } from "crypto";
+import { mkdir, writeFile } from "fs/promises";
+import path from "path";
+
+const prisma = new PrismaClient();
+const downloadTimeoutMs = 3000;
+const concurrency = 8;
+const publicCacheDir = path.join(process.cwd(), "public", "cached-thumbnails");
+const mapFile = path.join(
+  process.cwd(),
+  "src",
+  "lib",
+  "website",
+  "thumbnail-cache-map.ts"
+);
+
+type WebsiteAsset = {
+  id: number;
+  url: string;
+  thumbnail: string | null;
+  thumbnail_base64: string | null;
+};
+
+const contentTypeExtensions: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/svg+xml": "svg",
+  "image/x-icon": "ico",
+  "image/vnd.microsoft.icon": "ico",
+};
+
+function safeUrl(value: string | null | undefined): URL | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function dataUrlToAsset(dataUrl: string | null | undefined) {
+  if (!dataUrl?.startsWith("data:image/")) return null;
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) return null;
+
+  const contentType = match[1].toLowerCase();
+  const extension = contentTypeExtensions[contentType] || "png";
+  return {
+    bytes: Buffer.from(match[2], "base64"),
+    extension,
+  };
+}
+
+function cacheFileName(key: string, extension: string) {
+  const digest = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  return `${digest}.${extension}`;
+}
+
+function candidateUrls(websiteUrl: string, thumbnail: string | null) {
+  const urls: string[] = [];
+  const thumbnailUrl = safeUrl(thumbnail);
+  const website = safeUrl(websiteUrl);
+
+  if (thumbnailUrl) {
+    urls.push(thumbnailUrl.toString());
+  }
+
+  if (website) {
+    urls.push(new URL("/favicon.ico", website).toString());
+    urls.push(`https://icon.horse/icon/${website.hostname}`);
+  }
+
+  return urls;
+}
+
+async function fetchAsset(sourceUrl: string) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), downloadTimeoutMs);
+
+  try {
+    const response = await fetch(sourceUrl, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "askwalle-thumbnail-cache/1.0",
+        Accept: "image/avif,image/webp,image/png,image/jpeg,image/svg+xml,image/*,*/*;q=0.8",
+      },
+    });
+
+    if (!response.ok) return null;
+
+    const contentType = response.headers
+      .get("content-type")
+      ?.split(";")[0]
+      .trim()
+      .toLowerCase();
+
+    if (!contentType || !contentType.startsWith("image/")) return null;
+
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length === 0) return null;
+
+    return {
+      bytes,
+      extension: contentTypeExtensions[contentType] || "img",
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function writeAsset(key: string, bytes: Buffer, extension: string) {
+  const fileName = cacheFileName(key, extension);
+  const absolutePath = path.join(publicCacheDir, fileName);
+  await writeFile(absolutePath, bytes);
+  return `/cached-thumbnails/${fileName}`;
+}
+
+async function cacheWebsite(website: WebsiteAsset) {
+  const keys = new Set<string>([website.url]);
+  const thumbnailUrl = safeUrl(website.thumbnail)?.toString();
+  const urls = candidateUrls(website.url, website.thumbnail);
+  urls.forEach((url) => keys.add(url));
+
+  const dataAsset = dataUrlToAsset(website.thumbnail_base64);
+  if (dataAsset) {
+    const localPath = await writeAsset(website.url, dataAsset.bytes, dataAsset.extension);
+    return Array.from(keys).map((key) => [key, localPath] as const);
+  }
+
+  for (const sourceUrl of urls) {
+    const asset = await fetchAsset(sourceUrl);
+    if (!asset) continue;
+
+    const localPath = await writeAsset(sourceUrl, asset.bytes, asset.extension);
+    if (thumbnailUrl) keys.add(thumbnailUrl);
+    return Array.from(keys).map((key) => [key, localPath] as const);
+  }
+
+  return [];
+}
+
+async function main() {
+  await mkdir(publicCacheDir, { recursive: true });
+
+  const websites = await prisma.website.findMany({
+    select: {
+      id: true,
+      url: true,
+      thumbnail: true,
+      thumbnail_base64: true,
+    },
+    orderBy: {
+      id: "asc",
+    },
+  });
+
+  const mappings = new Map<string, string>();
+  let cached = 0;
+  let skipped = 0;
+
+  let index = 0;
+  async function worker() {
+    while (index < websites.length) {
+      const website = websites[index++];
+      const entries = await cacheWebsite(website);
+    if (entries.length === 0) {
+      skipped++;
+      continue;
+    }
+
+    cached++;
+    for (const [key, localPath] of entries) {
+      mappings.set(key, localPath);
+    }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, websites.length) }, () => worker())
+  );
+
+  const body = `// Generated by \`npm run cache-thumbnails\`.
+// Keys are known website, thumbnail, and favicon source URLs.
+export const thumbnailCacheMap: Record<string, string> = ${JSON.stringify(
+    Object.fromEntries([...mappings.entries()].sort(([a], [b]) => a.localeCompare(b))),
+    null,
+    2
+  )};
+
+export const thumbnailPlaceholder = "/cached-thumbnails/placeholder.svg";
+`;
+
+  await writeFile(mapFile, body);
+  console.log(`Thumbnail cache refreshed. Cached: ${cached}. Skipped: ${skipped}.`);
+}
+
+main()
+  .catch((error) => {
+    console.error("Thumbnail cache refresh failed:", error instanceof Error ? error.message : "Unknown error");
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+    process.exit(process.exitCode ?? 0);
+  });

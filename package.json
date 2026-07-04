@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "cache-thumbnails": "ts-node --project tsconfig.script.json scripts/cache-thumbnails.ts",
     "init-data": "ts-node --project tsconfig.script.json src/lib/utils/init-data.ts"
   },
   "dependencies": {

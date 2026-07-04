@@ -160,9 +160,9 @@ export default function WebsiteGrid({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             className={cn(
-              "grid gap-y-4 gap-x-3",
+              "grid gap-3",
               isCompact
-                ? "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+                ? "grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3"
                 : "grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
             )}
           >

@@ -1,9 +1,8 @@
 "use client";
 
-import { JSX, useState, useEffect } from "react";
-import { motion } from "framer-motion";
-import { Search, Globe, ChevronDown } from "lucide-react";
-import { Input } from "@/ui/common/input";
+import { JSX, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { ArrowUpRight, ChevronDown, Search, X } from "lucide-react";
 import { Button } from "@/ui/common/button";
 import {
   DropdownMenu,
@@ -11,6 +10,14 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/ui/common/dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/ui/common/select";
+import type { Category, Website } from "@/lib/types";
 
 interface SearchEngine {
   id: string;
@@ -67,29 +74,88 @@ interface SearchBoxProps {
   value: string;
   onChange: (value: string) => void;
   className?: string;
+  categories?: Category[];
+  websites?: Website[];
+  selectedCategory?: number | null;
+  onCategoryChange?: (categoryId: number | null) => void;
+  resultCount?: number;
+  totalCount?: number;
+  onSearchSubmit?: () => void;
 }
 
-export function SearchBox({ value, onChange, className }: SearchBoxProps) {
+export function SearchBox({
+  value,
+  onChange,
+  className,
+  categories = [],
+  websites = [],
+  selectedCategory = null,
+  onCategoryChange,
+  resultCount,
+  totalCount,
+  onSearchSubmit,
+}: SearchBoxProps) {
+  const router = useRouter();
   const [selectedEngine, setSelectedEngine] = useState<SearchEngine>(
     searchEngines[0]
   );
   const [localValue, setLocalValue] = useState(value);
+  const [isFocused, setIsFocused] = useState(false);
+  const hasDirectoryFilters =
+    selectedEngine.id === "local" && (!!localValue.trim() || !!selectedCategory);
+  const normalizedQuery = localValue.trim().toLowerCase();
+  const categoryById = useMemo(() => {
+    return new Map(categories.map((category) => [category.id, category]));
+  }, [categories]);
+  const suggestedTools = useMemo(() => {
+    if (!normalizedQuery) return [];
+
+    return websites
+      .filter((website) => {
+        const categoryName =
+          categoryById.get(website.category_id)?.name.toLowerCase() || "";
+        return (
+          website.title.toLowerCase().includes(normalizedQuery) ||
+          website.description.toLowerCase().includes(normalizedQuery) ||
+          categoryName.includes(normalizedQuery)
+        );
+      })
+      .sort((a, b) => b.visits - a.visits || b.likes - a.likes)
+      .slice(0, 5);
+  }, [websites, categoryById, normalizedQuery]);
+  const showSuggestions =
+    selectedEngine.id === "local" && isFocused && normalizedQuery.length > 0;
+
+  useEffect(() => {
+    if (selectedEngine.id === "local") {
+      setLocalValue(value);
+    }
+  }, [value, selectedEngine.id]);
 
   // 处理搜索引擎切换
   useEffect(() => {
     if (selectedEngine.id === "local") {
-      onChange(localValue); // 切换到站内搜索时，同步当前输入值
+      onChange(value); // 切换到站内搜索时保留外部传入值
     } else {
       onChange(""); // 切换到外部搜索时，清空站内搜索
     }
   }, [selectedEngine.id]);
 
   const handleSearch = () => {
-    if (!localValue.trim()) return;
-
     if (selectedEngine.id === "local") {
-      onChange(localValue); // 站内搜索
+      const query = localValue.trim();
+      if (!query) return;
+
+      onChange(query);
+      onSearchSubmit?.();
+      const params = new URLSearchParams();
+      if (selectedCategory) {
+        params.set("category", String(selectedCategory));
+      }
+      const suffix = params.toString() ? `?${params.toString()}` : "";
+      router.push(`/search/${encodeURIComponent(query)}${suffix}`);
     } else {
+      if (!localValue.trim()) return;
       // 外部搜索引擎
       window.open(
         selectedEngine.searchUrl + encodeURIComponent(localValue),
@@ -107,25 +173,36 @@ export function SearchBox({ value, onChange, className }: SearchBoxProps) {
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = e.target.value;
     setLocalValue(newValue);
-    if (selectedEngine.id === "local") {
-      onChange(newValue); // 只在站内搜索时实时更新
-    }
+  };
+
+  const handleCategoryChange = (value: string) => {
+    onCategoryChange?.(value === "all" ? null : Number(value));
+  };
+
+  const handleClear = () => {
+    setLocalValue("");
+    onChange("");
+    onCategoryChange?.(null);
+  };
+
+  const handleSuggestionSearch = (value: string) => {
+    setLocalValue(value);
+    onChange(value);
+    router.push(`/search/${encodeURIComponent(value)}`);
   };
 
   return (
-    <div className={`relative group max-w-2xl w-full mx-auto ${className}`}>
-      <div className="absolute -inset-1 bg-gradient-to-r from-blue-500 via-purple-500 to-pink-500 rounded-xl blur-2xl opacity-50 group-hover:opacity-75 transition duration-1000 group-hover:duration-200 animate-pulse"></div>
-
-      <div className="relative flex items-center gap-2 p-1.5 bg-background/80 dark:bg-background/40 backdrop-blur-xl rounded-xl border border-border/50 shadow-xl">
+    <div className={`relative mx-auto w-full max-w-3xl ${className}`}>
+      <div className="flex flex-col gap-2 rounded-lg border border-border/70 bg-background p-2 shadow-lg shadow-black/[0.04] transition-colors focus-within:border-primary/50 md:flex-row md:items-center md:p-1.5">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
               size="sm"
-              className="h-9 gap-2 px-2.5 md:px-3 hover:bg-background/60 data-[state=open]:bg-background/60 rounded-lg transition-colors"
+              className="h-10 w-full justify-start gap-2 rounded-md px-2.5 transition-colors hover:bg-muted data-[state=open]:bg-muted md:w-auto md:px-3"
             >
               {selectedEngine.icon}
-              <span className="hidden sm:inline font-medium text-sm">
+              <span className="font-medium text-sm">
                 {selectedEngine.name}
               </span>
               <ChevronDown className="h-3.5 w-3.5 opacity-50" />
@@ -146,26 +223,124 @@ export function SearchBox({ value, onChange, className }: SearchBoxProps) {
         </DropdownMenu>
 
         <div className="relative flex-1 min-w-0">
-          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground/50 group-hover:text-muted-foreground/70 transition-colors duration-300" />
+          <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
           <input
             type="text"
-            placeholder="搜索AI工具、教程、资源..."
+            placeholder="Search AI tools, categories, use cases..."
             value={localValue}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
-            className="w-full h-9 pl-9 pr-3 bg-transparent border-0 ring-1 ring-border/50 hover:ring-border focus:ring-2 focus:ring-primary/30 placeholder:text-muted-foreground/50 rounded-lg transition-all duration-300"
+            onFocus={() => setIsFocused(true)}
+            onBlur={() => {
+              window.setTimeout(() => setIsFocused(false), 120);
+            }}
+            className="h-10 w-full rounded-md border-0 bg-muted/40 pl-9 pr-3 text-sm outline-none ring-0 placeholder:text-muted-foreground focus:bg-muted"
           />
         </div>
+
+        {selectedEngine.id === "local" && categories.length > 0 && (
+          <Select
+            value={selectedCategory ? String(selectedCategory) : "all"}
+            onValueChange={handleCategoryChange}
+          >
+            <SelectTrigger className="h-10 w-full border-0 bg-muted/40 md:w-[190px]">
+              <SelectValue placeholder="All categories" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All categories</SelectItem>
+              {categories.map((category) => (
+                <SelectItem key={category.id} value={String(category.id)}>
+                  {category.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
 
         <Button
           variant="default"
           size="sm"
-          className="h-9 px-4 rounded-lg bg-primary/90 hover:bg-primary transition-colors shadow-sm"
+          className="h-10 w-full rounded-md px-4 shadow-sm md:w-auto"
           onClick={handleSearch}
         >
           搜索
         </Button>
+
+        {hasDirectoryFilters && (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-10 w-10 shrink-0"
+            onClick={handleClear}
+            aria-label="Clear search filters"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        )}
       </div>
+
+      {selectedEngine.id === "local" &&
+        typeof resultCount === "number" &&
+        typeof totalCount === "number" && (
+          <div className="mt-3 text-center text-xs text-muted-foreground">
+            Showing {resultCount} of {totalCount} AI tools
+            {selectedCategory ? " in the selected category" : ""}
+          </div>
+        )}
+
+      {showSuggestions && (
+        <div className="absolute left-0 right-0 z-40 mt-3 max-h-[70vh] overflow-hidden rounded-lg border bg-popover text-popover-foreground shadow-xl">
+          <button
+            type="button"
+            className="flex w-full items-center justify-between gap-3 px-4 py-4 text-left text-sm transition-colors hover:bg-muted/60"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => handleSuggestionSearch(localValue.trim())}
+          >
+            <span className="min-w-0 break-words">
+              Search for{" "}
+              <span className="font-semibold text-primary">
+                {localValue.trim()}
+              </span>{" "}
+              using AI
+            </span>
+            <ArrowUpRight className="h-4 w-4 text-muted-foreground" />
+          </button>
+
+          <div className="border-t bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+            Tools({suggestedTools.length})
+          </div>
+
+          {suggestedTools.length > 0 ? (
+            <div className="max-h-[48vh] divide-y overflow-y-auto">
+              {suggestedTools.map((website) => (
+                <button
+                  key={website.id}
+                  type="button"
+                  className="grid w-full grid-cols-[minmax(0,1fr)] gap-2 px-4 py-3 text-left transition-colors hover:bg-muted/60 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3"
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => handleSuggestionSearch(website.title)}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">
+                      {website.title}
+                    </div>
+                    <div className="mt-1 line-clamp-1 text-xs text-muted-foreground">
+                      {website.description}
+                    </div>
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {website.visits.toLocaleString()} visits
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+              Press Enter to search the directory.
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

@@ -5,39 +5,46 @@ import type { FooterSettings } from "@/lib/types";
 import { cachedPrismaQuery } from "@/lib/db/cache";
 
 export async function Footer() {
-  // 在服务端获取数据
-  const [footerLinks, settings] = await Promise.all([
-    cachedPrismaQuery(
-      "footer-links",
-      () =>
-        prisma.footerLink.findMany({
-          select: {
-            title: true,
-            url: true,
-          },
-          orderBy: {
-            created_at: "asc",
-          },
-        }),
-      { ttl: 86400 } // 1天缓存
-    ),
-    cachedPrismaQuery(
-      "footer-settings",
-      () =>
-        prisma.setting.findMany({
-          where: {
-            key: {
-              in: [
-                WebsiteSettings.siteIcp,
-                WebsiteSettings.customHtml,
-                WebsiteSettings.siteCopyright,
-              ],
+  let footerLinks: { title: string; url: string }[] = [];
+  let settings: { key: string; value: string }[] = [];
+
+  try {
+    // 在服务端获取数据
+    [footerLinks, settings] = await Promise.all([
+      cachedPrismaQuery(
+        "footer-links",
+        () =>
+          prisma.footerLink.findMany({
+            select: {
+              title: true,
+              url: true,
             },
-          },
-        }),
-      { ttl: 2592000 } // 1个月缓存
-    ),
-  ]);
+            orderBy: {
+              created_at: "asc",
+            },
+          }),
+        { ttl: 86400 } // 1天缓存
+      ),
+      cachedPrismaQuery(
+        "footer-settings",
+        () =>
+          prisma.setting.findMany({
+            where: {
+              key: {
+                in: [
+                  WebsiteSettings.siteIcp,
+                  WebsiteSettings.customHtml,
+                  WebsiteSettings.siteCopyright,
+                ],
+              },
+            },
+          }),
+        { ttl: 2592000 } // 1个月缓存
+      ),
+    ]);
+  } catch (error) {
+    console.error("[Footer] Database query failed while loading footer data.");
+  }
 
   // 转换设置数据为对象格式
   const settingsMap = settings.reduce((acc, setting) => {

@@ -12,5 +12,5 @@
       "@/*": ["src/*"]
     }
   },
-  "include": ["src/lib/utils/init-data.ts"]
+  "include": ["src/lib/utils/init-data.ts", "scripts/cache-thumbnails.ts"]
 }

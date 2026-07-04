@@ -1,10 +1,11 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useEffect } from "react";
 import { useAtom } from "jotai";
 import { motion } from "framer-motion";
 import { Button } from "@/ui/common/button";
-import { Plus } from "lucide-react";
+import { ArrowUpRight, Folder, Plus, Send, Trophy } from "lucide-react";
 import { isAdminModeAtom, footerSettingsAtom } from "@/lib/atoms";
 import {
   Dialog,
@@ -121,26 +122,56 @@ export default function FooterContent({
         "transition-colors duration-300"
       )}
     >
-      <div className="container mx-auto px-4 py-4">
-        <div className="flex flex-col space-y-2 md:space-y-0 md:flex-row md:items-center md:justify-between">
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+      <div className="container mx-auto px-4 py-8 md:py-10">
+        <div className="grid gap-7 sm:grid-cols-2 md:grid-cols-[1.4fr_1fr_1fr] lg:grid-cols-[1.6fr_1fr_1fr_1fr]">
+          <div>
+            <Link href="/" className="inline-flex items-center gap-2">
+              <span className="flex h-9 w-9 items-center justify-center rounded-md bg-primary text-sm font-semibold text-primary-foreground">
+                AW
+              </span>
+              <span className="font-semibold">AskWalle AI Hub</span>
+            </Link>
+            <p className="mt-3 max-w-sm text-sm leading-6 text-muted-foreground">
+              A practical AI tools directory for discovering products across
+              writing, image generation, coding, productivity, marketing, and
+              business workflows.
+            </p>
+          </div>
+
+          <FooterColumn title="Directory">
+            <FooterLink href="/#all-tools">AI Tools</FooterLink>
+            <FooterLink href="/categories" icon={<Folder className="h-3.5 w-3.5" />}>
+              Categories
+            </FooterLink>
+            <FooterLink href="/rankings" icon={<Trophy className="h-3.5 w-3.5" />}>
+              Rankings
+            </FooterLink>
+            <FooterLink href="/submit" icon={<Send className="h-3.5 w-3.5" />}>
+              Submit Tool
+            </FooterLink>
+          </FooterColumn>
+
+          <FooterColumn title="Resources">
             {settings.links.length > 0 ? (
               settings.links.map((link, index) => (
-                <div key={index} className="flex items-center gap-1.5">
+                <div key={`${link.url}-${index}`} className="flex min-w-0 items-center gap-1.5">
                   <a
                     href={link.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    target={link.url.startsWith("/") ? undefined : "_blank"}
+                    rel={link.url.startsWith("/") ? undefined : "noopener noreferrer"}
+                    className="inline-flex min-w-0 items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
                   >
-                    {link.title}
+                    <span className="truncate">{link.title}</span>
+                    {!link.url.startsWith("/") && (
+                      <ArrowUpRight className="h-3 w-3" />
+                    )}
                   </a>
                   {isAdmin && (
                     <Button
                       variant="ghost"
                       size="sm"
                       className={cn(
-                        "h-5 w-5 p-0 rounded-full",
+                        "h-5 w-5 rounded-full p-0",
                         "hover:bg-destructive/10 hover:text-destructive",
                         "transition-colors duration-200"
                       )}
@@ -152,55 +183,58 @@ export default function FooterContent({
                 </div>
               ))
             ) : (
-              <div className="text-xs text-muted-foreground/60 italic">
-                {isAdmin ? "点击右侧加号添加页脚链接" : "暂无页脚链接"}
+              <div className="text-sm leading-6 text-muted-foreground">
+                {isAdmin ? "Add footer links for privacy, terms, or contact." : "Privacy, terms, and contact links can be added by the site admin."}
               </div>
             )}
             {isAdmin && (
               <Button
-                variant="ghost"
+                variant="outline"
                 size="sm"
-                className={cn(
-                  "h-5 w-5 p-0 rounded-full",
-                  "hover:bg-primary/10 hover:text-primary",
-                  "transition-colors duration-200"
-                )}
+                className="mt-1 h-8 gap-1.5"
                 onClick={() => setIsDialogOpen(true)}
               >
-                <Plus className="h-3 w-3" />
+                <Plus className="h-3.5 w-3.5" />
+                Add link
               </Button>
             )}
-          </div>
+          </FooterColumn>
 
-          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <FooterColumn title="Site">
+            <p className="text-sm leading-6 text-muted-foreground">
+              Built for browsing, comparing, and submitting useful AI tools
+              without inflated claims.
+            </p>
+          </FooterColumn>
+        </div>
+
+        <div className="mt-8 flex flex-col gap-3 border-t border-border/70 pt-5 text-xs text-muted-foreground md:flex-row md:items-center md:justify-between">
+          <div>{settings.copyright}</div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            {settings.icpBeian && (
+              <a
+                href="https://beian.miit.gov.cn/"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="transition-colors hover:text-foreground"
+              >
+                {settings.icpBeian}
+              </a>
+            )}
             <a
               href="https://github.com/liyown/ai-navigation"
               target="_blank"
               rel="noopener noreferrer"
-              className="hover:text-foreground transition-colors"
+              className="transition-colors hover:text-foreground"
             >
-              {settings.copyright}
+              Source project
             </a>
-            {settings.icpBeian && (
-              <>
-                <span className="hidden md:inline text-muted-foreground/60">
-                  |
-                </span>
-                <a
-                  href="https://beian.miit.gov.cn/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="hover:text-foreground transition-colors"
-                >
-                  {settings.icpBeian}
-                </a>
-              </>
-            )}
           </div>
         </div>
+
         {settings.customHtml && (
           <div
-            className="mt-2 text-xs text-muted-foreground"
+            className="mt-3 text-xs text-muted-foreground"
             dangerouslySetInnerHTML={{ __html: settings.customHtml }}
           />
         )}
@@ -260,5 +294,40 @@ export default function FooterContent({
         </DialogContent>
       </Dialog>
     </motion.footer>
+  );
+}
+
+function FooterColumn({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <h2 className="text-sm font-semibold">{title}</h2>
+      <div className="mt-3 flex flex-col gap-2">{children}</div>
+    </div>
+  );
+}
+
+function FooterLink({
+  href,
+  icon,
+  children,
+}: {
+  href: string;
+  icon?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <Link
+      href={href}
+      className="inline-flex items-center gap-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground"
+    >
+      {icon}
+      {children}
+    </Link>
   );
 }

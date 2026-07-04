@@ -52,8 +52,6 @@ export async function PUT(request: Request) {
       });
     });
 
-    console.log("body keys: ", Object.keys(body));
-
     // Execute all updates in parallel
     const results = await Promise.all(updatePromises);
 

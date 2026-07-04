@@ -45,8 +45,6 @@ export async function getSettings() {
       return acc;
     }, {} as Record<string, string>);
 
-    console.log(settingsObject);
-
     return settingsObject;
   } catch (error) {
     console.error("Error fetching settings:", error);

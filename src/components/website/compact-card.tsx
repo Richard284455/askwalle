@@ -1,20 +1,20 @@
 "use client";
 
+import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { motion } from "framer-motion";
-import { Card } from "@/ui/common/card";
-import { Button } from "@/ui/common/button";
+import { ArrowUpRight, BarChart3, Heart, Loader2 } from "lucide-react";
 import { Badge } from "@/ui/common/badge";
-import { Heart, Globe, ArrowUpRight, Loader2 } from "lucide-react";
+import { Button } from "@/ui/common/button";
+import { Card } from "@/ui/common/card";
+import { toast } from "@/hooks/use-toast";
+import { useCardTilt } from "@/hooks/use-card-tilt";
 import { cn } from "@/lib/utils/utils";
 import {
   cardHoverVariants,
   sharedLayoutTransition,
 } from "@/ui/animation/variants/animations";
 import type { Website } from "@/lib/types";
-import { useState, useRef, useEffect } from "react";
 import { WebsiteThumbnail } from "./website-thumbnail";
-import { toast } from "@/hooks/use-toast";
-import { useCardTilt } from "@/hooks/use-card-tilt";
 
 interface CompactCardProps {
   website: Website;
@@ -27,12 +27,11 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
   const [isLiking, setIsLiking] = useState(false);
   const prevLikesRef = useRef(website.likes);
   const { cardRef, tiltProps } = useCardTilt({
-    maxTiltDegree: 10, // 减小倾斜角度
-    scale: 1.02, // 减小缩放比例
-    transitionZ: 10, // 减小Z轴位移
+    maxTiltDegree: 4,
+    scale: 1.01,
+    transitionZ: 4,
   });
 
-  // 当 website.likes 从外部更新时，同步本地状态
   useEffect(() => {
     if (website.likes !== prevLikesRef.current) {
       setLikes(website.likes);
@@ -40,8 +39,24 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
     }
   }, [website.likes]);
 
-  const handleLike = async (e: React.MouseEvent) => {
-    e.stopPropagation(); // 阻止事件冒泡到卡片点击
+  const handleVisit = () => {
+    onVisit(website);
+  };
+
+  const handleCardKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      handleVisit();
+    }
+  };
+
+  const handleVisitClick = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    handleVisit();
+  };
+
+  const handleLike = async (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
     const key = `website-${website.id}-liked`;
     const lastLiked = localStorage.getItem(key);
     const now = new Date().getTime();
@@ -69,12 +84,11 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
       let newLikes: number;
       if (data.code === 200 && data.data?.likes !== undefined) {
         newLikes = data.data.likes;
-        setLikes(newLikes);
       } else {
         newLikes = likes + 1;
-        setLikes(newLikes);
       }
-      // 回调父组件更新全局状态
+
+      setLikes(newLikes);
       onLike?.(website.id, newLikes);
       toast({
         title: "点赞成功",
@@ -93,13 +107,7 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
   };
 
   return (
-    <div
-      ref={cardRef}
-      {...tiltProps}
-      className="card-container"
-      onClick={() => onVisit(website)}
-      style={{ cursor: "pointer" }}
-    >
+    <div ref={cardRef} {...tiltProps} className="card-container">
       <motion.div
         variants={cardHoverVariants}
         initial="initial"
@@ -110,79 +118,72 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
       >
         <Card
           className={cn(
-            "group relative flex flex-col overflow-hidden",
-            "bg-background",
-            "border-primary/15 dark:border-white/10",
-            "hover:border-primary/20 dark:hover:border-primary/20",
-            "hover:bg-background",
-            "shadow-sm hover:shadow-lg",
-            "transition-colors duration-300",
-            "rounded-2xl sm:rounded-lg"
+            "group flex min-h-[96px] cursor-pointer items-center gap-3 rounded-lg border-border/70 bg-card p-3 shadow-sm",
+            "transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md"
           )}
+          onClick={handleVisit}
+          onKeyDown={handleCardKeyDown}
+          role="button"
+          tabIndex={0}
         >
-          {/* Content */}
-          <div className="relative py-2 px-3 sm:p-3 flex flex-col gap-2">
-            <div className="flex items-center gap-3">
-              <WebsiteThumbnail
-                url={website.url}
-                thumbnail={website.thumbnail}
-                thumbnail_base64={website.thumbnail_base64}
-                title={website.title}
-                className="w-9 h-9 sm:w-10 sm:h-10"
-              />
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-3">
-                  <h3 className="font-medium text-sm flex-1 truncate group-hover:text-primary transition-colors">
-                    {website.title}
-                  </h3>
-                  <div className="flex items-center gap-3 text-[10px] text-muted-foreground shrink-0">
-                    <div className="flex items-center gap-1.5">
-                      <Heart className="w-3.5 h-3.5" />
-                      <span>{likes}</span>
-                    </div>
-                    <div className="flex items-center gap-1.5">
-                      <Globe className="w-3.5 h-3.5" />
-                      <span>{website.visits}</span>
-                    </div>
-                  </div>
-                </div>
-                <p className="text-xs text-muted-foreground mt-0.5 line-clamp-1">
-                  {website.description}
-                </p>
-              </div>
-              <div className="flex items-center gap-2 ml-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleLike}
-                  disabled={isLiking}
-                  className={cn(
-                    "h-8 w-8 p-0",
-                    "bg-white/[0.02] backdrop-blur-xl border-white/10",
-                    "hover:bg-red-500/5 hover:border-red-500/20 hover:text-red-500",
-                    "dark:bg-white/[0.01] dark:hover:bg-red-500/10",
-                    "transition-all duration-300",
-                    isLiking && "opacity-50 cursor-not-allowed"
-                  )}
-                >
-                  {isLiking ? (
-                    <motion.div
-                      animate={{ rotate: 360 }}
-                      transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
-                    >
-                      <Loader2 className="h-4 w-4" />
-                    </motion.div>
-                  ) : (
-                    <motion.div
-                      whileTap={{ scale: 1.4 }}
-                      transition={{ duration: 0.2 }}
-                    >
-                      <Heart className="h-4 w-4" />
-                    </motion.div>
-                  )}
-                </Button>
-              </div>
+          <WebsiteThumbnail
+            url={website.url}
+            thumbnail={website.thumbnail}
+            thumbnail_base64={website.thumbnail_base64}
+            title={website.title}
+            className="h-10 w-10 shrink-0 rounded-md"
+          />
+
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <h3 className="truncate text-sm font-semibold group-hover:text-primary">
+                {website.title}
+              </h3>
+              {website.status !== "approved" && (
+                <Badge variant="outline" className="px-1.5 py-0 text-[10px]">
+                  {website.status}
+                </Badge>
+              )}
             </div>
+            <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">
+              {website.description}
+            </p>
+            <div className="mt-2 flex items-center gap-3 text-[11px] text-muted-foreground">
+              <span className="inline-flex items-center gap-1">
+                <BarChart3 className="h-3 w-3" />
+                {website.visits}
+              </span>
+              <span className="inline-flex items-center gap-1">
+                <Heart className="h-3 w-3" />
+                {likes}
+              </span>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={handleLike}
+              disabled={isLiking}
+              className="h-8 w-8"
+              aria-label={`Like ${website.title}`}
+            >
+              {isLiking ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Heart className="h-3.5 w-3.5" />
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={handleVisitClick}
+              className="h-8 w-8 text-primary"
+              aria-label={`Visit ${website.title}`}
+            >
+              <ArrowUpRight className="h-4 w-4" />
+            </Button>
           </div>
         </Card>
       </motion.div>

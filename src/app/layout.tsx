@@ -1,4 +1,5 @@
 import "./globals.css";
+import type { Metadata } from "next";
 import ThemeProvider from "@/components/providers/theme-provider";
 import { StoreProvider } from "@/components/providers/store-provider";
 import { Toaster } from "@/ui/common/sonner";
@@ -8,6 +9,35 @@ import SWRProvider from "@/components/providers/swr-provider";
 import { Analytics as VercelAnalytics } from "@vercel/analytics/react";
 import { Analytics as OtherAnalytics } from "@/components/analytics";
 import { thumbnailUpdateJob } from "@/lib/tasks/cron";
+
+export const metadata: Metadata = {
+  title: "AskWalle AI Hub - Discover the Best AI Tools",
+  description:
+    "Explore AI tools for writing, image generation, coding, productivity, marketing, business, and more.",
+  keywords: [
+    "AI tools",
+    "AI directory",
+    "writing AI",
+    "image generation",
+    "coding AI",
+    "productivity AI",
+    "marketing AI",
+    "business AI",
+  ],
+  openGraph: {
+    title: "AskWalle AI Hub - Discover the Best AI Tools",
+    description:
+      "Explore AI tools for writing, image generation, coding, productivity, marketing, business, and more.",
+    type: "website",
+    siteName: "AskWalle AI Hub",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "AskWalle AI Hub - Discover the Best AI Tools",
+    description:
+      "Explore AI tools for writing, image generation, coding, productivity, marketing, business, and more.",
+  },
+};
 
 // 启动定时任务
 if (process.env.NODE_ENV === "production") {

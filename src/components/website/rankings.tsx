@@ -1,233 +1,267 @@
 "use client";
 
-import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Card } from "@/ui/common/card";
-import { Button } from "@/ui/common/button";
+import { ArrowUpRight, CalendarDays, Eye, Heart, Medal } from "lucide-react";
 import { Badge } from "@/ui/common/badge";
-import { Heart, Eye, Trophy, ArrowUpRight, Crown, Medal } from "lucide-react";
+import { Button } from "@/ui/common/button";
+import { Card } from "@/ui/common/card";
 import { cn } from "@/lib/utils/utils";
-import type { Website } from "@/lib/types";
+import type { Category, Website } from "@/lib/types";
+import { WebsiteThumbnail } from "./website-thumbnail";
+
+export type RankedWebsite = Website & {
+  created_at: string;
+  category: Category | null;
+};
 
 interface RankingsProps {
-  websites: Website[];
-  onVisit: (website: Website) => void;
+  websites: RankedWebsite[];
+  onVisit: (website: RankedWebsite) => void;
+}
+
+type RankingMetric = "visits" | "likes" | "newest";
+
+interface RankingSection {
+  title: string;
+  description: string;
+  metric: RankingMetric;
+  icon: typeof Eye;
+  websites: RankedWebsite[];
+}
+
+const rankStyles = [
+  "border-amber-400/40 bg-amber-400/10 text-amber-700 dark:text-amber-300",
+  "border-slate-300 bg-slate-100 text-slate-700 dark:border-slate-600 dark:bg-slate-800 dark:text-slate-200",
+  "border-orange-300/60 bg-orange-400/10 text-orange-700 dark:text-orange-300",
+];
+
+function formatDate(value: string) {
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  }).format(new Date(value));
+}
+
+function metricLabel(website: RankedWebsite, metric: RankingMetric) {
+  if (metric === "visits") {
+    return `${website.visits.toLocaleString()} visits`;
+  }
+
+  if (metric === "likes") {
+    return `${website.likes.toLocaleString()} likes`;
+  }
+
+  return formatDate(website.created_at);
+}
+
+function RankingRow({
+  website,
+  index,
+  metric,
+  onVisit,
+}: {
+  website: RankedWebsite;
+  index: number;
+  metric: RankingMetric;
+  onVisit: (website: RankedWebsite) => void;
+}) {
+  const MetricIcon = metric === "likes" ? Heart : metric === "newest" ? CalendarDays : Eye;
+
+  return (
+    <div
+      className="group grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 border-t border-border/60 px-3 py-3 transition-colors hover:bg-muted/40 sm:gap-3 sm:px-4"
+    >
+      <div
+        className={cn(
+          "flex h-8 w-8 items-center justify-center rounded-full border text-xs font-semibold",
+          rankStyles[index] || "border-border bg-muted/60 text-muted-foreground"
+        )}
+      >
+        {index < 3 ? <Medal className="h-3.5 w-3.5" /> : index + 1}
+      </div>
+
+      <div className="flex min-w-0 items-center gap-3">
+        <WebsiteThumbnail
+          url={website.url}
+          thumbnail={website.thumbnail}
+          thumbnail_base64={website.thumbnail_base64}
+          title={website.title}
+          className="h-9 w-9 shrink-0 rounded-md sm:h-10 sm:w-10"
+        />
+        <div className="min-w-0">
+          <div className="flex min-w-0 items-center gap-2">
+            <h3 className="truncate text-sm font-semibold group-hover:text-primary">
+              {website.title}
+            </h3>
+            {website.category && (
+              <Badge variant="secondary" className="hidden shrink-0 px-2 py-0 text-[11px] sm:inline-flex">
+                {website.category.name}
+              </Badge>
+            )}
+          </div>
+          <p className="mt-1 line-clamp-1 text-xs leading-5 text-muted-foreground">
+            {website.description}
+          </p>
+          <div className="mt-2 flex items-center gap-3 text-[11px] text-muted-foreground">
+            <span className="inline-flex items-center gap-1">
+              <Eye className="h-3 w-3" />
+              {website.visits.toLocaleString()}
+            </span>
+            <span className="inline-flex items-center gap-1">
+              <Heart className="h-3 w-3" />
+              {website.likes.toLocaleString()}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+        <div className="hidden text-right text-xs text-muted-foreground md:block">
+          <div className="inline-flex items-center gap-1 font-medium text-foreground">
+            <MetricIcon className="h-3.5 w-3.5" />
+            {metricLabel(website, metric)}
+          </div>
+        </div>
+        <Button
+          variant="outline"
+          size="icon"
+          className="h-8 w-8"
+          onClick={() => onVisit(website)}
+          aria-label={`Visit ${website.title}`}
+        >
+          <ArrowUpRight className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function RankingPanel({
+  section,
+  onVisit,
+}: {
+  section: RankingSection;
+  onVisit: (website: RankedWebsite) => void;
+}) {
+  const Icon = section.icon;
+
+  return (
+    <Card className="overflow-hidden rounded-lg border-border/70 bg-card shadow-sm">
+      <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="flex h-8 w-8 items-center justify-center rounded-md bg-primary/10 text-primary">
+              <Icon className="h-4 w-4" />
+            </span>
+            <h2 className="text-base font-semibold">{section.title}</h2>
+          </div>
+          <p className="mt-2 text-sm text-muted-foreground">
+            {section.description}
+          </p>
+        </div>
+        <Badge variant="outline" className="w-fit shrink-0">
+          Top {section.websites.length}
+        </Badge>
+      </div>
+
+      {section.websites.length > 0 ? (
+        <div>
+          {section.websites.map((website, index) => (
+            <RankingRow
+              key={`${section.metric}-${website.id}`}
+              website={website}
+              index={index}
+              metric={section.metric}
+              onVisit={onVisit}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="border-t border-border/60 px-4 py-10 text-center text-sm text-muted-foreground">
+          No approved AI tools are available yet.
+        </div>
+      )}
+    </Card>
+  );
 }
 
 export function Rankings({ websites, onVisit }: RankingsProps) {
-  const [activeTab, setActiveTab] = useState<"visits" | "likes">("visits");
+  const topByVisits = [...websites]
+    .sort((a, b) => b.visits - a.visits || b.likes - a.likes)
+    .slice(0, 10);
+  const topByLikes = [...websites]
+    .sort((a, b) => b.likes - a.likes || b.visits - a.visits)
+    .slice(0, 10);
+  const newest = [...websites]
+    .sort(
+      (a, b) =>
+        new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+    )
+    .slice(0, 10);
 
-  // 只取前5名
-  const sortedWebsites = [...websites]
-    .sort((a, b) => {
-      if (activeTab === "visits") {
-        return b.visits - a.visits;
-      }
-      return b.likes - a.likes;
-    })
-    .slice(0, 5); // Top 5
-
-  const getRankIcon = (index: number) => {
-    switch (index) {
-      case 0:
-        return (
-          <div className="relative">
-            <Crown className="h-4 w-4 text-amber-400 drop-shadow-glow animate-shine" />
-            <div className="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent animate-shimmer" />
-          </div>
-        );
-      case 1:
-        return <Medal className="h-4 w-4 text-gray-300 drop-shadow" />;
-      case 2:
-        return <Medal className="h-4 w-4 text-amber-600 drop-shadow" />;
-      default:
-        return (
-          <span className="text-sm font-medium text-muted-foreground/80">
-            {index + 1}
-          </span>
-        );
-    }
-  };
-
-  // 根据排名获取特殊样式
-  const getRankStyle = (index: number) => {
-    switch (index) {
-      case 0:
-        return "bg-primary/5 hover:bg-primary/10";
-      case 1:
-        return "bg-muted/5 hover:bg-muted/10";
-      case 2:
-        return "bg-accent/5 hover:bg-accent/10";
-      default:
-        return "hover:bg-accent/5";
-    }
-  };
+  const sections: RankingSection[] = [
+    {
+      title: "Top AI Tools by Visits",
+      description: "The most visited tools in the directory, ranked by usage signals.",
+      metric: "visits",
+      icon: Eye,
+      websites: topByVisits,
+    },
+    {
+      title: "Most Liked AI Tools",
+      description: "Community favorites based on likes from public tool cards.",
+      metric: "likes",
+      icon: Heart,
+      websites: topByLikes,
+    },
+    {
+      title: "Newest AI Tools",
+      description: "Recently added approved tools from the latest database updates.",
+      metric: "newest",
+      icon: CalendarDays,
+      websites: newest,
+    },
+  ];
 
   return (
-    <Card
-      className={cn(
-        "overflow-hidden",
-        "bg-background/95 backdrop-blur-xl backdrop-saturate-150",
-        "border-border/50",
-        "shadow-lg hover:shadow-xl",
-        "transition-all duration-300"
-      )}
-    >
-      {/* 标题栏 */}
-      <div
-        className={cn(
-          "p-3 border-b border-border/50",
-          "bg-gradient-to-r from-muted/50 via-background to-muted/50"
-        )}
-      >
-        <div className="flex items-center gap-2">
-          <Trophy className="h-4 w-4 text-primary" />
-          <h2 className="text-base font-semibold text-foreground">
-            TOP 5 排行榜
-          </h2>
+    <div className="mx-auto max-w-6xl">
+      <div className="mb-6 flex flex-col gap-4 md:mb-8 md:flex-row md:items-end md:justify-between">
+        <div>
+          <Badge variant="secondary" className="mb-3">
+            AI tool rankings
+          </Badge>
+          <h1 className="text-2xl font-semibold tracking-normal sm:text-3xl md:text-4xl">
+            Discover the tools people use, like, and add now
+          </h1>
+          <p className="mt-3 max-w-2xl text-sm leading-6 text-muted-foreground md:text-base">
+            Browse public rankings for AI tools by visits, likes, and newest approvals.
+          </p>
+        </div>
+        <div className="grid grid-cols-3 gap-1.5 rounded-lg border bg-card p-2 text-center shadow-sm sm:gap-2">
+          <div className="px-3 py-2">
+            <div className="text-lg font-semibold">{websites.length}</div>
+            <div className="text-[11px] text-muted-foreground">Tools</div>
+          </div>
+          <div className="px-3 py-2">
+            <div className="text-lg font-semibold">
+              {websites.reduce((sum, item) => sum + item.visits, 0).toLocaleString()}
+            </div>
+            <div className="text-[11px] text-muted-foreground">Visits</div>
+          </div>
+          <div className="px-3 py-2">
+            <div className="text-lg font-semibold">
+              {websites.reduce((sum, item) => sum + item.likes, 0).toLocaleString()}
+            </div>
+            <div className="text-[11px] text-muted-foreground">Likes</div>
+          </div>
         </div>
       </div>
 
-      {/* 标签页 */}
-      <div className="p-1.5 border-b border-border/50 bg-muted/20">
-        <div className="flex gap-1">
-          <Button
-            variant={activeTab === "visits" ? "default" : "ghost"}
-            size="sm"
-            onClick={() => setActiveTab("visits")}
-            className={cn(
-              "flex-1 transition-all duration-200 h-8",
-              activeTab === "visits"
-                ? "bg-primary text-primary-foreground shadow-sm"
-                : "hover:bg-accent hover:text-accent-foreground"
-            )}
-          >
-            <Eye className="h-3.5 w-3.5 mr-1.5" />
-            访问榜
-          </Button>
-          <Button
-            variant={activeTab === "likes" ? "default" : "ghost"}
-            size="sm"
-            onClick={() => setActiveTab("likes")}
-            className={cn(
-              "flex-1 transition-all duration-200 h-8",
-              activeTab === "likes"
-                ? "bg-primary text-primary-foreground shadow-sm"
-                : "hover:bg-accent hover:text-accent-foreground"
-            )}
-          >
-            <Heart className="h-3.5 w-3.5 mr-1.5" />
-            点赞榜
-          </Button>
-        </div>
+      <div className="grid gap-5">
+        {sections.map((section) => (
+          <RankingPanel key={section.metric} section={section} onVisit={onVisit} />
+        ))}
       </div>
-
-      {/* 排行榜列表 */}
-      <div className="divide-y divide-border/50">
-        <AnimatePresence mode="popLayout">
-          {sortedWebsites.map((website, index) => (
-            <motion.div
-              key={`${website.id}-${activeTab}`}
-              initial={{ opacity: 0, y: 20, scale: 0.95 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: -20, scale: 0.95 }}
-              transition={{
-                duration: 0.2,
-                delay: index * 0.03,
-                type: "spring",
-                stiffness: 500,
-                damping: 30,
-              }}
-              className={cn(
-                "relative p-3 flex items-center gap-3 group cursor-pointer",
-                getRankStyle(index),
-                "active:bg-accent/10",
-                "transition-all duration-200"
-              )}
-              onClick={() => onVisit(website)}
-            >
-              {/* 排名图标 */}
-              <motion.div
-                className={cn(
-                  "w-8 h-8 flex items-center justify-center shrink-0",
-                  "bg-muted/30 rounded-full",
-                  "group-hover:bg-muted/50",
-                  "transition-colors duration-200"
-                )}
-                whileHover={{ scale: 1.1 }}
-                transition={{ type: "spring", stiffness: 400 }}
-              >
-                {getRankIcon(index)}
-              </motion.div>
-
-              {/* 网站信息 */}
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <h3 className="font-medium truncate text-foreground group-hover:text-primary transition-colors">
-                    {website.title}
-                  </h3>
-                  {index === 0 && (
-                    <Badge
-                      variant="default"
-                      className="bg-primary/20 text-primary text-[10px] px-1 py-0"
-                    >
-                      No.1
-                    </Badge>
-                  )}
-                </div>
-                <p className="text-sm text-muted-foreground/80 line-clamp-1 mt-0.5 mb-1 group-hover:text-muted-foreground transition-colors">
-                  {website.description}
-                </p>
-                <div className="flex items-center gap-3 text-xs text-muted-foreground/70">
-                  <div className="flex items-center gap-1">
-                    <Eye className="h-3.5 w-3.5" />
-                    <motion.span
-                      key={website.visits}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="tabular-nums font-medium"
-                    >
-                      {website.visits}
-                    </motion.span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Heart className="h-3.5 w-3.5" />
-                    <motion.span
-                      key={website.likes}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="tabular-nums font-medium"
-                    >
-                      {website.likes}
-                    </motion.span>
-                  </div>
-                </div>
-              </div>
-
-              {/* 访问箭头 */}
-              <div
-                className={cn(
-                  "w-8 flex items-center justify-center",
-                  "opacity-0 group-hover:opacity-100",
-                  "transition-opacity duration-200"
-                )}
-              >
-                <motion.div
-                  initial={{ x: -5 }}
-                  animate={{ x: 0 }}
-                  transition={{
-                    type: "spring",
-                    stiffness: 300,
-                    damping: 20,
-                  }}
-                >
-                  <ArrowUpRight className="h-4 w-4 text-primary" />
-                </motion.div>
-              </div>
-            </motion.div>
-          ))}
-        </AnimatePresence>
-      </div>
-    </Card>
+    </div>
   );
 }

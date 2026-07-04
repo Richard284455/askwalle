@@ -1,11 +1,11 @@
 "use client";
 
 import { Rankings } from "@/components/website/rankings";
-import { Website } from "@/lib/types";
+import type { RankedWebsite } from "@/components/website/rankings";
 import { toast } from "@/hooks/use-toast";
 
-export function RankingsClient({ websites }: { websites: Website[] }) {
-  const handleVisit = async (website: Website) => {
+export function RankingsClient({ websites }: { websites: RankedWebsite[] }) {
+  const handleVisit = async (website: RankedWebsite) => {
     try {
       fetch(`/api/websites/${website.id}/visit`, {
         method: "POST",

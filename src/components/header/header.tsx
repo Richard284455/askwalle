@@ -1,104 +1,71 @@
 import Link from "next/link";
-import { Trophy, Plus, Brain, Download, Info } from "lucide-react";
+import {
+  BrainCircuit,
+  Folder,
+  Plus,
+  Search,
+  Sparkles,
+  Trophy,
+} from "lucide-react";
 import { Button } from "@/ui/common/button";
 import ThemeSwitch from "@/components/theme-switcher/theme-switch";
 import MobileMenu from "./mobile-menu";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/ui/common/tooltip";
+
+const navItems = [
+  { href: "/#all-tools", label: "AI Tools", icon: Sparkles },
+  { href: "/categories", label: "Categories", icon: Folder },
+  { href: "/rankings", label: "Rankings", icon: Trophy },
+];
 
 export default function Header() {
   return (
-    <header className="sticky top-0 z-50 w-full border-b bg-background/30 backdrop-blur-lg">
-      <nav className="container mx-auto px-4 h-14">
+    <header className="sticky top-0 z-50 w-full border-b border-border/70 bg-background/85 backdrop-blur-xl">
+      <nav className="container mx-auto h-14 px-4 md:h-16">
         <div className="flex h-full items-center justify-between gap-4">
-          {/* Logo and Title */}
           <Link
             href="/"
-            className="flex items-center gap-2 hover:opacity-80 transition-opacity"
+            className="flex min-w-0 items-center gap-2.5 transition-opacity hover:opacity-85"
           >
-            <Brain className="h-6 w-6 text-primary" />
-            <div className="flex items-center gap-0.5">
-              <span className="font-bold">AI Nav</span>
-              <span
-                className="bg-clip-text text-transparent bg-gradient-to-r from-primary via-primary/80 to-primary/60 px-1.5 origin-center font-medium font-serif italic"
-                style={{
-                  textShadow:
-                    "0 0 2px rgba(var(--primary), 0.15), 0 0 1px rgba(var(--primary), 0.1)",
-                  letterSpacing: "0.08em",
-                  fontWeight: 500,
-                  WebkitFontSmoothing: "antialiased",
-                }}
-              >
-                探索AI新世界
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-sm md:h-9 md:w-9">
+              <BrainCircuit className="h-4 w-4 md:h-5 md:w-5" />
+            </span>
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-semibold leading-tight sm:text-base">
+                AskWalle AI Hub
               </span>
-            </div>
+              <span className="hidden text-xs text-muted-foreground sm:block">
+                AI tools directory
+              </span>
+            </span>
           </Link>
 
-          {/* Desktop Navigation */}
-          <div className="hidden md:flex items-center gap-4">
-            <Link href="/rankings">
-              <Button
-                variant="ghost"
-                size="sm"
-                className="flex items-center gap-2"
-              >
-                <Trophy className="h-4 w-4" />
-                <span>排行榜</span>
+          <div className="hidden items-center gap-1 lg:flex">
+            {navItems.map(({ href, label, icon: Icon }) => (
+              <Button key={href} asChild variant="ghost" size="sm">
+                <Link href={href} className="gap-2">
+                  <Icon className="h-4 w-4" />
+                  {label}
+                </Link>
               </Button>
-            </Link>
+            ))}
+          </div>
 
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Link href="/scripts/tamper-monkey-script.user.js">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="flex items-center gap-2"
-                    >
-                      <Download className="h-4 w-4" />
-                      <span>安装脚本</span>
-                    </Button>
-                  </Link>
-                </TooltipTrigger>
-                <TooltipContent className="max-w-[300px] p-3">
-                  <p className="font-medium mb-1">AI导航助手脚本</p>
-                  <p className="text-sm text-muted-foreground">
-                    功能：自动识别并采集当前网页的AI工具信息，快速提交到AI导航。
-                  </p>
-                  <p className="text-sm text-muted-foreground mt-1">
-                    需要先安装 Tampermonkey 或 Violentmonkey 浏览器扩展。
-                  </p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
-
-            <Link href="/submit">
-              <Button size="sm" className="flex items-center gap-2">
+          <div className="hidden items-center gap-2 md:flex">
+            <Button asChild variant="outline" size="sm">
+              <Link href="/#directory-search" className="gap-2">
+                <Search className="h-4 w-4" />
+                Search
+              </Link>
+            </Button>
+            <Button asChild size="sm">
+              <Link href="/submit" className="gap-2">
                 <Plus className="h-4 w-4" />
-                <span>提交网站</span>
-              </Button>
-            </Link>
-
-            <Link href="/about">
-              <Button
-                variant="ghost"
-                size="sm"
-                className="flex items-center gap-2"
-              >
-                <Info className="h-4 w-4" />
-                <span>关于</span>
-              </Button>
-            </Link>
-
+                Submit Tool
+              </Link>
+            </Button>
             <ThemeSwitch />
           </div>
 
-          {/* Mobile Menu */}
           <MobileMenu />
         </div>
       </nav>
