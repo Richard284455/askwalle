@@ -43,7 +43,7 @@ export async function Footer() {
       ),
     ]);
   } catch (error) {
-    console.error("[Footer] Database query failed while loading footer data.");
+    console.warn("[Footer] Footer data unavailable; rendering fallback content.");
   }
 
   // 转换设置数据为对象格式

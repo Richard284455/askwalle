@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "next lint",
     "cache-thumbnails": "ts-node --project tsconfig.script.json scripts/cache-thumbnails.ts",
-    "init-data": "ts-node --project tsconfig.script.json src/lib/utils/init-data.ts"
+    "init-data": "ts-node --project tsconfig.script.json src/lib/utils/init-data.ts",
+    "import:resources": "ts-node --project tsconfig.script.json scripts/import-resources.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

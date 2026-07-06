@@ -193,13 +193,13 @@ export function SearchBox({
 
   return (
     <div className={`relative mx-auto w-full max-w-3xl ${className}`}>
-      <div className="flex flex-col gap-2 rounded-lg border border-border/70 bg-background p-2 shadow-lg shadow-black/[0.04] transition-colors focus-within:border-primary/50 md:flex-row md:items-center md:p-1.5">
+      <div className="flex flex-col gap-2 rounded-xl border border-border/80 bg-white p-2 shadow-xl shadow-slate-900/[0.08] transition-colors focus-within:border-primary/50 focus-within:shadow-primary/10 dark:bg-card md:flex-row md:items-center md:p-1.5">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button
               variant="ghost"
               size="sm"
-              className="h-10 w-full justify-start gap-2 rounded-md px-2.5 transition-colors hover:bg-muted data-[state=open]:bg-muted md:w-auto md:px-3"
+              className="h-11 w-full justify-start gap-2 rounded-lg px-2.5 text-slate-700 transition-colors hover:bg-slate-100 data-[state=open]:bg-slate-100 dark:text-slate-200 dark:hover:bg-muted dark:data-[state=open]:bg-muted md:w-auto md:px-3"
             >
               {selectedEngine.icon}
               <span className="font-medium text-sm">
@@ -208,7 +208,7 @@ export function SearchBox({
               <ChevronDown className="h-3.5 w-3.5 opacity-50" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-[150px]">
+          <DropdownMenuContent align="start" className="w-[150px] rounded-lg">
             {searchEngines.map((engine) => (
               <DropdownMenuItem
                 key={engine.id}
@@ -234,7 +234,7 @@ export function SearchBox({
             onBlur={() => {
               window.setTimeout(() => setIsFocused(false), 120);
             }}
-            className="h-10 w-full rounded-md border-0 bg-muted/40 pl-9 pr-3 text-sm outline-none ring-0 placeholder:text-muted-foreground focus:bg-muted"
+            className="h-11 w-full rounded-lg border-0 bg-slate-50 pl-9 pr-3 text-sm text-slate-950 outline-none ring-0 placeholder:text-slate-400 focus:bg-slate-100 dark:bg-background dark:text-foreground dark:placeholder:text-muted-foreground dark:focus:bg-muted"
           />
         </div>
 
@@ -243,7 +243,7 @@ export function SearchBox({
             value={selectedCategory ? String(selectedCategory) : "all"}
             onValueChange={handleCategoryChange}
           >
-            <SelectTrigger className="h-10 w-full border-0 bg-muted/40 md:w-[190px]">
+            <SelectTrigger className="h-11 w-full rounded-lg border-0 bg-slate-50 text-slate-700 md:w-[190px] dark:bg-background dark:text-foreground">
               <SelectValue placeholder="All categories" />
             </SelectTrigger>
             <SelectContent>
@@ -260,17 +260,17 @@ export function SearchBox({
         <Button
           variant="default"
           size="sm"
-          className="h-10 w-full rounded-md px-4 shadow-sm md:w-auto"
+          className="h-11 w-full rounded-lg px-5 shadow-sm shadow-primary/20 md:w-auto"
           onClick={handleSearch}
         >
-          搜索
+          Search
         </Button>
 
         {hasDirectoryFilters && (
           <Button
             variant="ghost"
             size="icon"
-            className="h-10 w-10 shrink-0"
+            className="h-11 w-11 shrink-0 rounded-lg"
             onClick={handleClear}
             aria-label="Clear search filters"
           >
@@ -289,10 +289,10 @@ export function SearchBox({
         )}
 
       {showSuggestions && (
-        <div className="absolute left-0 right-0 z-40 mt-3 max-h-[70vh] overflow-hidden rounded-lg border bg-popover text-popover-foreground shadow-xl">
+        <div className="absolute left-0 right-0 z-40 mt-3 max-h-[70vh] overflow-hidden rounded-xl border border-border/80 bg-white text-slate-950 shadow-2xl shadow-slate-900/10 dark:bg-popover dark:text-popover-foreground">
           <button
             type="button"
-            className="flex w-full items-center justify-between gap-3 px-4 py-4 text-left text-sm transition-colors hover:bg-muted/60"
+            className="flex w-full items-center justify-between gap-3 px-4 py-4 text-left text-sm transition-colors hover:bg-slate-50 dark:hover:bg-muted/60"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => handleSuggestionSearch(localValue.trim())}
           >
@@ -306,7 +306,7 @@ export function SearchBox({
             <ArrowUpRight className="h-4 w-4 text-muted-foreground" />
           </button>
 
-          <div className="border-t bg-muted/40 px-4 py-2 text-xs font-medium text-muted-foreground">
+          <div className="border-t bg-slate-50 px-4 py-2 text-xs font-medium text-slate-500 dark:bg-muted/40 dark:text-muted-foreground">
             Tools({suggestedTools.length})
           </div>
 
@@ -316,7 +316,7 @@ export function SearchBox({
                 <button
                   key={website.id}
                   type="button"
-                  className="grid w-full grid-cols-[minmax(0,1fr)] gap-2 px-4 py-3 text-left transition-colors hover:bg-muted/60 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3"
+                  className="grid w-full grid-cols-[minmax(0,1fr)] gap-2 px-4 py-3 text-left transition-colors hover:bg-slate-50 dark:hover:bg-muted/60 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:gap-3"
                   onMouseDown={(event) => event.preventDefault()}
                   onClick={() => handleSuggestionSearch(website.title)}
                 >

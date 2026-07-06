@@ -71,6 +71,9 @@ Notes:
 - `Popular` can link to `/#popular-tools`.
 - `AI Tools` can link to `/#all-tools`.
 - `Free AI Tools` can link to `/free-ai-tools`.
+- TODO: Create real `/new`, `/popular`, and `/free-ai-tools` routes before
+  changing header links to those route paths. Until then, do not add broken
+  header links for routes that do not exist.
 
 ### 2. Homepage Sections
 

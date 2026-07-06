@@ -2,14 +2,26 @@ import { prisma } from "@/lib/db/db";
 import HomePage from "@/app/home-page";
 import { cachedPrismaQuery } from "@/lib/db/cache";
 import type { Category, Website } from "@/lib/types";
+import {
+  getHomepageResourcePreviews,
+  resourceContentToResourceItem,
+} from "@/lib/resources/resource-content";
 
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 export default async function Home() {
   const startTime = Date.now();
 
   let categoriesData: Category[] = [];
   let websitesData: Website[] = [];
+  let resourcePreviews = {
+    latestNews: [],
+    latestReviews: [],
+    featuredPrompts: [],
+    popularSkills: [],
+    beginnerTutorials: [],
+  };
 
   try {
     // 分类数据可以长时间缓存
@@ -45,11 +57,21 @@ export default async function Home() {
         visits: true,
         likes: true,
         active: true,
+        created_at: true,
       },
     });
+
+    const previews = await getHomepageResourcePreviews(3);
+    resourcePreviews = {
+      latestNews: previews.latestNews.map(resourceContentToResourceItem),
+      latestReviews: previews.latestReviews.map(resourceContentToResourceItem),
+      featuredPrompts: previews.featuredPrompts.map(resourceContentToResourceItem),
+      popularSkills: previews.popularSkills.map(resourceContentToResourceItem),
+      beginnerTutorials: previews.beginnerTutorials.map(resourceContentToResourceItem),
+    };
   } catch (error) {
-    console.error(
-      "[Home] Database query failed while loading public homepage data."
+    console.warn(
+      "[Home] Public homepage data unavailable; rendering fallback content."
     );
   }
 
@@ -59,6 +81,10 @@ export default async function Home() {
   // 预处理数据，减少客户端计算
   const preFilteredWebsites = websitesData.map((website) => ({
     ...website,
+    created_at:
+      website.created_at instanceof Date
+        ? website.created_at.toISOString()
+        : website.created_at,
     searchText: `${website.title.toLowerCase()} ${website.description.toLowerCase()}`,
   }));
 
@@ -66,6 +92,7 @@ export default async function Home() {
     <HomePage
       initialWebsites={preFilteredWebsites}
       initialCategories={categoriesData}
+      resourcePreviews={resourcePreviews}
     />
   );
 }

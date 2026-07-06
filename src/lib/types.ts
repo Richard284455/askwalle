@@ -10,6 +10,7 @@ export interface Website {
   status: string;
   visits: number;
   likes: number;
+  created_at?: string;
 }
 
 export interface Category {

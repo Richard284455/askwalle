@@ -11,6 +11,26 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+enum ResourceType {
+  news
+  review
+  prompt
+  skill
+  tutorial
+}
+
+enum ResourceStatus {
+  draft
+  published
+  archived
+}
+
+enum ResourceSourceType {
+  original
+  source_informed
+  external
+}
+
 model Setting {
   id         Int      @id @default(autoincrement())
   key        String   @unique
@@ -65,4 +85,27 @@ model FooterLink {
 
   @@map("footer_links")
   @@index([url])
+}
+
+model ResourceContent {
+  id             Int                @id @default(autoincrement())
+  type           ResourceType
+  slug           String
+  title          String
+  summary        String
+  category       String
+  tags           Json
+  publishedAt    DateTime
+  updatedAt      DateTime           @updatedAt
+  status         ResourceStatus     @default(draft)
+  sourceType     ResourceSourceType @default(original)
+  sources        Json?
+  content        Json
+  seoTitle       String?
+  seoDescription String?
+
+  @@map("resource_contents")
+  @@unique([type, slug])
+  @@index([type, status, publishedAt])
+  @@index([category])
 }

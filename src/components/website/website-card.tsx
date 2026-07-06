@@ -1,8 +1,10 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import {
+  ArrowRight,
   ArrowUpRight,
   BarChart3,
   Check,
@@ -22,6 +24,7 @@ import {
   sharedLayoutTransition,
 } from "@/ui/animation/variants/animations";
 import type { Website, Category } from "@/lib/types";
+import { createToolSlug } from "@/lib/website/tool-index";
 import { WebsiteThumbnail } from "./website-thumbnail";
 import {
   Tooltip,
@@ -55,6 +58,7 @@ export function WebsiteCard({
     scale: 1.01,
     transitionZ: 6,
   });
+  const detailHref = `/tools/${createToolSlug(website)}`;
 
   useEffect(() => {
     if (website.likes !== prevLikesRef.current) {
@@ -147,8 +151,8 @@ export function WebsiteCard({
       >
         <Card
           className={cn(
-            "group flex h-full min-h-[178px] flex-col overflow-hidden rounded-lg border-border/70 bg-card p-3 shadow-sm",
-            "transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md"
+            "group flex h-full min-h-[196px] flex-col overflow-hidden rounded-lg border-border/80 bg-white p-3 shadow-sm shadow-slate-900/[0.03] dark:bg-card",
+            "transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md hover:shadow-slate-900/[0.07]"
           )}
         >
           <div className="flex items-start gap-3">
@@ -162,9 +166,14 @@ export function WebsiteCard({
 
             <div className="min-w-0 flex-1">
               <div className="flex items-start justify-between gap-2">
-                <h3 className="line-clamp-1 text-sm font-semibold leading-5 group-hover:text-primary">
-                  {website.title}
-                </h3>
+                <Link
+                  href={detailHref}
+                  className="min-w-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <h3 className="line-clamp-1 text-sm font-semibold leading-5 text-slate-950 group-hover:text-primary dark:text-foreground">
+                    {website.title}
+                  </h3>
+                </Link>
                 <TooltipProvider>
                   <Tooltip>
                     <TooltipTrigger asChild>
@@ -194,7 +203,7 @@ export function WebsiteCard({
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
                 <Badge
                   variant="secondary"
-                  className="max-w-full truncate px-2 py-0 text-[11px] font-medium"
+                  className="max-w-full truncate bg-slate-100 px-2 py-0 text-[11px] font-medium text-slate-600 dark:bg-muted dark:text-muted-foreground"
                 >
                   {category?.name || "Uncategorized"}
                 </Badge>
@@ -213,12 +222,14 @@ export function WebsiteCard({
             </div>
           </div>
 
-          <p className="mt-3 line-clamp-2 min-h-[40px] text-xs leading-5 text-muted-foreground">
-            {website.description}
-          </p>
+          <Link href={detailHref} className="mt-3 block">
+            <p className="line-clamp-2 min-h-[40px] text-xs leading-5 text-slate-600 dark:text-muted-foreground">
+              {website.description}
+            </p>
+          </Link>
 
           <div className="mt-auto flex items-center justify-between gap-2 border-t border-border/60 pt-3">
-            <div className="flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+            <div className="flex min-w-0 items-center gap-3 text-xs text-slate-500 dark:text-muted-foreground">
               <span className="inline-flex items-center gap-1">
                 <BarChart3 className="h-3.5 w-3.5" />
                 {website.visits}
@@ -246,13 +257,25 @@ export function WebsiteCard({
               </Button>
 
               <Button
+                asChild
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1 border-border/80 bg-white/70 px-2 text-xs hover:bg-primary hover:text-primary-foreground dark:bg-background/60 sm:gap-1.5 sm:px-2.5"
+              >
+                <Link href={detailHref} aria-label={`View details for ${website.title}`}>
+                  View Details
+                  <ArrowRight className="h-3.5 w-3.5" />
+                </Link>
+              </Button>
+
+              <Button
                 variant="default"
                 size="sm"
                 onClick={() => onVisit(website)}
-                className="h-8 gap-1 px-2 text-xs sm:gap-1.5 sm:px-2.5"
-                aria-label={`Visit ${website.title}`}
+                className="h-8 gap-1 px-2 text-xs shadow-sm shadow-primary/20 sm:gap-1.5 sm:px-2.5"
+                aria-label={`Visit website for ${website.title}`}
               >
-                Visit
+                Visit Website
                 <ArrowUpRight className="h-3.5 w-3.5" />
               </Button>
 

@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState, type KeyboardEvent, type MouseEvent } from "react";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { ArrowUpRight, BarChart3, Heart, Loader2 } from "lucide-react";
+import { ArrowRight, ArrowUpRight, BarChart3, Heart, Loader2 } from "lucide-react";
 import { Badge } from "@/ui/common/badge";
 import { Button } from "@/ui/common/button";
 import { Card } from "@/ui/common/card";
@@ -14,6 +15,7 @@ import {
   sharedLayoutTransition,
 } from "@/ui/animation/variants/animations";
 import type { Website } from "@/lib/types";
+import { createToolSlug } from "@/lib/website/tool-index";
 import { WebsiteThumbnail } from "./website-thumbnail";
 
 interface CompactCardProps {
@@ -23,6 +25,7 @@ interface CompactCardProps {
 }
 
 export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
+  const router = useRouter();
   const [likes, setLikes] = useState(website.likes);
   const [isLiking, setIsLiking] = useState(false);
   const prevLikesRef = useRef(website.likes);
@@ -39,20 +42,27 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
     }
   }, [website.likes]);
 
-  const handleVisit = () => {
-    onVisit(website);
+  const detailHref = `/tools/${createToolSlug(website)}`;
+
+  const handleViewDetails = () => {
+    router.push(detailHref);
   };
 
   const handleCardKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      handleVisit();
+      handleViewDetails();
     }
+  };
+
+  const handleDetailsClick = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation();
+    handleViewDetails();
   };
 
   const handleVisitClick = (event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation();
-    handleVisit();
+    onVisit(website);
   };
 
   const handleLike = async (event: MouseEvent<HTMLButtonElement>) => {
@@ -118,10 +128,10 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
       >
         <Card
           className={cn(
-            "group flex min-h-[96px] cursor-pointer items-center gap-3 rounded-lg border-border/70 bg-card p-3 shadow-sm",
-            "transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md"
+            "group flex min-h-[108px] cursor-pointer items-center gap-3 rounded-lg border-border/80 bg-white p-3 shadow-sm shadow-slate-900/[0.03] dark:bg-card",
+            "transition-all duration-200 hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md hover:shadow-slate-900/[0.07]"
           )}
-          onClick={handleVisit}
+          onClick={handleViewDetails}
           onKeyDown={handleCardKeyDown}
           role="button"
           tabIndex={0}
@@ -136,7 +146,7 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
 
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <h3 className="truncate text-sm font-semibold group-hover:text-primary">
+              <h3 className="truncate text-sm font-semibold text-slate-950 group-hover:text-primary dark:text-foreground">
                 {website.title}
               </h3>
               {website.status !== "approved" && (
@@ -145,10 +155,10 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
                 </Badge>
               )}
             </div>
-            <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">
+            <p className="mt-1 line-clamp-1 text-xs text-slate-600 dark:text-muted-foreground">
               {website.description}
             </p>
-            <div className="mt-2 flex items-center gap-3 text-[11px] text-muted-foreground">
+            <div className="mt-2 flex items-center gap-3 text-[11px] text-slate-500 dark:text-muted-foreground">
               <span className="inline-flex items-center gap-1">
                 <BarChart3 className="h-3 w-3" />
                 {website.visits}
@@ -176,11 +186,20 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
               )}
             </Button>
             <Button
-              variant="ghost"
+              variant="outline"
+              size="icon"
+              onClick={handleDetailsClick}
+              className="h-8 w-8 border-border/80 bg-white/70 text-primary hover:bg-primary hover:text-primary-foreground dark:bg-background/60"
+              aria-label={`View details for ${website.title}`}
+            >
+              <ArrowRight className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="default"
               size="icon"
               onClick={handleVisitClick}
-              className="h-8 w-8 text-primary"
-              aria-label={`Visit ${website.title}`}
+              className="h-8 w-8 shadow-sm shadow-primary/20"
+              aria-label={`Visit website for ${website.title}`}
             >
               <ArrowUpRight className="h-4 w-4" />
             </Button>

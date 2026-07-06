@@ -63,7 +63,7 @@ export default function WebsiteGrid({
   const hasMore = visibleCount < websites.length;
 
   const handleVisit = (website: Website) => {
-    window.open(website.url, "_blank");
+    window.open(website.url, "_blank", "noopener,noreferrer");
 
     fetch(`/api/websites/${website.id}/visit`, { method: "POST" })
       .then((response) => response.json())
@@ -82,7 +82,9 @@ export default function WebsiteGrid({
           );
         }
       })
-      .catch(console.error);
+      .catch(() => {
+        console.warn("[WebsiteGrid] Visit tracking unavailable.");
+      });
 
     fetch(`/api/websites/active`, {
       method: "POST",
@@ -99,7 +101,9 @@ export default function WebsiteGrid({
           );
         }
       })
-      .catch(console.error);
+      .catch(() => {
+        console.warn("[WebsiteGrid] Website status check unavailable.");
+      });
   };
 
   const handleStatusUpdate = async (id: number, status: Website["status"]) => {
