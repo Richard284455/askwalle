@@ -32,7 +32,7 @@ AskWalle is being evolved from an AI tool navigation app into a public AI tools 
 - Full removal of legacy static files under `src/data/resources`.
 - Automated tests. The project currently has no `test` script.
 - Cleanup of noisy non-secret footer/cache build logs.
-- Type checking command. `next build` currently skips type validation and linting based on project configuration.
+- Type checking command. There is **no** `type-check` script in `package.json`. Because `next.config.ts` sets `typescript.ignoreBuildErrors: true` and `eslint.ignoreDuringBuilds: true`, `npm run build` skips both TypeScript type validation and ESLint. A passing build does NOT imply type checking passed.
 - Production deployment validation after the resource database migration.
 
 ## Recent Work
@@ -52,8 +52,9 @@ AskWalle is being evolved from an AI tool navigation app into a public AI tools 
 ## Branch, Commit, and Checkpoint
 
 - Branch: `feature/toolify-inspired-redesign`
-- Latest checkpoint commit: `d273e82`
-- Checkpoint tag: `checkpoint-after-resource-db-migration`
+- Current HEAD: `fad0fe7 docs: add agent handoff documentation`
+- Resource DB migration checkpoint (feature checkpoint): `d273e82 feat: migrate resource hub content to database`
+- Checkpoint tag: `checkpoint-after-resource-db-migration` (points at the `d273e82` resource migration checkpoint)
 - Remote: `origin` points to `https://github.com/Richard284455/askwalle.git`
 
 ## Known Issues and Technical Debt
@@ -137,7 +138,15 @@ The `ResourceContent` migration creates:
 - indexes for type/status/published date and category
 - unique constraint on type + slug
 
-Safe apply command:
+To inspect migration state without applying anything (safe, read-only):
+
+```bash
+npx prisma migrate status
+# or, if DATABASE_URL (pooler) is unreachable:
+DATABASE_URL="$DIRECT_URL" npx prisma migrate status
+```
+
+Apply command — **requires explicit human approval before running** (consistent with `AGENTS.md` and `README.md`; agents must not run migrations on their own):
 
 ```bash
 set -a
@@ -147,11 +156,12 @@ DATABASE_URL="$DIRECT_URL" npx prisma migrate deploy
 DATABASE_URL="$DIRECT_URL" npx prisma generate
 ```
 
-Never run:
+Never run (destructive / prohibited):
 
 ```bash
 npx prisma db push
 npx prisma migrate reset
+npx prisma migrate dev        # creates/applies migrations; approval required, not for routine use
 ```
 
 ## Data Import
