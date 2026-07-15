@@ -14,8 +14,9 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@/ui/common/tabs";
 import type { Website } from "@/lib/types";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { Settings, ListFilter } from "lucide-react";
+import { Settings, ListFilter, LogOut, BookOpen } from "lucide-react";
 import { cn } from "@/lib/utils/utils";
 
 export function AdminPageClient({
@@ -25,9 +26,16 @@ export function AdminPageClient({
   initialWebsites: Website[];
   initialCategories: any[];
 }) {
+  const router = useRouter();
   const [activeStatus, setActiveStatus] =
     useState<Website["status"]>("pending");
   const [selectedCategory, setSelectedCategory] = useState<string>("all");
+
+  const handleLogout = async () => {
+    await fetch("/api/logout", { method: "POST" });
+    router.push("/login");
+    router.refresh();
+  };
 
   if (!initialWebsites || !Array.isArray(initialWebsites)) return null;
   if (!initialCategories || !Array.isArray(initialCategories)) return null;
@@ -76,23 +84,40 @@ export function AdminPageClient({
             管理网站内容和系统设置
           </p>
         </div>
-        <Tabs defaultValue="websites" className="w-full sm:w-auto">
-          <TabsList className="grid w-full sm:w-auto grid-cols-2 bg-background/50">
-            <TabsTrigger
-              value="websites"
-              className="flex items-center gap-2 data-[state=active]:bg-background/60"
-            >
-              <ListFilter className="w-4 h-4" />
-              网站管理
-            </TabsTrigger>
-            <TabsTrigger value="settings" asChild>
-              <Link href="/admin/settings" className="flex items-center gap-2">
-                <Settings className="w-4 h-4" />
-                系统设置
-              </Link>
-            </TabsTrigger>
-          </TabsList>
-        </Tabs>
+        <div className="flex w-full sm:w-auto items-center gap-2">
+          <Tabs defaultValue="websites" className="w-full sm:w-auto">
+            <TabsList className="grid w-full sm:w-auto grid-cols-3 bg-background/50">
+              <TabsTrigger
+                value="websites"
+                className="flex items-center gap-2 data-[state=active]:bg-background/60"
+              >
+                <ListFilter className="w-4 h-4" />
+                网站管理
+              </TabsTrigger>
+              <TabsTrigger value="resources" asChild>
+                <Link href="/admin/resources" className="flex items-center gap-2">
+                  <BookOpen className="w-4 h-4" />
+                  资源管理
+                </Link>
+              </TabsTrigger>
+              <TabsTrigger value="settings" asChild>
+                <Link href="/admin/settings" className="flex items-center gap-2">
+                  <Settings className="w-4 h-4" />
+                  系统设置
+                </Link>
+              </TabsTrigger>
+            </TabsList>
+          </Tabs>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleLogout}
+            className="flex items-center gap-2 shrink-0"
+          >
+            <LogOut className="w-4 h-4" />
+            退出登录
+          </Button>
+        </div>
       </div>
 
       {/* Main Content */}

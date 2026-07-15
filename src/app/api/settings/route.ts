@@ -1,11 +1,15 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db/db";
 import { AjaxResponse } from "@/lib/utils";
+import { requireAdmin } from "@/lib/auth/admin-auth";
 
 export interface SettingItem {
   key: string;
   value: string;
 }
+
+// 不允许通过公开接口读取的敏感设置项
+const SENSITIVE_SETTING_KEYS = new Set(["adminPassword"]);
 
 // Get custom settings
 export async function GET() {
@@ -20,7 +24,9 @@ export async function GET() {
     // Convert array to object with key-value pairs
     const settingsObject = settings.reduce(
       (acc: Record<string, string>, setting) => {
-        acc[setting.key] = setting.value;
+        if (!SENSITIVE_SETTING_KEYS.has(setting.key)) {
+          acc[setting.key] = setting.value;
+        }
         return acc;
       },
       {}
@@ -34,6 +40,9 @@ export async function GET() {
 
 // 更新设置
 export async function PUT(request: Request) {
+  const unauthorized = await requireAdmin();
+  if (unauthorized) return unauthorized;
+
   try {
     const body = await request.json();
 
@@ -82,10 +91,13 @@ export async function POST(request: Request) {
 
     if (body.keys) {
       // Handle multiple keys
+      const requestedKeys = (body.keys as string[]).filter(
+        (key) => !SENSITIVE_SETTING_KEYS.has(key)
+      );
       const settingsArray = await prisma.setting.findMany({
         where: {
           key: {
-            in: body.keys,
+            in: requestedKeys,
           },
         },
       });
@@ -100,6 +112,9 @@ export async function POST(request: Request) {
       );
     } else {
       // Handle single key
+      if (SENSITIVE_SETTING_KEYS.has(body.key)) {
+        return NextResponse.json(AjaxResponse.ok({}));
+      }
       const setting = await prisma.setting.findUnique({
         where: { key: body.key },
       });
@@ -115,6 +130,9 @@ export async function POST(request: Request) {
 }
 
 export async function DELETE(request: Request) {
+  const unauthorized = await requireAdmin();
+  if (unauthorized) return unauthorized;
+
   try {
     const { searchParams } = new URL(request.url);
     const key = searchParams.get("key");

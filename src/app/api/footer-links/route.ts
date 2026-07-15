@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/db/db";
 import { AjaxResponse } from "@/lib/utils";
+import { requireAdmin } from "@/lib/auth/admin-auth";
 
 // 获取所有页脚链接
 export async function GET() {
@@ -22,6 +23,9 @@ export async function GET() {
 
 // 创建新的页脚链接
 export async function POST(request: Request) {
+  const unauthorized = await requireAdmin();
+  if (unauthorized) return unauthorized;
+
   try {
     const { title, url } = await request.json();
 
@@ -54,6 +58,9 @@ export async function POST(request: Request) {
 
 // 更新页脚链接
 export async function PUT(request: Request) {
+  const unauthorized = await requireAdmin();
+  if (unauthorized) return unauthorized;
+
   try {
     const { id, title, url } = await request.json();
 
@@ -80,6 +87,9 @@ export async function PUT(request: Request) {
 
 // 删除页脚链接
 export async function DELETE(request: Request) {
+  const unauthorized = await requireAdmin();
+  if (unauthorized) return unauthorized;
+
   try {
     const { searchParams } = new URL(request.url);
     const id = searchParams.get("id");

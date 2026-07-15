@@ -2,15 +2,18 @@ import { NextResponse } from "next/server";
 import type { Website } from "@/lib/types";
 import { AjaxResponse } from "@/lib/utils";
 import { PrismaClient } from "@prisma/client";
+import { isAdminRequest } from "@/lib/auth/admin-auth";
 
 const prisma = new PrismaClient();
 
 // GET /api/websites
-// 获取所有指定分类的网站
+// 获取所有指定分类的网站；非管理员只能查看已通过的网站
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
-  const status =
+  const requestedStatus =
     (searchParams.get("status") as Website["status"]) || "approved";
+  const isAdmin = await isAdminRequest();
+  const status = isAdmin ? requestedStatus : "approved";
   const websites = await prisma.website.findMany({
     where: { status: status === "all" ? undefined : status },
   });
@@ -77,6 +80,10 @@ export async function POST(request: Request) {
       "content-type"
     )};base64,${Buffer.from(imageBuffer).toString("base64")}`;
 
+    // 非管理员提交一律进入待审核，防止未授权直接发布
+    const isAdmin = await isAdminRequest();
+    const status = isAdmin ? data.status || "pending" : "pending";
+
     const website = await prisma.website.create({
       data: {
         title: data.title.trim(),
@@ -84,7 +91,7 @@ export async function POST(request: Request) {
         description: data.description?.trim() || "",
         category_id: Number(data.category_id),
         thumbnail: data.thumbnail?.trim() || "",
-        status: data.status || "pending",
+        status,
         thumbnail_base64: imageBase64 as string,
       },
     });
