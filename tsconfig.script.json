@@ -15,6 +15,7 @@
   "include": [
     "src/lib/utils/init-data.ts",
     "scripts/cache-thumbnails.ts",
-    "scripts/import-resources.ts"
+    "scripts/import-resources.ts",
+    "scripts/import-tools-from-xlsx.ts"
   ]
 }

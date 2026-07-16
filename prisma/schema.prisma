@@ -31,6 +31,32 @@ enum ResourceSourceType {
   external
 }
 
+enum ToolTagKind {
+  platform
+  pricing
+  topic
+}
+
+enum ToolLinkKind {
+  twitter
+  facebook
+  instagram
+  youtube
+  linkedin
+  tiktok
+  github
+  discord
+  reddit
+  pinterest
+  email
+  pricing
+  login
+  signup
+  about
+  contact
+  other
+}
+
 model Setting {
   id         Int      @id @default(autoincrement())
   key        String   @unique
@@ -45,8 +71,9 @@ model Setting {
 model Website {
   id          Int      @id @default(autoincrement())
   title       String
-  url         String   
+  url         String
   description String
+  slug        String?  @unique
   category    Category @relation(fields: [category_id], references: [id])
   category_id Int
   thumbnail   String?
@@ -57,6 +84,11 @@ model Website {
   active      Int      @default(1)
   created_at  DateTime @default(now())
   updated_at  DateTime @updatedAt
+  toolDetail  ToolDetail?
+  toolTags    WebsiteToolTag[]
+  toolLinks   ToolLink[]
+  toolMedia   ToolMedia[]
+  toolFaqs    ToolFAQ[]
 
   @@map("websites")
   @@index([category_id])
@@ -67,12 +99,16 @@ model Category {
   id         Int       @id @default(autoincrement())
   name       String
   slug       String    @unique
+  parent_id  Int?
+  parent     Category?  @relation("CategoryHierarchy", fields: [parent_id], references: [id])
+  children   Category[] @relation("CategoryHierarchy")
   created_at DateTime  @default(now())
   updated_at DateTime  @updatedAt
   websites   Website[]
 
   @@map("categories")
   @@index([slug])
+  @@index([parent_id])
 }
 
 model FooterLink {
@@ -108,4 +144,89 @@ model ResourceContent {
   @@unique([type, slug])
   @@index([type, status, publishedAt])
   @@index([category])
+}
+
+model ToolDetail {
+  id               Int       @id @default(autoincrement())
+  website_id       Int       @unique
+  website          Website   @relation(fields: [website_id], references: [id])
+  what             String?
+  how              String?
+  features_text    String?
+  features         Json?
+  use_cases        Json?
+  rating           Float?
+  review_count     Int       @default(0)
+  saved_count      Int       @default(0)
+  monthly_visitors Int?
+  listed_at        DateTime?
+  source           String?
+  external_raw     String?
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @updatedAt
+
+  @@map("tool_details")
+}
+
+model ToolTag {
+  id       Int              @id @default(autoincrement())
+  name     String
+  slug     String           @unique
+  kind     ToolTagKind
+  websites WebsiteToolTag[]
+
+  @@map("tool_tags")
+  @@unique([kind, name])
+}
+
+model WebsiteToolTag {
+  website_id Int
+  tag_id     Int
+  website    Website @relation(fields: [website_id], references: [id])
+  tag        ToolTag @relation(fields: [tag_id], references: [id])
+
+  @@map("website_tool_tags")
+  @@id([website_id, tag_id])
+  @@index([tag_id])
+}
+
+model ToolLink {
+  id         Int          @id @default(autoincrement())
+  website_id Int
+  website    Website      @relation(fields: [website_id], references: [id])
+  kind       ToolLinkKind
+  url        String
+  label      String?
+  created_at DateTime     @default(now())
+
+  @@map("tool_links")
+  @@unique([website_id, kind, url])
+  @@index([website_id])
+}
+
+model ToolMedia {
+  id         Int      @id @default(autoincrement())
+  website_id Int
+  website    Website  @relation(fields: [website_id], references: [id])
+  kind       String   @default("screenshot")
+  // V1 存提取出来的源图 URL；TODO: 后续缓存到 public/ 或对象存储，不长期热链外部 CDN
+  url        String
+  alt        String?
+  position   Int      @default(0)
+  created_at DateTime @default(now())
+
+  @@map("tool_media")
+  @@index([website_id])
+}
+
+model ToolFAQ {
+  id         Int     @id @default(autoincrement())
+  website_id Int
+  website    Website @relation(fields: [website_id], references: [id])
+  question   String
+  answer     String?
+  position   Int     @default(0)
+
+  @@map("tool_faqs")
+  @@index([website_id])
 }

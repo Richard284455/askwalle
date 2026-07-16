@@ -9,7 +9,8 @@
     "lint": "next lint",
     "cache-thumbnails": "ts-node --project tsconfig.script.json scripts/cache-thumbnails.ts",
     "init-data": "ts-node --project tsconfig.script.json src/lib/utils/init-data.ts",
-    "import:resources": "ts-node --project tsconfig.script.json scripts/import-resources.ts"
+    "import:resources": "ts-node --project tsconfig.script.json scripts/import-resources.ts",
+    "import:tools": "ts-node --project tsconfig.script.json scripts/import-tools-from-xlsx.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
