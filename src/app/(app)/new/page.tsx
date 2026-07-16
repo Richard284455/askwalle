@@ -32,6 +32,7 @@ export default async function NewToolsPage() {
         select: {
           id: true,
           title: true,
+          slug: true,
           url: true,
           description: true,
           category_id: true,

@@ -16,6 +16,9 @@
     "src/lib/utils/init-data.ts",
     "scripts/cache-thumbnails.ts",
     "scripts/import-resources.ts",
-    "scripts/import-tools-from-xlsx.ts"
+    "scripts/import-tools-from-xlsx.ts",
+    "scripts/backfill-website-slugs.ts",
+    "scripts/cache-tool-media.ts",
+    "scripts/lib/slug-utils.ts"
   ]
 }

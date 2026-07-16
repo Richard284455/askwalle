@@ -13,6 +13,7 @@ export default async function RankingsPage() {
     select: {
       id: true,
       title: true,
+      slug: true,
       url: true,
       description: true,
       category_id: true,

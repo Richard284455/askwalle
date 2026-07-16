@@ -3,6 +3,7 @@ export interface Website {
   title: string;
   url: string;
   description: string;
+  slug?: string | null;
   category_id: number;
   thumbnail: string | null;
   thumbnail_base64: string | null;

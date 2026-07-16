@@ -1,11 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { ArrowUpRight, CalendarDays, Eye, Heart, Medal } from "lucide-react";
 import { Badge } from "@/ui/common/badge";
 import { Button } from "@/ui/common/button";
 import { Card } from "@/ui/common/card";
 import { cn } from "@/lib/utils/utils";
 import type { Category, Website } from "@/lib/types";
+import { getToolHref } from "@/lib/website/tool-index";
 import { WebsiteThumbnail } from "./website-thumbnail";
 
 export type RankedWebsite = Website & {
@@ -90,9 +92,14 @@ function RankingRow({
         />
         <div className="min-w-0">
           <div className="flex min-w-0 items-center gap-2">
-            <h3 className="truncate text-sm font-semibold group-hover:text-primary">
-              {website.title}
-            </h3>
+            <Link
+              href={getToolHref(website)}
+              className="min-w-0 rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <h3 className="truncate text-sm font-semibold group-hover:text-primary">
+                {website.title}
+              </h3>
+            </Link>
             {website.category && (
               <Badge variant="secondary" className="hidden shrink-0 px-2 py-0 text-[11px] sm:inline-flex">
                 {website.category.name}

@@ -31,7 +31,7 @@ import {
   websitesAtom,
 } from "@/lib/atoms";
 import { cn } from "@/lib/utils/utils";
-import { createToolSlug } from "@/lib/website/tool-index";
+import { getToolHref } from "@/lib/website/tool-index";
 import type { Website, Category } from "@/lib/types";
 import type { PublicResourceListItem } from "@/lib/resources/resource-content";
 
@@ -79,46 +79,51 @@ export default function HomePage({
     setSelectedCategory,
   ]);
 
+  // SSR 与首屏渲染使用服务端 props（atom 初始为空，仅客户端 effect 后填充），
+  // 保证首页 HTML 直接包含工具卡片与链接；atom 同步后无缝接管
+  const websiteList = websites.length > 0 ? websites : initialWebsites;
+  const categoryList = categories.length > 0 ? categories : initialCategories;
+
   const categoryById = useMemo(() => {
-    return new Map(categories.map((category) => [category.id, category]));
-  }, [categories]);
+    return new Map(categoryList.map((category) => [category.id, category]));
+  }, [categoryList]);
 
   const toolCountsByCategory = useMemo(() => {
-    return websites.reduce((counts, website) => {
+    return websiteList.reduce((counts, website) => {
       counts.set(website.category_id, (counts.get(website.category_id) || 0) + 1);
       return counts;
     }, new Map<number, number>());
-  }, [websites]);
+  }, [websiteList]);
 
   const filteredWebsites = useMemo(() => {
-    return websites.filter((website) => {
+    return websiteList.filter((website) => {
       const matchesCategory =
         !selectedCategory || website.category_id === Number(selectedCategory);
 
       return matchesCategory;
     });
-  }, [websites, selectedCategory]);
+  }, [websiteList, selectedCategory]);
 
   const topVisitedTools = useMemo(() => {
-    return [...websites].sort((a, b) => b.visits - a.visits).slice(0, 6);
-  }, [websites]);
+    return [...websiteList].sort((a, b) => b.visits - a.visits).slice(0, 6);
+  }, [websiteList]);
 
   const mostLikedTools = useMemo(() => {
-    return [...websites].sort((a, b) => b.likes - a.likes).slice(0, 6);
-  }, [websites]);
+    return [...websiteList].sort((a, b) => b.likes - a.likes).slice(0, 6);
+  }, [websiteList]);
 
   const newTools = useMemo(() => {
-    return [...websites]
+    return [...websiteList]
       .sort(
         (a, b) =>
           new Date(b.created_at || 0).getTime() -
           new Date(a.created_at || 0).getTime()
       )
       .slice(0, 6);
-  }, [websites]);
+  }, [websiteList]);
 
   const freeToolsPreview = useMemo(() => {
-    const keywordMatches = websites.filter((website) => {
+    const keywordMatches = websiteList.filter((website) => {
       const text = `${website.title} ${website.description}`.toLowerCase();
       return (
         text.includes("free") ||
@@ -128,11 +133,11 @@ export default function HomePage({
       );
     });
 
-    return (keywordMatches.length > 0 ? keywordMatches : websites)
+    return (keywordMatches.length > 0 ? keywordMatches : websiteList)
       .slice()
       .sort((a, b) => b.likes - a.likes || b.visits - a.visits)
       .slice(0, 6);
-  }, [websites]);
+  }, [websiteList]);
 
   const exploreTabs = [
     {
@@ -160,14 +165,14 @@ export default function HomePage({
   const activeExplore = exploreTabs.find((tab) => tab.id === activeExploreTab) || exploreTabs[0];
 
   const featuredCategories = useMemo(() => {
-    return [...categories]
+    return [...categoryList]
       .sort(
         (a, b) =>
           (toolCountsByCategory.get(b.id) || 0) -
           (toolCountsByCategory.get(a.id) || 0)
       )
       .slice(0, 8);
-  }, [categories, toolCountsByCategory]);
+  }, [categoryList, toolCountsByCategory]);
 
   const popularCategories = featuredCategories.slice(0, 6);
   const hasActiveFilters = !!selectedCategory;
@@ -235,8 +240,8 @@ export default function HomePage({
               <SearchBox
                 value={searchQuery}
                 onChange={setSearchQuery}
-                categories={categories}
-                websites={websites}
+                categories={categoryList}
+                websites={websiteList}
                 selectedCategory={selectedCategory}
                 onCategoryChange={handleCategorySelect}
                 onSearchSubmit={scrollToResults}
@@ -248,7 +253,7 @@ export default function HomePage({
               <CategoryChip
                 active={!selectedCategory}
                 label="All tools"
-                count={websites.length}
+                count={websiteList.length}
                 onClick={() => handleCategorySelect(null)}
               />
               {popularCategories.map((category) => (
@@ -263,10 +268,10 @@ export default function HomePage({
             </div>
 
             <div className="mt-9 grid w-full max-w-3xl grid-cols-1 gap-3 sm:grid-cols-3">
-              <StatCard label="AI tools" value={websites.length.toString()} />
+              <StatCard label="AI tools" value={websiteList.length.toString()} />
               <StatCard
                 label="Categories"
-                value={categories.length.toString()}
+                value={categoryList.length.toString()}
               />
               <StatCard
                 label="Recently added"
@@ -461,7 +466,7 @@ export default function HomePage({
                 }}
               />
             ) : (
-              <WebsiteGrid websites={filteredWebsites} categories={categories} />
+              <WebsiteGrid websites={filteredWebsites} categories={categoryList} />
             )}
           </div>
         </motion.section>
@@ -714,7 +719,7 @@ function DirectoryToolCard({
   category?: Category;
   onVisit: (website: Website) => void;
 }) {
-  const detailHref = `/tools/${createToolSlug(website)}`;
+  const detailHref = getToolHref(website);
 
   return (
     <Card className="group flex h-full flex-col gap-4 rounded-lg border-border/80 bg-white p-4 shadow-sm shadow-slate-900/[0.03] transition-all hover:-translate-y-0.5 hover:border-primary/30 hover:shadow-md hover:shadow-slate-900/[0.07] dark:bg-card">

@@ -119,6 +119,7 @@ export default async function FreeAiToolsPage() {
         select: {
           id: true,
           title: true,
+          slug: true,
           url: true,
           description: true,
           category_id: true,

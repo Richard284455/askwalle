@@ -40,3 +40,10 @@ export function getToolIdFromSlug(slug: string) {
 
   return match ? Number(match[1]) : null;
 }
+
+// 详情页链接：优先使用数据库持久化 slug，缺失时回退到 title-id 兼容格式
+export function getToolHref(
+  website: Pick<Website, "id" | "title"> & { slug?: string | null }
+) {
+  return `/tools/${website.slug || createToolSlug(website)}`;
+}

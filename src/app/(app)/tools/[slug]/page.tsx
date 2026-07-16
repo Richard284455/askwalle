@@ -6,19 +6,26 @@ import {
   ArrowLeft,
   ArrowRight,
   BarChart3,
-  CalendarDays,
+  Bookmark,
   CheckCircle2,
   Compass,
   ExternalLink,
+  Globe,
   Heart,
+  HelpCircle,
+  Link2,
+  ListChecks,
   Plus,
+  Sparkles,
+  Star,
+  Users,
 } from "lucide-react";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import WebsiteGrid from "@/components/website/website-grid";
 import { ToolVisitButton } from "@/components/website/tool-visit-button";
 import { WebsiteThumbnail } from "@/components/website/website-thumbnail";
 import {
-  createToolSlug,
   getToolIdFromSlug,
   TOOL_INDEX_LETTERS,
 } from "@/lib/website/tool-index";
@@ -55,13 +62,29 @@ function formatDate(value?: Date | string | null) {
   });
 }
 
-function toPublicWebsite(website: Website & { created_at?: Date | string }) {
+function formatVisitorCount(value: number) {
+  if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}B`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`;
+  return value.toLocaleString();
+}
+
+function stringArray(value: Prisma.JsonValue | null | undefined): string[] {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is string =>
+          typeof item === "string" && item.trim().length > 0
+      )
+    : [];
+}
+
+function toPublicWebsite<T extends { created_at?: Date | string }>(
+  website: T
+): Omit<T, "created_at"> & { created_at?: string } {
+  const { created_at, ...rest } = website;
   return {
-    ...website,
-    created_at:
-      website.created_at instanceof Date
-        ? website.created_at.toISOString()
-        : website.created_at,
+    ...rest,
+    created_at: created_at instanceof Date ? created_at.toISOString() : created_at,
   };
 }
 
@@ -112,15 +135,22 @@ function getIconHorseUrl(value: string) {
   }
 }
 
-const getApprovedWebsiteById = cache(async (id: number) => {
-  return prisma.website.findFirst({
-    where: {
-      id,
-      status: "approved",
-    },
+function getHostname(value: string) {
+  try {
+    return new URL(value).hostname.replace(/^www\./, "");
+  } catch {
+    return value;
+  }
+}
+
+const toolInclude = {
+  category: {
     select: {
-      ...websiteSelect,
-      category: {
+      id: true,
+      name: true,
+      slug: true,
+      parent_id: true,
+      parent: {
         select: {
           id: true,
           name: true,
@@ -128,8 +158,69 @@ const getApprovedWebsiteById = cache(async (id: number) => {
         },
       },
     },
+  },
+  toolDetail: true,
+  toolTags: { include: { tag: true } },
+  toolLinks: true,
+  toolMedia: { orderBy: { position: "asc" as const } },
+  toolFaqs: { orderBy: { position: "asc" as const } },
+} satisfies Prisma.WebsiteInclude;
+
+type ToolWithRelations = Prisma.WebsiteGetPayload<{ include: typeof toolInclude }>;
+
+// 公开详情页只允许 approved 工具；优先数据库 slug，兼容旧 title-id 链接。
+// slug 被任何记录占用（含非 approved）时不做 legacy 回退，避免尾号被误当作 id。
+const getApprovedTool = cache(async (slug: string): Promise<ToolWithRelations | null> => {
+  const bySlug = await prisma.website.findFirst({
+    where: { slug },
+    include: toolInclude,
   });
+
+  if (bySlug) {
+    return bySlug.status === "approved" ? bySlug : null;
+  }
+
+  const legacyId = getToolIdFromSlug(slug);
+  if (!legacyId) return null;
+
+  const legacy = await prisma.website.findFirst({
+    where: { id: legacyId, status: "approved" },
+    include: toolInclude,
+  });
+
+  return legacy;
 });
+
+async function getRelatedTools(tool: ToolWithRelations) {
+  // 优先同 level2 分类，其次同 level1 下的兄弟分类，只取 approved，limit 6
+  const sameCategory = await prisma.website.findMany({
+    where: {
+      status: "approved",
+      category_id: tool.category_id,
+      id: { not: tool.id },
+    },
+    orderBy: [{ visits: "desc" }, { likes: "desc" }],
+    take: 6,
+    select: websiteSelect,
+  });
+
+  if (sameCategory.length >= 6 || !tool.category?.parent) {
+    return sameCategory;
+  }
+
+  const siblings = await prisma.website.findMany({
+    where: {
+      status: "approved",
+      id: { notIn: [tool.id, ...sameCategory.map((website) => website.id)] },
+      category: { parent_id: tool.category.parent.id },
+    },
+    orderBy: [{ visits: "desc" }, { likes: "desc" }],
+    take: 6 - sameCategory.length,
+    select: websiteSelect,
+  });
+
+  return [...sameCategory, ...siblings];
+}
 
 export async function generateMetadata({
   params,
@@ -144,16 +235,12 @@ export async function generateMetadata({
     };
   }
 
-  const id = getToolIdFromSlug(slug);
-
-  if (!id) {
-    return {
-      title: "AI Tool Details | AskWalle AI Hub",
-      description: "Explore AI tool details, category, usage notes, and related tools on AskWalle AI Hub.",
-    };
+  let website: ToolWithRelations | null = null;
+  try {
+    website = await getApprovedTool(slug);
+  } catch {
+    website = null;
   }
-
-  const website = await getApprovedWebsiteById(id);
 
   if (!website) {
     return {
@@ -163,7 +250,9 @@ export async function generateMetadata({
   }
 
   const title = `${website.title} - AI Tool Details | AskWalle AI Hub`;
-  const description = truncateDescription(website.description);
+  const description = truncateDescription(
+    website.toolDetail?.what ?? website.description
+  );
   const image = getCachedThumbnailImage(website);
 
   return {
@@ -230,7 +319,7 @@ async function ToolsLetterPage({ slug }: { slug: string }) {
 
     websites = websiteData.map(toPublicWebsite);
     categories = categoryData;
-  } catch (error) {
+  } catch {
     console.warn("[ToolsLetterPage] Public tools letter data unavailable.");
   }
 
@@ -301,63 +390,113 @@ async function ToolsLetterPage({ slug }: { slug: string }) {
   );
 }
 
+const LINK_GROUPS: { label: string; kinds: string[] }[] = [
+  { label: "Pricing", kinds: ["pricing"] },
+  { label: "Account", kinds: ["login", "signup"] },
+  {
+    label: "Social",
+    kinds: [
+      "twitter",
+      "facebook",
+      "instagram",
+      "youtube",
+      "linkedin",
+      "tiktok",
+      "github",
+      "discord",
+      "reddit",
+      "pinterest",
+    ],
+  },
+  { label: "Email", kinds: ["email"] },
+  { label: "More", kinds: ["about", "contact", "other"] },
+];
+
+function linkLabel(kind: string, url: string) {
+  const names: Record<string, string> = {
+    twitter: "Twitter / X",
+    facebook: "Facebook",
+    instagram: "Instagram",
+    youtube: "YouTube",
+    linkedin: "LinkedIn",
+    tiktok: "TikTok",
+    github: "GitHub",
+    discord: "Discord",
+    reddit: "Reddit",
+    pinterest: "Pinterest",
+    pricing: "Pricing page",
+    login: "Log in",
+    signup: "Sign up",
+    about: "About",
+    contact: "Contact",
+    email: url,
+    other: getHostname(url),
+  };
+  return names[kind] ?? kind;
+}
+
 async function ToolDetailPage({ slug }: { slug: string }) {
-  const id = getToolIdFromSlug(slug);
-
-  if (!id) {
-    notFound();
-  }
-
-  let website:
-    | (Website & {
-        category: Category | null;
-        created_at: Date | string;
-      })
-    | null = null;
+  let website: ToolWithRelations | null = null;
   let relatedTools: Website[] = [];
-  let categories: Category[] = [];
 
   try {
-    website = await getApprovedWebsiteById(id);
-
-    if (!website) {
-      notFound();
-    }
-
-    const [relatedData, categoryData] = await Promise.all([
-      prisma.website.findMany({
-        where: {
-          status: "approved",
-          category_id: website.category_id,
-          id: {
-            not: website.id,
-          },
-        },
-        orderBy: [{ visits: "desc" }, { likes: "desc" }],
-        take: 6,
-        select: websiteSelect,
-      }),
-      prisma.category.findMany({
-        where: {
-          id: website.category_id,
-        },
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-        },
-      }),
-    ]);
-
-    relatedTools = relatedData.map(toPublicWebsite);
-    categories = categoryData;
-  } catch (error) {
+    website = await getApprovedTool(slug);
+  } catch {
     console.warn("[ToolDetailPage] Public tool detail data unavailable.");
     notFound();
   }
 
+  if (!website) {
+    notFound();
+  }
+
+  try {
+    relatedTools = (await getRelatedTools(website)).map(toPublicWebsite);
+  } catch {
+    console.warn("[ToolDetailPage] Related tools unavailable.");
+  }
+
   const category = website.category;
+  const parentCategory = category?.parent ?? null;
   const categoryHref = category ? `/categories/${category.slug}` : "/categories";
+  const detail = website.toolDetail;
+
+  const allTags = website.toolTags.map((entry) => entry.tag);
+  const topicTags = allTags.filter((tag) => tag.kind === "topic");
+  const pricingTags = allTags.filter((tag) => tag.kind === "pricing");
+  const platformTags = allTags.filter((tag) => tag.kind === "platform");
+
+  const features = stringArray(detail?.features);
+  const useCases = stringArray(detail?.use_cases);
+  const screenshots = website.toolMedia;
+  // FAQ 只有在存在有内容的 answer 时才展示，避免空手风琴
+  const answeredFaqs = website.toolFaqs.filter(
+    (faq) => faq.answer && faq.answer.trim().length > 0
+  );
+
+  const stats: { icon: typeof Star; label: string; value: string }[] = [];
+  if (detail?.rating) {
+    stats.push({ icon: Star, label: "Rating", value: detail.rating.toFixed(1) });
+  }
+  if (detail && detail.saved_count > 0) {
+    stats.push({
+      icon: Bookmark,
+      label: "Saved",
+      value: detail.saved_count.toLocaleString(),
+    });
+  }
+  if (detail?.monthly_visitors) {
+    stats.push({
+      icon: Users,
+      label: "Monthly visitors",
+      value: formatVisitorCount(detail.monthly_visitors),
+    });
+  }
+
+  const linkGroups = LINK_GROUPS.map((group) => ({
+    label: group.label,
+    links: website.toolLinks.filter((link) => group.kinds.includes(link.kind)),
+  })).filter((group) => group.links.length > 0);
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-background">
@@ -371,6 +510,17 @@ async function ToolDetailPage({ slug }: { slug: string }) {
             <Link href="/tools" className="hover:text-primary">
               AI Tools
             </Link>
+            {parentCategory && (
+              <>
+                <span>/</span>
+                <Link
+                  href={`/categories/${parentCategory.slug}`}
+                  className="hover:text-primary"
+                >
+                  {parentCategory.name}
+                </Link>
+              </>
+            )}
             <span>/</span>
             <Link href={categoryHref} className="hover:text-primary">
               {category?.name || "Category"}
@@ -401,9 +551,6 @@ async function ToolDetailPage({ slug }: { slug: string }) {
                       <CheckCircle2 className="h-3.5 w-3.5" />
                       Approved
                     </Badge>
-                    <Badge variant="outline" className="border-border/80 bg-white/70 dark:bg-background/60">
-                      {website.active ? "Website reachable" : "Status unknown"}
-                    </Badge>
                   </div>
                   <h1 className="mt-4 text-3xl font-semibold tracking-normal text-slate-950 md:text-5xl dark:text-foreground">
                     {website.title}
@@ -411,6 +558,32 @@ async function ToolDetailPage({ slug }: { slug: string }) {
                   <p className="mt-4 max-w-3xl text-sm leading-6 text-slate-600 md:text-base dark:text-muted-foreground">
                     {website.description}
                   </p>
+                  {topicTags.length > 0 && (
+                    <div className="mt-4 flex flex-wrap gap-1.5">
+                      {topicTags.slice(0, 8).map((tag) => (
+                        <Badge
+                          key={tag.id}
+                          variant="outline"
+                          className="border-border/80 bg-white/70 px-2 py-0.5 text-[11px] font-medium text-slate-600 dark:bg-background/60 dark:text-muted-foreground"
+                        >
+                          {tag.name}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                  {stats.length > 0 && (
+                    <div className="mt-4 flex flex-wrap gap-4 text-sm text-slate-600 dark:text-muted-foreground">
+                      {stats.map((stat) => (
+                        <span key={stat.label} className="inline-flex items-center gap-1.5">
+                          <stat.icon className="h-4 w-4 text-primary" />
+                          <span className="font-semibold text-slate-950 dark:text-foreground">
+                            {stat.value}
+                          </span>
+                          {stat.label}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   <div className="mt-5 flex flex-col gap-3 sm:flex-row">
                     <ToolVisitButton
                       websiteId={website.id}
@@ -428,7 +601,7 @@ async function ToolDetailPage({ slug }: { slug: string }) {
             <Card className="rounded-xl border-border/80 bg-white p-4 shadow-sm shadow-slate-900/[0.04] dark:bg-card">
               <div className="flex items-center justify-between gap-3">
                 <h2 className="font-semibold text-slate-950 dark:text-foreground">
-                  Quick info
+                  Quick facts
                 </h2>
                 <Badge variant="outline" className="border-primary/20 bg-primary/5 text-primary">
                   Directory listing
@@ -439,13 +612,41 @@ async function ToolDetailPage({ slug }: { slug: string }) {
                 <Metric label="Likes" value={website.likes.toLocaleString()} icon={Heart} />
               </div>
               <div className="mt-4 space-y-3 border-t border-border/60 pt-4">
-                <InfoRow label="Category" value={category?.name || "Uncategorized"} />
-                <InfoRow label="Added date" value={formatDate(website.created_at)} />
+                <InfoRow label="Official website" value={getHostname(website.url)} />
                 <InfoRow
-                  label="Website status"
-                  value={website.active ? "Reachable" : "Status unknown"}
+                  label="Category"
+                  value={
+                    parentCategory
+                      ? `${parentCategory.name} / ${category?.name ?? ""}`
+                      : category?.name || "Uncategorized"
+                  }
                 />
-                <InfoRow label="Pricing" value="Not specified" />
+                <InfoRow
+                  label="Pricing"
+                  value={
+                    pricingTags.length
+                      ? pricingTags.map((tag) => tag.name).join(", ")
+                      : "Not specified"
+                  }
+                />
+                <InfoRow
+                  label="Platform"
+                  value={
+                    platformTags.length
+                      ? platformTags.map((tag) => tag.name).join(", ")
+                      : "Not specified"
+                  }
+                />
+                <InfoRow
+                  label="Listed date"
+                  value={formatDate(detail?.listed_at ?? website.created_at)}
+                />
+                {detail?.monthly_visitors ? (
+                  <InfoRow
+                    label="Monthly visitors"
+                    value={formatVisitorCount(detail.monthly_visitors)}
+                  />
+                ) : null}
               </div>
               <ToolVisitButton
                 websiteId={website.id}
@@ -462,50 +663,178 @@ async function ToolDetailPage({ slug }: { slug: string }) {
         <section className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="space-y-6">
             <DetailSection title={`What is ${website.title}?`}>
-              <p>
-                {website.title} is listed in AskWalle AI Hub as an approved AI
-                tool in the {category?.name || "Uncategorized"} category. The
-                directory description says: {website.description}
-              </p>
-              <p className="mt-3">
-                This overview uses existing directory metadata only. Verify
-                current features, pricing, availability, and terms on the
-                official website before adopting the tool.
-              </p>
+              {detail?.what ? (
+                <p className="whitespace-pre-line">{detail.what}</p>
+              ) : (
+                <>
+                  <p>
+                    {website.title} is listed in AskWalle AI Hub as an approved AI
+                    tool in the {category?.name || "Uncategorized"} category. The
+                    directory description says: {website.description}
+                  </p>
+                  <p className="mt-3">
+                    This overview uses existing directory metadata only. Verify
+                    current features, pricing, availability, and terms on the
+                    official website before adopting the tool.
+                  </p>
+                </>
+              )}
             </DetailSection>
 
             <DetailSection title="How to use">
-              <ol className="space-y-3">
-                {[
-                  "Open the official website using the Visit Website button.",
-                  "Review the tool's current features, pricing, account requirements, and usage limits.",
-                  "Try the tool with a small, low-risk workflow before using it for important work.",
-                  "Compare the output with related tools in the same category before deciding.",
-                ].map((step, index) => (
-                  <li key={step} className="flex gap-3">
-                    <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-xs font-semibold text-primary">
-                      {index + 1}
-                    </span>
-                    <span>{step}</span>
-                  </li>
-                ))}
-              </ol>
+              {detail?.how ? (
+                <p className="whitespace-pre-line">{detail.how}</p>
+              ) : (
+                <ol className="space-y-3">
+                  {[
+                    "Open the official website using the Visit Website button.",
+                    "Review the tool's current features, pricing, account requirements, and usage limits.",
+                    "Try the tool with a small, low-risk workflow before using it for important work.",
+                    "Compare the output with related tools in the same category before deciding.",
+                  ].map((step, index) => (
+                    <li key={step} className="flex gap-3">
+                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-xs font-semibold text-primary">
+                        {index + 1}
+                      </span>
+                      <span>{step}</span>
+                    </li>
+                  ))}
+                </ol>
+              )}
             </DetailSection>
+
+            {(features.length > 0 || detail?.features_text) && (
+              <DetailSection title="Core features">
+                {features.length > 0 ? (
+                  <ul className="space-y-2.5">
+                    {features.map((feature) => (
+                      <li key={feature} className="flex gap-2.5">
+                        <Sparkles className="mt-1 h-4 w-4 shrink-0 text-primary" />
+                        <span>{feature}</span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="whitespace-pre-line">{detail?.features_text}</p>
+                )}
+              </DetailSection>
+            )}
+
+            {useCases.length > 0 && (
+              <DetailSection title="Use cases">
+                <ul className="space-y-2.5">
+                  {useCases.map((useCase, index) => (
+                    <li key={useCase} className="flex gap-3">
+                      <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-primary/10 text-xs font-semibold text-primary">
+                        {index + 1}
+                      </span>
+                      <span>{useCase}</span>
+                    </li>
+                  ))}
+                </ul>
+              </DetailSection>
+            )}
+
+            {screenshots.length > 0 && (
+              <DetailSection title="Screenshots">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  {screenshots.map((media) => (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      key={media.id}
+                      src={media.url}
+                      alt={media.alt || `${website.title} screenshot`}
+                      loading="lazy"
+                      className="w-full rounded-lg border border-border/80 bg-slate-50 object-cover shadow-sm dark:bg-background"
+                    />
+                  ))}
+                </div>
+              </DetailSection>
+            )}
+
+            {answeredFaqs.length > 0 && (
+              <DetailSection title="FAQ">
+                <div className="space-y-4">
+                  {answeredFaqs.map((faq) => (
+                    <div key={faq.id} className="rounded-lg border border-border/60 bg-slate-50 p-4 dark:bg-background">
+                      <p className="flex items-start gap-2 font-medium text-slate-950 dark:text-foreground">
+                        <HelpCircle className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                        {faq.question}
+                      </p>
+                      <p className="mt-2 pl-6 text-sm leading-6">{faq.answer}</p>
+                    </div>
+                  ))}
+                </div>
+              </DetailSection>
+            )}
           </div>
 
-          <Card className="h-fit rounded-xl border-border/80 bg-white p-4 shadow-sm shadow-slate-900/[0.04] dark:bg-card">
-            <h2 className="font-semibold text-slate-950 dark:text-foreground">
-              Evaluation notes
-            </h2>
-            <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-muted-foreground">
-              AskWalle lists this tool for discovery and comparison. Product
-              capabilities can change, so use the official site as the source
-              of truth before buying or deploying it.
-            </p>
-            <Button asChild variant="outline" size="sm" className="mt-4 w-full bg-white/70 dark:bg-background/60">
-              <Link href={categoryHref}>Browse more in category</Link>
-            </Button>
-          </Card>
+          <div className="space-y-6">
+            <Card className="h-fit rounded-xl border-border/80 bg-white p-4 shadow-sm shadow-slate-900/[0.04] dark:bg-card">
+              <h2 className="flex items-center gap-2 font-semibold text-slate-950 dark:text-foreground">
+                <Link2 className="h-4 w-4 text-primary" />
+                Links &amp; social
+              </h2>
+              <div className="mt-3 space-y-3">
+                <div>
+                  <p className="text-xs font-semibold uppercase text-slate-500 dark:text-muted-foreground">
+                    Official
+                  </p>
+                  <a
+                    href={website.url}
+                    target="_blank"
+                    rel="noopener noreferrer nofollow"
+                    className="mt-1 inline-flex items-center gap-1.5 text-sm font-medium text-primary hover:underline"
+                  >
+                    <Globe className="h-3.5 w-3.5" />
+                    {getHostname(website.url)}
+                  </a>
+                </div>
+                {linkGroups.map((group) => (
+                  <div key={group.label}>
+                    <p className="text-xs font-semibold uppercase text-slate-500 dark:text-muted-foreground">
+                      {group.label}
+                    </p>
+                    <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
+                      {group.links.map((link) => (
+                        <a
+                          key={link.id}
+                          href={
+                            link.kind === "email"
+                              ? `mailto:${link.url}`
+                              : link.url
+                          }
+                          target={link.kind === "email" ? undefined : "_blank"}
+                          rel="noopener noreferrer nofollow"
+                          className="inline-flex items-center gap-1 text-sm text-slate-600 hover:text-primary dark:text-muted-foreground"
+                        >
+                          {linkLabel(link.kind, link.url)}
+                          {link.kind !== "email" && (
+                            <ExternalLink className="h-3 w-3" />
+                          )}
+                        </a>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Card>
+
+            <Card className="h-fit rounded-xl border-border/80 bg-white p-4 shadow-sm shadow-slate-900/[0.04] dark:bg-card">
+              <h2 className="flex items-center gap-2 font-semibold text-slate-950 dark:text-foreground">
+                <ListChecks className="h-4 w-4 text-primary" />
+                Evaluation notes
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-muted-foreground">
+                AskWalle lists this tool for discovery and comparison. Product
+                capabilities can change, so use the official site as the source
+                of truth before buying or deploying it.
+              </p>
+              <Button asChild variant="outline" size="sm" className="mt-4 w-full bg-white/70 dark:bg-background/60">
+                <Link href={categoryHref}>Browse more in category</Link>
+              </Button>
+            </Card>
+          </div>
         </section>
 
         <section>
@@ -515,7 +844,10 @@ async function ToolDetailPage({ slug }: { slug: string }) {
             description="Explore other approved AI tools from the same category."
           />
           {relatedTools.length > 0 ? (
-            <WebsiteGrid websites={relatedTools} categories={categories} />
+            <WebsiteGrid
+              websites={relatedTools}
+              categories={category ? [category] : []}
+            />
           ) : (
             <Card className="mt-5 rounded-lg border-border/80 bg-white p-8 text-center text-sm text-slate-600 shadow-sm shadow-slate-900/[0.03] dark:bg-card dark:text-muted-foreground">
               No related tools are available in this category yet.
@@ -639,6 +971,7 @@ function SectionHeader({
 const websiteSelect = {
   id: true,
   title: true,
+  slug: true,
   url: true,
   description: true,
   category_id: true,

@@ -6,7 +6,7 @@ import { Badge } from "@/ui/common/badge";
 import { Button } from "@/ui/common/button";
 import { Card } from "@/ui/common/card";
 import { WebsiteThumbnail } from "@/components/website/website-thumbnail";
-import { createToolSlug } from "@/lib/website/tool-index";
+import { getToolHref } from "@/lib/website/tool-index";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -52,6 +52,7 @@ export default async function CategoryPage({ params }: CategoryPageProps) {
         select: {
           id: true,
           title: true,
+          slug: true,
           url: true,
           description: true,
           category_id: true,
@@ -123,7 +124,7 @@ export default async function CategoryPage({ params }: CategoryPageProps) {
                     className="h-11 w-11 shrink-0 rounded-md"
                   />
                   <div className="min-w-0 flex-1">
-                    <Link href={`/tools/${createToolSlug(website)}`}>
+                    <Link href={getToolHref(website)}>
                       <h2 className="line-clamp-1 text-sm font-semibold group-hover:text-primary">
                         {website.title}
                       </h2>
@@ -148,7 +149,7 @@ export default async function CategoryPage({ params }: CategoryPageProps) {
                     </span>
                   </div>
                   <Button asChild size="sm" className="h-8 gap-1.5 px-2.5 text-xs">
-                    <Link href={`/tools/${createToolSlug(website)}`}>
+                    <Link href={getToolHref(website)}>
                       Details
                       <ArrowRight className="h-3.5 w-3.5" />
                     </Link>

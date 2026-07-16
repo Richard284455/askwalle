@@ -15,7 +15,7 @@ import {
   sharedLayoutTransition,
 } from "@/ui/animation/variants/animations";
 import type { Website } from "@/lib/types";
-import { createToolSlug } from "@/lib/website/tool-index";
+import { getToolHref } from "@/lib/website/tool-index";
 import { WebsiteThumbnail } from "./website-thumbnail";
 
 interface CompactCardProps {
@@ -42,7 +42,7 @@ export function CompactCard({ website, onVisit, onLike }: CompactCardProps) {
     }
   }, [website.likes]);
 
-  const detailHref = `/tools/${createToolSlug(website)}`;
+  const detailHref = getToolHref(website);
 
   const handleViewDetails = () => {
     router.push(detailHref);

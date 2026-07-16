@@ -76,6 +76,7 @@ export default async function SearchPage({ params, searchParams }: SearchPagePro
         select: {
           id: true,
           title: true,
+          slug: true,
           url: true,
           description: true,
           category_id: true,

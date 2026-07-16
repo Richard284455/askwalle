@@ -19,6 +19,7 @@ import {
   ToolLinkKind,
   ToolTagKind,
 } from "@prisma/client";
+import { bestToolSlug } from "./lib/slug-utils";
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -476,9 +477,10 @@ function buildRecords(
     if ((row.site ?? "").length !== site.length) stats.siteCleaned++;
 
     // 同一 URL 的已有记录沿用其现有 slug，保证重复导入幂等；否则生成并消歧
+    // （标题无法生成有意义 slug 时回退到官网域名，见 lib/slug-utils）
     let slug = urlToExistingSlug.get(site) ?? "";
     if (!slug) {
-      slug = slugify(name) || `tool-${index + 2}`;
+      slug = bestToolSlug(name, site, index + 2);
       if (usedSlugs.has(slug)) {
         let n = 2;
         while (usedSlugs.has(`${slug}-${n}`)) n++;

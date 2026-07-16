@@ -24,7 +24,7 @@ import {
   sharedLayoutTransition,
 } from "@/ui/animation/variants/animations";
 import type { Website, Category } from "@/lib/types";
-import { createToolSlug } from "@/lib/website/tool-index";
+import { getToolHref } from "@/lib/website/tool-index";
 import { WebsiteThumbnail } from "./website-thumbnail";
 import {
   Tooltip,
@@ -58,7 +58,7 @@ export function WebsiteCard({
     scale: 1.01,
     transitionZ: 6,
   });
-  const detailHref = `/tools/${createToolSlug(website)}`;
+  const detailHref = getToolHref(website);
 
   useEffect(() => {
     if (website.likes !== prevLikesRef.current) {

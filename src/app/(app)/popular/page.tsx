@@ -31,6 +31,7 @@ export default async function PopularToolsPage() {
         select: {
           id: true,
           title: true,
+          slug: true,
           url: true,
           description: true,
           category_id: true,
@@ -51,6 +52,7 @@ export default async function PopularToolsPage() {
         select: {
           id: true,
           title: true,
+          slug: true,
           url: true,
           description: true,
           category_id: true,
