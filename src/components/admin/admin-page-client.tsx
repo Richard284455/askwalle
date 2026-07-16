@@ -16,7 +16,7 @@ import type { Website } from "@/lib/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { Settings, ListFilter, LogOut, BookOpen } from "lucide-react";
+import { Settings, ListFilter, LogOut, BookOpen, Wrench } from "lucide-react";
 import { cn } from "@/lib/utils/utils";
 
 export function AdminPageClient({
@@ -86,13 +86,19 @@ export function AdminPageClient({
         </div>
         <div className="flex w-full sm:w-auto items-center gap-2">
           <Tabs defaultValue="websites" className="w-full sm:w-auto">
-            <TabsList className="grid w-full sm:w-auto grid-cols-3 bg-background/50">
+            <TabsList className="grid w-full sm:w-auto grid-cols-4 bg-background/50">
               <TabsTrigger
                 value="websites"
                 className="flex items-center gap-2 data-[state=active]:bg-background/60"
               >
                 <ListFilter className="w-4 h-4" />
                 网站管理
+              </TabsTrigger>
+              <TabsTrigger value="tools" asChild>
+                <Link href="/admin/tools" className="flex items-center gap-2">
+                  <Wrench className="w-4 h-4" />
+                  工具管理
+                </Link>
               </TabsTrigger>
               <TabsTrigger value="resources" asChild>
                 <Link href="/admin/resources" className="flex items-center gap-2">

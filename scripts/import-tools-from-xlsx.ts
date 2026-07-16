@@ -680,6 +680,7 @@ async function importRecords(records: ToolRecord[]) {
       };
 
       let websiteId: number;
+      let hasCachedMedia = false;
       if (existing) {
         await prisma.website.update({
           where: { id: existing.id },
@@ -688,7 +689,21 @@ async function importRecords(records: ToolRecord[]) {
         websiteId = existing.id;
         await prisma.websiteToolTag.deleteMany({ where: { website_id: websiteId } });
         await prisma.toolLink.deleteMany({ where: { website_id: websiteId } });
-        await prisma.toolMedia.deleteMany({ where: { website_id: websiteId } });
+        // 已通过 cache:tool-media 本地化的媒体在覆盖导入时保留，
+        // 只清除仍指向远程的媒体行，避免缓存被重置回远程 URL
+        hasCachedMedia =
+          (await prisma.toolMedia.count({
+            where: {
+              website_id: websiteId,
+              url: { startsWith: "/cached-tool-media/" },
+            },
+          })) > 0;
+        await prisma.toolMedia.deleteMany({
+          where: {
+            website_id: websiteId,
+            url: { not: { startsWith: "/cached-tool-media/" } },
+          },
+        });
         await prisma.toolFAQ.deleteMany({ where: { website_id: websiteId } });
         updated++;
       } else {
@@ -746,8 +761,8 @@ async function importRecords(records: ToolRecord[]) {
         });
       }
 
-      if (record.media.length) {
-        // TODO: 后续将远程图片缓存到 public/ 或对象存储，避免长期热链外部 CDN
+      // 已有本地缓存媒体时跳过重建；新导入的远程 URL 可随后用 npm run cache:tool-media 本地化
+      if (record.media.length && !hasCachedMedia) {
         await prisma.toolMedia.createMany({
           data: record.media.map((item, position) => ({
             website_id: websiteId,
