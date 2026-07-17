@@ -1,17 +1,22 @@
 /**
- * Import AI tools from a Toolify-style xlsx export into Website/Category/Tool* tables.
+ * Import AI tools from Toolify-style xlsx exports into Website/Category/Tool* tables.
  *
  * Usage:
- *   npm run import:tools -- --dry-run            # 只输出清洗统计，不写数据库
- *   npm run import:tools -- --limit 20           # 只导入前 20 条
- *   npm run import:tools -- --overwrite          # 显式允许覆盖已存在记录
- *   npm run import:tools -- --file <path.xlsx>   # 指定数据源文件
+ *   npm run import:tools -- --file <path.xlsx>            # 单文件导入
+ *   npm run import:tools -- --dir 数据源                   # 目录递归批量导入(.xlsx)
+ *   npm run import:tools -- --dir 数据源 --dry-run          # 全目录清洗统计，不写数据库
+ *   npm run import:tools -- --dir 数据源 --limit-files 2    # 只处理前 N 个文件
+ *   npm run import:tools -- --limit-rows 20               # 每个文件最多导入 N 行
+ *   npm run import:tools -- --batch-name "first-batch"    # 批次名称
+ *   npm run import:tools -- --overwrite                   # 显式允许覆盖已存在记录
  *
+ * 正式导入会写入 ToolImportBatch / ToolImportFile 批次记录。
  * 导入的工具默认 status=pending，需人工审核后发布。
  * 来源文本(what/how/features/cases/faq)作为内部底稿导入，不直接作为公开原创内容。
+ * 已 human_reviewed 的工具不会被 --overwrite 覆盖。
  */
 import { inflateRawSync } from "zlib";
-import { readFileSync } from "fs";
+import { readdirSync, readFileSync, statSync } from "fs";
 import path from "path";
 import {
   Prisma,
@@ -29,17 +34,38 @@ import { bestToolSlug } from "./lib/slug-utils";
 const argv = process.argv.slice(2);
 const dryRun = argv.includes("--dry-run");
 const overwrite = argv.includes("--overwrite");
-const limitIndex = argv.indexOf("--limit");
-const limit =
-  limitIndex >= 0 ? parseInt(argv[limitIndex + 1] ?? "", 10) : undefined;
-const fileIndex = argv.indexOf("--file");
-const xlsxPath =
-  fileIndex >= 0
-    ? argv[fileIndex + 1]
-    : path.join(process.cwd(), "数据源", "AI Creative Writing.xlsx");
 
-if (limitIndex >= 0 && (!limit || Number.isNaN(limit) || limit <= 0)) {
-  console.error("--limit 需要一个正整数参数");
+function argValue(flag: string): string | undefined {
+  const index = argv.indexOf(flag);
+  return index >= 0 ? argv[index + 1] : undefined;
+}
+
+function intArg(flag: string): number | undefined {
+  const raw = argValue(flag);
+  if (raw === undefined) {
+    if (argv.includes(flag)) {
+      console.error(`${flag} 需要一个正整数参数`);
+      process.exit(1);
+    }
+    return undefined;
+  }
+  const value = parseInt(raw, 10);
+  if (Number.isNaN(value) || value <= 0) {
+    console.error(`${flag} 需要一个正整数参数`);
+    process.exit(1);
+  }
+  return value;
+}
+
+const limitFiles = intArg("--limit-files");
+// --limit 为旧用法别名，等价于 --limit-rows（每个文件的行数上限）
+const limitRows = intArg("--limit-rows") ?? intArg("--limit");
+const batchName = argValue("--batch-name");
+const singleFile = argValue("--file");
+const sourceDir = argValue("--dir");
+
+if (singleFile && sourceDir) {
+  console.error("--file 与 --dir 不能同时使用");
   process.exit(1);
 }
 
@@ -170,7 +196,8 @@ function readXlsx(filePath: string): Record<string, string>[] {
     shared
   );
   if (rows.length < 2) return [];
-  const header = rows[0].map((h) => (h ?? "").trim());
+  // 表头小写归一化：容忍个别文件的大小写差异（如 Introduction vs introduction）
+  const header = rows[0].map((h) => (h ?? "").trim().toLowerCase());
   return rows.slice(1).map((row) => {
     const record: Record<string, string> = {};
     header.forEach((name, i) => {
@@ -596,44 +623,47 @@ function tagSlug(tag: ParsedTag): string {
   return `${tag.kind}-${slugify(tag.name)}`;
 }
 
-// 一次性批量建全部标签并返回 slug → id 缓存，避免逐条 upsert 的网络往返
+// 批量补建缺失标签并合并进共享的 slug → id 缓存，避免逐条 upsert 的网络往返
 async function ensureTags(
   prisma: PrismaClient,
-  records: ToolRecord[]
-): Promise<Map<string, number>> {
-  const unique = new Map<string, ParsedTag>();
+  records: ToolRecord[],
+  tagCache: Map<string, number>
+): Promise<void> {
+  const missing = new Map<string, ParsedTag>();
   for (const record of records) {
     for (const tag of record.tags) {
       const slug = tagSlug(tag);
-      if (!unique.has(slug)) unique.set(slug, tag);
+      if (!tagCache.has(slug) && !missing.has(slug)) missing.set(slug, tag);
     }
   }
-  if (unique.size) {
-    await prisma.toolTag.createMany({
-      data: [...unique.entries()].map(([slug, tag]) => ({
-        name: tag.name,
-        slug,
-        kind: tag.kind,
-      })),
-      skipDuplicates: true,
-    });
-  }
-  const all = await prisma.toolTag.findMany({
-    where: { slug: { in: [...unique.keys()] } },
+  if (!missing.size) return;
+  await prisma.toolTag.createMany({
+    data: [...missing.entries()].map(([slug, tag]) => ({
+      name: tag.name,
+      slug,
+      kind: tag.kind,
+    })),
+    skipDuplicates: true,
+  });
+  const created = await prisma.toolTag.findMany({
+    where: { slug: { in: [...missing.keys()] } },
     select: { id: true, slug: true },
   });
-  return new Map(all.map((tag) => [tag.slug, tag.id]));
+  for (const tag of created) tagCache.set(tag.slug, tag.id);
 }
 
-async function importRecords(records: ToolRecord[]) {
-  const prisma = new PrismaClient();
-  const categoryCache = new Map<string, number>();
+async function importRecords(
+  prisma: PrismaClient,
+  records: ToolRecord[],
+  categoryCache: Map<string, number>,
+  tagCache: Map<string, number>
+) {
   let inserted = 0;
   let skippedExisting = 0;
   let updated = 0;
 
-  try {
-    const tagCache = await ensureTags(prisma, records);
+  {
+    await ensureTags(prisma, records, tagCache);
 
     // 一次性预取本批可能已存在的记录
     const existingWebsites = await prisma.website.findMany({
@@ -746,6 +776,7 @@ async function importRecords(records: ToolRecord[]) {
         external_raw: record.externalRaw || null,
         // 原始导入底稿快照 + 审核流起点状态
         raw_imported_content: {
+          description: record.introduction,
           what: record.what,
           how: record.how,
           featuresText: record.featuresText,
@@ -810,11 +841,9 @@ async function importRecords(records: ToolRecord[]) {
       }
 
       console.log(
-        `  [${inserted + updated + skippedExisting}/${records.length}] ${existing ? "更新" : "新增"}: ${record.name}`
+        `    [${inserted + updated + skippedExisting}/${records.length}] ${existing ? "更新" : "新增"}: ${record.name}`
       );
     }
-  } finally {
-    await prisma.$disconnect();
   }
 
   return { inserted, skippedExisting, updated };
@@ -873,12 +902,9 @@ function printStats(stats: Stats, records: ToolRecord[]) {
   }
 }
 
-async function main() {
-  console.log(`读取数据源: ${xlsxPath}`);
-  const rows = readXlsx(xlsxPath);
-
-  const stats: Stats = {
-    totalRows: rows.length,
+function emptyStats(totalRows = 0): Stats {
+  return {
+    totalRows,
     valid: 0,
     skippedRows: [],
     slugDisambiguated: [],
@@ -893,12 +919,93 @@ async function main() {
     featuresSplit: 0,
     casesSplit: 0,
   };
+}
 
+function mergeStats(target: Stats, source: Stats): void {
+  target.totalRows += source.totalRows;
+  target.valid += source.valid;
+  target.skippedRows.push(...source.skippedRows);
+  target.slugDisambiguated.push(...source.slugDisambiguated);
+  target.siteCleaned += source.siteCleaned;
+  target.monthlyParsed += source.monthlyParsed;
+  for (const [key, count] of Object.entries(source.tagCounts)) {
+    target.tagCounts[key] = (target.tagCounts[key] ?? 0) + count;
+  }
+  for (const tag of source.uniqueTopicTags) target.uniqueTopicTags.add(tag);
+  for (const [key, count] of Object.entries(source.linkCounts)) {
+    target.linkCounts[key] = (target.linkCounts[key] ?? 0) + count;
+  }
+  target.mediaTotal += source.mediaTotal;
+  target.faqQuestions += source.faqQuestions;
+  target.faqFlagged += source.faqFlagged;
+  target.featuresSplit += source.featuresSplit;
+  target.casesSplit += source.casesSplit;
+}
+
+// 递归收集目录下所有 .xlsx（忽略 Office 临时文件），按路径排序
+function findXlsxFiles(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir)) {
+    if (entry.startsWith("~$") || entry.startsWith(".")) continue;
+    const fullPath = path.join(dir, entry);
+    const stat = statSync(fullPath);
+    if (stat.isDirectory()) {
+      files.push(...findXlsxFiles(fullPath));
+    } else if (entry.toLowerCase().endsWith(".xlsx")) {
+      files.push(fullPath);
+    }
+  }
+  return files.sort();
+}
+
+type FileResult = {
+  filePath: string;
+  fileName: string;
+  rowCount: number;
+  importedCount: number;
+  skippedCount: number;
+  errorCount: number;
+  errorLog: string | null;
+  level1: string | null;
+  level2: string | null;
+};
+
+const ERROR_LOG_LIMIT = 4000;
+
+async function main() {
+  // 解析文件清单
+  let files: string[];
+  if (sourceDir) {
+    files = findXlsxFiles(sourceDir);
+    if (!files.length) {
+      console.error(`目录中没有找到 .xlsx 文件: ${sourceDir}`);
+      process.exit(1);
+    }
+  } else {
+    files = [
+      singleFile ?? path.join(process.cwd(), "数据源", "AI Creative Writing.xlsx"),
+    ];
+  }
+  const totalFound = files.length;
+  if (limitFiles) files = files.slice(0, limitFiles);
+
+  console.log(
+    `数据源: ${sourceDir ?? files[0]}（发现 ${totalFound} 个文件，处理 ${files.length} 个）` +
+      (dryRun ? " [dry-run]" : "") +
+      (limitRows ? ` [每文件最多 ${limitRows} 行]` : "")
+  );
+
+  const prisma = dryRun ? null : new PrismaClient();
   const usedSlugs = new Set<string>();
   const urlToExistingSlug = new Map<string, string>();
-  if (!dryRun) {
-    const prisma = new PrismaClient();
-    try {
+  const categoryCache = new Map<string, number>();
+  const tagCache = new Map<string, number>();
+  const aggregate = emptyStats();
+  const fileResults: FileResult[] = [];
+  let batchId: number | null = null;
+
+  try {
+    if (prisma) {
       const existingWebsites = await prisma.website.findMany({
         where: { slug: { not: null } },
         select: { slug: true, url: true },
@@ -909,30 +1016,147 @@ async function main() {
           urlToExistingSlug.set(row.url, row.slug);
         }
       }
-    } finally {
-      await prisma.$disconnect();
+
+      const batch = await prisma.toolImportBatch.create({
+        data: {
+          name: batchName ?? null,
+          source_dir: sourceDir ?? null,
+        },
+      });
+      batchId = batch.id;
+      console.log(`批次 #${batchId}${batchName ? ` (${batchName})` : ""} 开始`);
     }
-  }
 
-  let records = buildRecords(rows, usedSlugs, urlToExistingSlug, stats);
-  printStats(stats, records);
+    for (const [index, filePath] of files.entries()) {
+      const fileName = path.basename(filePath);
+      const fileStats = emptyStats();
+      let importedCount = 0;
+      let skippedCount = 0;
+      let thrownError: string | null = null;
+      let level1: string | null = null;
+      let level2: string | null = null;
 
-  if (dryRun) {
-    console.log("\n--dry-run：未写入数据库。");
-    return;
-  }
+      try {
+        const rows = readXlsx(filePath);
+        fileStats.totalRows = rows.length;
+        let records = buildRecords(rows, usedSlugs, urlToExistingSlug, fileStats);
+        if (limitRows) records = records.slice(0, limitRows);
+        level1 = records[0]?.level1 ?? null;
+        level2 = records[0]?.level2 ?? null;
 
-  if (limit) {
-    records = records.slice(0, limit);
-    console.log(`\n--limit ${limit}：仅导入前 ${records.length} 条。`);
-  }
+        if (prisma) {
+          const result = await importRecords(
+            prisma,
+            records,
+            categoryCache,
+            tagCache
+          );
+          importedCount = result.inserted + result.updated;
+          skippedCount = result.skippedExisting;
+        }
+      } catch (error) {
+        thrownError = redactPotentialSecrets(
+          error instanceof Error ? error.message : "Unknown error"
+        );
+      }
 
-  const result = await importRecords(records);
-  console.log(
-    `\n导入完成（status=pending）。新增: ${result.inserted}，更新: ${result.updated}，已存在跳过: ${result.skippedExisting}。`
-  );
-  if (!overwrite && result.skippedExisting > 0) {
-    console.log("提示：默认跳过已存在记录；使用 --overwrite 显式覆盖。");
+      const rowErrors = fileStats.skippedRows.map(
+        (skip) => `第 ${skip.row} 行 (${skip.name}): ${skip.reason}`
+      );
+      if (thrownError) rowErrors.unshift(`文件级错误: ${thrownError}`);
+      const errorCount = fileStats.skippedRows.length + (thrownError ? 1 : 0);
+      const errorLog = rowErrors.length
+        ? rowErrors.join("\n").slice(0, ERROR_LOG_LIMIT)
+        : null;
+
+      const result: FileResult = {
+        filePath,
+        fileName,
+        rowCount: fileStats.totalRows,
+        importedCount,
+        skippedCount,
+        errorCount,
+        errorLog,
+        level1,
+        level2,
+      };
+      fileResults.push(result);
+      // 汇总时给跳过行带上文件名，方便定位
+      fileStats.skippedRows = fileStats.skippedRows.map((skip) => ({
+        ...skip,
+        name: `${fileName} · ${skip.name}`,
+      }));
+      mergeStats(aggregate, fileStats);
+
+      console.log(
+        `[${index + 1}/${files.length}] ${fileName} — 行:${result.rowCount} 有效:${fileStats.valid} ` +
+          (dryRun
+            ? `(dry-run 未写入) `
+            : `导入:${importedCount} 跳过:${skippedCount} `) +
+          `错误:${errorCount}` +
+          (thrownError ? `  !! ${thrownError.slice(0, 80)}` : "")
+      );
+
+      if (prisma && batchId !== null) {
+        await prisma.toolImportFile.create({
+          data: {
+            batch_id: batchId,
+            file_path: filePath,
+            file_name: fileName,
+            row_count: result.rowCount,
+            imported_count: importedCount,
+            skipped_count: skippedCount,
+            error_count: errorCount,
+            error_log: errorLog,
+            level1_category: level1,
+            level2_category: level2,
+          },
+        });
+      }
+    }
+
+    const totals = fileResults.reduce(
+      (acc, file) => ({
+        rows: acc.rows + file.rowCount,
+        imported: acc.imported + file.importedCount,
+        skipped: acc.skipped + file.skippedCount,
+        errors: acc.errors + file.errorCount,
+      }),
+      { rows: 0, imported: 0, skipped: 0, errors: 0 }
+    );
+
+    if (prisma && batchId !== null) {
+      await prisma.toolImportBatch.update({
+        where: { id: batchId },
+        data: {
+          file_count: fileResults.length,
+          row_count: totals.rows,
+          imported_count: totals.imported,
+          skipped_count: totals.skipped,
+          error_count: totals.errors,
+          finished_at: new Date(),
+        },
+      });
+    }
+
+    console.log("");
+    printStats(aggregate, []);
+    console.log("\n== 批次汇总 ==");
+    console.log(
+      `文件: ${fileResults.length}  总行: ${totals.rows}  导入: ${totals.imported}  跳过: ${totals.skipped}  错误: ${totals.errors}`
+    );
+    if (dryRun) {
+      console.log("--dry-run：未写入数据库，未创建批次记录。");
+    } else {
+      console.log(
+        `批次记录: ToolImportBatch #${batchId}（含 ${fileResults.length} 条 ToolImportFile）。导入工具均为 status=pending。`
+      );
+      if (!overwrite && totals.skipped > 0) {
+        console.log("提示：默认跳过已存在记录；使用 --overwrite 显式覆盖（human_reviewed 除外）。");
+      }
+    }
+  } finally {
+    if (prisma) await prisma.$disconnect();
   }
 }
 

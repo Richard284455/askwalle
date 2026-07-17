@@ -230,6 +230,41 @@ model ToolMedia {
   @@index([website_id])
 }
 
+model ToolImportBatch {
+  id             Int              @id @default(autoincrement())
+  name           String?
+  source_dir     String?
+  file_count     Int              @default(0)
+  row_count      Int              @default(0)
+  imported_count Int              @default(0)
+  skipped_count  Int              @default(0)
+  error_count    Int              @default(0)
+  started_at     DateTime         @default(now())
+  finished_at    DateTime?
+  files          ToolImportFile[]
+
+  @@map("tool_import_batches")
+}
+
+model ToolImportFile {
+  id              Int             @id @default(autoincrement())
+  batch_id        Int
+  batch           ToolImportBatch @relation(fields: [batch_id], references: [id])
+  file_path       String
+  file_name       String
+  row_count       Int             @default(0)
+  imported_count  Int             @default(0)
+  skipped_count   Int             @default(0)
+  error_count     Int             @default(0)
+  error_log       String?
+  level1_category String?
+  level2_category String?
+  created_at      DateTime        @default(now())
+
+  @@map("tool_import_files")
+  @@index([batch_id])
+}
+
 model ToolFAQ {
   id         Int     @id @default(autoincrement())
   website_id Int
