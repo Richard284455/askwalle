@@ -139,12 +139,17 @@ export function ToolAdminList({
             管理 AI 工具目录：基础信息、详情内容与审核发布
           </p>
         </div>
-        <Button variant="outline" size="sm" asChild>
-          <Link href="/admin" className="flex items-center gap-2">
-            <ArrowLeft className="w-4 h-4" />
-            返回后台
-          </Link>
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/tools/rewrite">批量 AI 改写</Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin" className="flex items-center gap-2">
+              <ArrowLeft className="w-4 h-4" />
+              返回后台
+            </Link>
+          </Button>
+        </div>
       </div>
 
       <div className="rounded-xl border border-border/40 bg-background/30 shadow-sm overflow-hidden backdrop-blur-sm">

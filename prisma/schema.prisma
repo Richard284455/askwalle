@@ -95,6 +95,7 @@ model Website {
   toolLinks   ToolLink[]
   toolMedia   ToolMedia[]
   toolFaqs    ToolFAQ[]
+  rewriteItems ToolRewriteItem[]
 
   @@map("websites")
   @@index([category_id])
@@ -263,6 +264,55 @@ model ToolImportFile {
 
   @@map("tool_import_files")
   @@index([batch_id])
+}
+
+model ToolRewriteBatch {
+  id              Int               @id @default(autoincrement())
+  name            String?
+  provider        String            @default("openai")
+  model           String
+  status          String            @default("created") // created / jsonl_generated / submitted / in_progress / completed / failed / imported
+  filter_snapshot Json?
+  total_count     Int               @default(0)
+  submitted_count Int               @default(0)
+  completed_count Int               @default(0)
+  failed_count    Int               @default(0)
+  qc_passed_count Int               @default(0)
+  qc_failed_count Int               @default(0)
+  openai_batch_id String?
+  input_file_id   String?
+  output_file_id  String?
+  error_file_id   String?
+  submitted_at    DateTime?
+  completed_at    DateTime?
+  created_at      DateTime          @default(now())
+  updated_at      DateTime          @updatedAt
+  items           ToolRewriteItem[]
+
+  @@map("tool_rewrite_batches")
+}
+
+model ToolRewriteItem {
+  id            Int              @id @default(autoincrement())
+  batch_id      Int
+  batch         ToolRewriteBatch @relation(fields: [batch_id], references: [id])
+  website_id    Int
+  website       Website          @relation(fields: [website_id], references: [id])
+  status        String           @default("queued") // queued / submitted / completed / failed / qc_failed / saved
+  custom_id     String           @unique
+  prompt        String?
+  raw_output    Json?
+  parsed_draft  Json?
+  qc_status     String?
+  qc_errors     Json?
+  error_message String?
+  attempt_count Int              @default(0)
+  created_at    DateTime         @default(now())
+  updated_at    DateTime         @updatedAt
+
+  @@map("tool_rewrite_items")
+  @@index([batch_id])
+  @@index([website_id])
 }
 
 model ToolFAQ {
