@@ -7,124 +7,68 @@ import {
 } from "@/lib/website/tool-admin";
 
 // ---------------------------------------------------------------------------
-// 多 provider 配置（key 只在服务端读取，绝不入库/入日志/回传客户端）
+// Provider 配置来自 AI Provider 配置中心（env 优先于 DB，key 仅服务端解析）
 //
 // - openai:   官方 Batch API（异步：Submit → Refresh → Import results）
 // - deepseek/qwen/kimi/custom: OpenAI 兼容 chat/completions 直连模式
 //   （Submit 即同步逐条改写并完成 QC 入库；无需 Refresh/Import）
 // ---------------------------------------------------------------------------
 
-export type RewriteProviderId =
-  | "openai"
-  | "deepseek"
-  | "qwen"
-  | "kimi"
-  | "custom";
+import {
+  getProviderSetting,
+  getProviderSettings,
+  isProviderKey,
+  providerMode,
+  resolveProviderRuntime,
+  type ProviderKey,
+  type ProviderSettingsView,
+} from "@/lib/website/ai-provider-config";
 
-type ProviderConfig = {
-  label: string;
-  baseUrl: string;
-  keyEnvs: string[]; // 依次尝试的环境变量名
-  defaultModel: string;
-  mode: "batch" | "direct";
-};
-
-const PROVIDERS: Record<RewriteProviderId, ProviderConfig> = {
-  openai: {
-    label: "OpenAI (Batch API)",
-    baseUrl: "https://api.openai.com/v1",
-    keyEnvs: ["OPENAI_API_KEY"],
-    defaultModel: "gpt-4o-mini",
-    mode: "batch",
-  },
-  deepseek: {
-    label: "DeepSeek",
-    baseUrl: "https://api.deepseek.com/v1",
-    keyEnvs: ["DEEPSEEK_API_KEY"],
-    defaultModel: "deepseek-chat",
-    mode: "direct",
-  },
-  qwen: {
-    label: "Qwen (DashScope 兼容模式)",
-    baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    keyEnvs: ["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
-    defaultModel: "qwen-plus",
-    mode: "direct",
-  },
-  kimi: {
-    label: "Kimi (Moonshot)",
-    baseUrl: "https://api.moonshot.cn/v1",
-    keyEnvs: ["KIMI_API_KEY", "MOONSHOT_API_KEY"],
-    defaultModel: "moonshot-v1-8k",
-    mode: "direct",
-  },
-  custom: {
-    label: "自定义 OpenAI 兼容端点",
-    baseUrl: process.env.REWRITE_BASE_URL || "",
-    keyEnvs: ["REWRITE_API_KEY"],
-    defaultModel: process.env.REWRITE_MODEL || "",
-    mode: "direct",
-  },
-};
+export type RewriteProviderId = ProviderKey;
 
 export function isRewriteProvider(value: string): value is RewriteProviderId {
-  return value in PROVIDERS;
-}
-
-function providerConfig(provider: RewriteProviderId): ProviderConfig {
-  return PROVIDERS[provider];
-}
-
-function providerApiKey(provider: RewriteProviderId): string | null {
-  for (const env of providerConfig(provider).keyEnvs) {
-    const value = process.env[env];
-    if (value) return value;
-  }
-  return null;
-}
-
-function missingKeyMessage(provider: RewriteProviderId): string {
-  return `Missing ${providerConfig(provider).keyEnvs[0]}`;
+  return isProviderKey(value);
 }
 
 export function getDefaultProvider(): RewriteProviderId {
   const configured = process.env.REWRITE_PROVIDER;
-  return configured && isRewriteProvider(configured) ? configured : "openai";
+  return configured && isProviderKey(configured) ? configured : "openai";
 }
 
-export function getProviderModel(provider: RewriteProviderId): string {
-  // OPENAI_REWRITE_MODEL 为旧配置，向后兼容；REWRITE_MODEL_<PROVIDER> 为各家覆盖
-  const override =
-    process.env[`REWRITE_MODEL_${provider.toUpperCase()}`] ||
-    (provider === "openai" ? process.env.OPENAI_REWRITE_MODEL : undefined);
-  return override || providerConfig(provider).defaultModel;
+export function getProviderMode(provider: string): "batch" | "direct" {
+  return providerMode(provider);
 }
 
 export type RewriteProviderInfo = {
   id: RewriteProviderId;
   label: string;
   model: string;
+  modelPresets: string[];
   mode: "batch" | "direct";
+  enabled: boolean;
   hasKey: boolean;
+  keySource: "env" | "db" | "missing";
   keyEnv: string;
 };
 
-// 提供给 UI 的 provider 清单（不含任何 key 值）
-export function listRewriteProviders(): RewriteProviderInfo[] {
-  return (Object.keys(PROVIDERS) as RewriteProviderId[])
-    .filter((id) => id !== "custom" || Boolean(PROVIDERS.custom.baseUrl))
-    .map((id) => ({
-      id,
-      label: providerConfig(id).label,
-      model: getProviderModel(id),
-      mode: providerConfig(id).mode,
-      hasKey: Boolean(providerApiKey(id)),
-      keyEnv: providerConfig(id).keyEnvs[0],
+// 提供给 UI 的 provider 清单（不含任何 key 值，仅状态信息）
+export async function listRewriteProviders(): Promise<RewriteProviderInfo[]> {
+  const settings = await getProviderSettings();
+  return settings
+    .filter(
+      (setting) => setting.providerKey !== "custom" || Boolean(setting.baseUrl)
+    )
+    .map((setting: ProviderSettingsView) => ({
+      id: setting.providerKey,
+      label: setting.displayName,
+      model: setting.defaultModel,
+      modelPresets: setting.modelPresets,
+      mode: setting.mode,
+      enabled: setting.enabled,
+      hasKey: setting.keyStatus === "configured",
+      keySource: setting.keySource,
+      keyEnv: setting.keyEnv,
     }));
-}
-
-export function getProviderMode(provider: string): "batch" | "direct" {
-  return isRewriteProvider(provider) ? providerConfig(provider).mode : "direct";
 }
 
 const BATCH_LIMIT_MAX = 20;
@@ -331,11 +275,12 @@ export async function createRewriteBatch(
   }
 
   const provider = filter.provider ?? getDefaultProvider();
+  const providerSetting = await getProviderSetting(provider);
   const batch = await prisma.toolRewriteBatch.create({
     data: {
       name: filter.name?.trim() || null,
       provider,
-      model: filter.model?.trim() || getProviderModel(provider),
+      model: filter.model?.trim() || providerSetting.defaultModel,
       filter_snapshot: {
         categoryId: filter.categoryId ?? null,
         rewriteStatuses: statuses,
@@ -542,17 +487,17 @@ export async function buildOpenAIBatchJsonl(
 // Provider HTTP 层（原生 fetch；key 仅服务端，不入日志）
 // ---------------------------------------------------------------------------
 
+type ProviderHttpRuntime = { baseUrl: string; apiKey: string };
+
 async function providerFetch(
-  provider: RewriteProviderId,
+  runtime: ProviderHttpRuntime,
   pathName: string,
   init?: RequestInit
 ) {
-  const config = providerConfig(provider);
-  const key = providerApiKey(provider);
-  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}${pathName}`, {
+  const response = await fetch(`${runtime.baseUrl}${pathName}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${key}`,
+      Authorization: `Bearer ${runtime.apiKey}`,
       ...(init?.headers ?? {}),
     },
   });
@@ -586,8 +531,12 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
     return { ok: false, message: `未知 provider: ${batch.provider}` };
   }
   const provider = batch.provider;
-  if (!providerApiKey(provider)) {
-    return { ok: false, message: missingKeyMessage(provider) };
+  const runtime = await resolveProviderRuntime(provider, batch.model);
+  if (!runtime.ok) {
+    return { ok: false, message: runtime.message };
+  }
+  if (!runtime.enabled) {
+    return { ok: false, message: `${provider} 已在配置中心禁用，无法提交真实任务` };
   }
   if (batch.openai_batch_id) {
     return { ok: false, message: `批次已提交过 (${batch.openai_batch_id})` };
@@ -598,7 +547,7 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
 
   // 直连模式：同步逐条改写并完成 QC 入库
   if (getProviderMode(provider) === "direct") {
-    return runDirectRewrite(batchId, provider, batch.model);
+    return runDirectRewrite(batchId, runtime, batch.model);
   }
 
   // OpenAI Batch API 模式
@@ -613,7 +562,7 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
     new Blob([jsonl.jsonl], { type: "application/jsonl" }),
     `tool-rewrite-batch-${batchId}.jsonl`
   );
-  const upload = await providerFetch(provider, "/files", {
+  const upload = await providerFetch(runtime, "/files", {
     method: "POST",
     body: form,
   });
@@ -624,7 +573,7 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
   if (!inputFileId) return { ok: false, message: "上传 JSONL 未返回 file id" };
 
   // 2) 创建 batch
-  const created = await providerFetch(provider, "/batches", {
+  const created = await providerFetch(runtime, "/batches", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -661,7 +610,7 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
 // 直连模式执行：逐条 chat/completions → QC → 入库（单条失败不影响其它条目）
 async function runDirectRewrite(
   batchId: number,
-  provider: RewriteProviderId,
+  runtime: ProviderHttpRuntime,
   model: string
 ): Promise<SubmitResult> {
   const items = await loadBatchWebsites(batchId);
@@ -688,7 +637,7 @@ async function runDirectRewrite(
 
     let outcome: "saved" | "qc_failed" | "failed";
     try {
-      const response = await providerFetch(provider, "/chat/completions", {
+      const response = await providerFetch(runtime, "/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -773,13 +722,12 @@ export async function refreshOpenAIBatchStatus(
   if (getProviderMode(batch.provider) === "direct") {
     return { ok: false, message: "直连模式在 Submit 时即同步完成，无需刷新状态" };
   }
-  if (!providerApiKey(batch.provider)) {
-    return { ok: false, message: missingKeyMessage(batch.provider) };
-  }
+  const runtime = await resolveProviderRuntime(batch.provider);
+  if (!runtime.ok) return { ok: false, message: runtime.message };
   if (!batch.openai_batch_id) return { ok: false, message: "批次尚未提交到 OpenAI" };
 
   const result = await providerFetch(
-    batch.provider,
+    runtime,
     `/batches/${batch.openai_batch_id}`
   );
   if (!result.ok) {
@@ -953,15 +901,14 @@ export async function importOpenAIBatchResults(
   if (getProviderMode(batch.provider) === "direct") {
     return { ok: false, message: "直连模式在 Submit 时即同步完成，无需导入结果" };
   }
-  if (!providerApiKey(batch.provider)) {
-    return { ok: false, message: missingKeyMessage(batch.provider) };
-  }
+  const runtime = await resolveProviderRuntime(batch.provider);
+  if (!runtime.ok) return { ok: false, message: runtime.message };
   if (!batch.output_file_id) {
     return { ok: false, message: "尚无 output 文件，请先 Refresh status 并等待 batch 完成" };
   }
 
   const download = await providerFetch(
-    batch.provider,
+    runtime,
     `/files/${batch.output_file_id}/content`
   );
   if (!download.ok) {

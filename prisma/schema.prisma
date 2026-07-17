@@ -266,6 +266,30 @@ model ToolImportFile {
   @@index([batch_id])
 }
 
+model AIProviderConfig {
+  id                   Int       @id @default(autoincrement())
+  provider_key         String    @unique // openai / deepseek / qwen / kimi / custom
+  display_name         String?
+  enabled              Boolean   @default(true)
+  base_url             String?
+  encrypted_api_key    String?   // AES-256-GCM 密文，绝不明文
+  api_key_last4        String?
+  api_key_source       String?   // env / db / missing（保存时记录，展示以运行时解析为准）
+  default_model        String?
+  model_presets        Json?     // string[] 模型 ID 列表
+  supports_batch       Boolean   @default(false)
+  supports_direct      Boolean   @default(true)
+  supports_json_schema Boolean   @default(false)
+  notes                String?
+  last_tested_at       DateTime?
+  last_test_status     String?
+  last_test_error      String?
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
+
+  @@map("ai_provider_configs")
+}
+
 model ToolRewriteBatch {
   id              Int               @id @default(autoincrement())
   name            String?

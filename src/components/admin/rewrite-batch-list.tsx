@@ -183,20 +183,41 @@ export function RewriteBatchList({
             {selectedProvider && (
               <p className="mt-1 text-xs text-muted-foreground">
                 {selectedProvider.mode === "batch"
-                  ? "Batch API 异步模式"
-                  : "直连同步模式"}
-                · key 环境变量: {selectedProvider.keyEnv}
+                  ? "Batch API 异步"
+                  : "直连同步"}
+                · key: {selectedProvider.keySource}
+                {selectedProvider.enabled ? "" : " · 已禁用"}
               </p>
             )}
           </div>
           <div>
             <label className="block text-sm font-medium mb-2 text-foreground/80">
-              模型（留空用默认）
+              模型 ID（可选 presets 或手动输入）
             </label>
+            {selectedProvider && selectedProvider.modelPresets.length > 0 && (
+              <Select
+                value={
+                  selectedProvider.modelPresets.includes(model) ? model : "__custom__"
+                }
+                onValueChange={(v) => setModel(v === "__custom__" ? "" : v)}
+              >
+                <SelectTrigger className="mb-2 bg-background/40 border-border/40">
+                  <SelectValue placeholder="从 presets 选择" />
+                </SelectTrigger>
+                <SelectContent>
+                  {selectedProvider.modelPresets.map((preset) => (
+                    <SelectItem key={preset} value={preset}>
+                      {preset}
+                    </SelectItem>
+                  ))}
+                  <SelectItem value="__custom__">自定义模型 ID…</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
             <Input
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              placeholder={selectedProvider?.model ?? ""}
+              placeholder={selectedProvider?.model ?? "留空用默认"}
               className="bg-background/40 border-border/40"
             />
           </div>

@@ -139,9 +139,15 @@ export function ToolAdminList({
             管理 AI 工具目录：基础信息、详情内容与审核发布
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" asChild>
             <Link href="/admin/tools/rewrite">批量 AI 改写</Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/tools/review">批量审核/发布</Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/settings/ai-providers">Provider 配置</Link>
           </Button>
           <Button variant="outline" size="sm" asChild>
             <Link href="/admin" className="flex items-center gap-2">

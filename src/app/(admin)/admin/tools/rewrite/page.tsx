@@ -9,9 +9,10 @@ import { RewriteBatchList } from "@/components/admin/rewrite-batch-list";
 export const dynamic = "force-dynamic";
 
 export default async function RewriteBatchesPage() {
-  const [batches, categories] = await Promise.all([
+  const [batches, categories, providers] = await Promise.all([
     listRewriteBatches().catch(() => []),
     getAdminCategoryOptions(),
+    listRewriteProviders().catch(() => []),
   ]);
 
   return (
@@ -19,7 +20,7 @@ export default async function RewriteBatchesPage() {
       <RewriteBatchList
         initialBatches={batches}
         categories={categories}
-        providers={listRewriteProviders()}
+        providers={providers}
         defaultProvider={getDefaultProvider()}
       />
     </div>

@@ -22,7 +22,7 @@ export default async function RewriteBatchDetailPage({
     notFound();
   }
 
-  const providers = listRewriteProviders();
+  const providers = await listRewriteProviders();
   const providerInfo = providers.find((p) => p.id === batch.provider) ?? null;
 
   return (

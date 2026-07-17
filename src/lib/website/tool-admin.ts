@@ -584,7 +584,8 @@ export async function saveRewriteDraft(
   });
 }
 
-// 把草稿应用到公开详情字段（覆盖 ToolDetail 四字段 + 整体替换 ToolFAQ）
+// 把草稿应用到公开详情字段（description → Website，其余 → ToolDetail + 整体替换 ToolFAQ）。
+// 单条编辑页与批量审核共用此唯一 apply 路径，避免逻辑分叉。
 export async function applyRewriteDraft(
   websiteId: number
 ): Promise<{ ok: true } | { ok: false; message: string }> {
@@ -598,6 +599,17 @@ export async function applyRewriteDraft(
   const parsed = parseRewriteDraft(JSON.stringify(detail.ai_rewrite_draft));
   if (!parsed.ok) {
     return { ok: false, message: `草稿数据无效: ${parsed.message}` };
+  }
+
+  // description 是批量草稿的扩展字段（单条 schema 不强制），存在且合法时应用到 Website
+  const rawDraft = detail.ai_rewrite_draft as Record<string, unknown>;
+  const description =
+    typeof rawDraft.description === "string" ? rawDraft.description.trim() : "";
+  if (description && !description.includes("<")) {
+    await prisma.website.update({
+      where: { id: websiteId },
+      data: { description },
+    });
   }
 
   await ensureRawSnapshot(websiteId);
