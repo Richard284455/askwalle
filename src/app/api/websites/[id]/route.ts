@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { AjaxResponse } from "@/lib/utils";
 import { PrismaClient } from "@prisma/client";
 import { requireAdmin } from "@/lib/auth/admin-auth";
+import { assertPublishAllowed } from "@/lib/website/tool-admin";
 
 const prisma = new PrismaClient();
 
@@ -122,6 +123,17 @@ export async function PUT(
       return NextResponse.json(AjaxResponse.fail("Category does not exist"), {
         status: 400,
       });
+    }
+
+    // 发布守卫：含来源内容的工具必须人工审核后才能改为 approved
+    const nextStatus = data.status || existingWebsite.status;
+    if (nextStatus === "approved" && existingWebsite.status !== "approved") {
+      const allowed = await assertPublishAllowed(websiteId, nextStatus);
+      if (!allowed.ok) {
+        return NextResponse.json(AjaxResponse.fail(allowed.message), {
+          status: 400,
+        });
+      }
     }
 
     const website = await prisma.website.update({

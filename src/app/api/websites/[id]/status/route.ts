@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { PrismaClient } from "@prisma/client";
 import { AjaxResponse } from "@/lib/utils";
 import { requireAdmin } from "@/lib/auth/admin-auth";
+import { assertPublishAllowed } from "@/lib/website/tool-admin";
 
 const prisma = new PrismaClient();
 
@@ -28,6 +29,16 @@ export async function PUT(request: Request, props: { params: Promise<{ id: strin
       return NextResponse.json(AjaxResponse.fail("Website not found"), {
         status: 404,
       });
+    }
+
+    // 发布守卫：含来源内容的工具必须人工审核后才能发布
+    if (status === "approved" && website.status !== "approved") {
+      const allowed = await assertPublishAllowed(websiteId, status);
+      if (!allowed.ok) {
+        return NextResponse.json(AjaxResponse.fail(allowed.message), {
+          status: 400,
+        });
+      }
     }
 
     await prisma.website.update({

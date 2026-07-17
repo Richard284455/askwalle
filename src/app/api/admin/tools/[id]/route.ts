@@ -3,10 +3,12 @@ import { Prisma } from "@prisma/client";
 import { AjaxResponse } from "@/lib/utils";
 import { requireAdmin } from "@/lib/auth/admin-auth";
 import {
+  assertPublishAllowed,
   getAdminToolById,
   parseToolUpdatePayload,
   updateTool,
 } from "@/lib/website/tool-admin";
+import { prisma } from "@/lib/prisma";
 
 async function resolveId(params: Promise<{ id: string }>) {
   const id = parseInt((await params).id);
@@ -60,6 +62,22 @@ export async function PUT(
       return NextResponse.json(AjaxResponse.fail(parsed.message), {
         status: 400,
       });
+    }
+
+    // 发布守卫：pending/rejected/archived → approved 需先完成人工审核
+    if (parsed.data.website.status === "approved") {
+      const existing = await prisma.website.findUnique({
+        where: { id },
+        select: { status: true },
+      });
+      if (existing && existing.status !== "approved") {
+        const allowed = await assertPublishAllowed(id, "approved");
+        if (!allowed.ok) {
+          return NextResponse.json(AjaxResponse.fail(allowed.message), {
+            status: 400,
+          });
+        }
+      }
     }
 
     await updateTool(id, parsed.data);

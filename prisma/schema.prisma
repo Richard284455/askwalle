@@ -37,6 +37,12 @@ enum ToolTagKind {
   topic
 }
 
+enum RewriteStatus {
+  raw_imported
+  draft_generated
+  human_reviewed
+}
+
 enum ToolLinkKind {
   twitter
   facebook
@@ -162,6 +168,11 @@ model ToolDetail {
   listed_at        DateTime?
   source           String?
   external_raw     String?
+  raw_imported_content Json?          // 原始导入底稿快照（仅内部）
+  ai_rewrite_draft     Json?          // AI 改写草稿（仅内部，人工审核前不公开）
+  rewrite_status       RewriteStatus? // raw_imported / draft_generated / human_reviewed
+  reviewed_at          DateTime?
+  review_notes         String?
   created_at       DateTime  @default(now())
   updated_at       DateTime  @updatedAt
 

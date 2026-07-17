@@ -1,4 +1,9 @@
-import { Prisma, ToolLinkKind, ToolTagKind } from "@prisma/client";
+import {
+  Prisma,
+  RewriteStatus,
+  ToolLinkKind,
+  ToolTagKind,
+} from "@prisma/client";
 import { z } from "zod";
 
 import { prisma } from "@/lib/prisma";
@@ -25,6 +30,33 @@ export type AdminToolListItem = {
 export type AdminToolFaq = {
   question: string;
   answer: string;
+};
+
+// AI 改写草稿的结构（管理员粘贴的 AI 输出）
+export type RewriteDraft = {
+  what: string;
+  how: string;
+  features: string[];
+  useCases: string[];
+  faqs: { question: string; answer: string }[];
+};
+
+// 原始导入底稿快照（仅内部展示，不公开）
+export type RawImportedContent = {
+  what: string;
+  how: string;
+  featuresText: string;
+  useCases: string[];
+  faqs: { question: string; answer: string | null }[];
+};
+
+export type AdminToolRewrite = {
+  status: RewriteStatus | null;
+  reviewedAt: string | null;
+  reviewNotes: string;
+  draft: string; // pretty JSON 或空串
+  raw: RawImportedContent;
+  prompt: string;
 };
 
 export type AdminToolRecord = {
@@ -57,6 +89,7 @@ export type AdminToolRecord = {
   links: string;
   media: string;
   faqs: AdminToolFaq[];
+  rewrite: AdminToolRewrite;
 };
 
 export type AdminCategoryOption = {
@@ -330,6 +363,311 @@ export function parseToolUpdatePayload(body: unknown): ParseToolResult {
 }
 
 // ---------------------------------------------------------------------------
+// AI 改写 / 人工审核
+// ---------------------------------------------------------------------------
+
+function jsonStringArray(value: Prisma.JsonValue | null | undefined): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+type DetailForRaw = {
+  what: string | null;
+  how: string | null;
+  features_text: string | null;
+  use_cases: Prisma.JsonValue | null;
+} | null;
+
+type FaqForRaw = { question: string; answer: string | null }[];
+
+// 从当前 ToolDetail/ToolFAQ 派生原始底稿快照（用于首次快照与老数据回退展示）
+export function buildRawSnapshot(
+  detail: DetailForRaw,
+  faqs: FaqForRaw
+): RawImportedContent {
+  return {
+    what: detail?.what ?? "",
+    how: detail?.how ?? "",
+    featuresText: detail?.features_text ?? "",
+    useCases: jsonStringArray(detail?.use_cases),
+    faqs: faqs.map((faq) => ({ question: faq.question, answer: faq.answer })),
+  };
+}
+
+function rawFromStored(
+  value: Prisma.JsonValue | null | undefined
+): RawImportedContent | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  return {
+    what: typeof record.what === "string" ? record.what : "",
+    how: typeof record.how === "string" ? record.how : "",
+    featuresText:
+      typeof record.featuresText === "string" ? record.featuresText : "",
+    useCases: Array.isArray(record.useCases)
+      ? record.useCases.filter((v): v is string => typeof v === "string")
+      : [],
+    faqs: Array.isArray(record.faqs)
+      ? record.faqs
+          .filter(
+            (v): v is Record<string, unknown> =>
+              Boolean(v) && typeof v === "object" && !Array.isArray(v)
+          )
+          .map((v) => ({
+            question: typeof v.question === "string" ? v.question : "",
+            answer: typeof v.answer === "string" ? v.answer : null,
+          }))
+          .filter((v) => v.question)
+      : [],
+  };
+}
+
+// 生成可复制给外部 AI（ChatGPT/Claude/Gemini）的改写 prompt；V1 不接任何 AI API
+export function buildRewritePrompt(
+  toolTitle: string,
+  raw: RawImportedContent
+): string {
+  const rawJson = JSON.stringify(
+    {
+      what: raw.what,
+      how: raw.how,
+      featuresText: raw.featuresText,
+      useCases: raw.useCases,
+      faqQuestions: raw.faqs.map((faq) => faq.question),
+    },
+    null,
+    2
+  );
+
+  return `You are helping rewrite third-party reference notes about an AI tool called "${toolTitle}" into original directory content for a US-focused AI tools directory.
+
+Requirements:
+- Do NOT copy sentences or distinctive phrasing from the reference notes. Write original wording.
+- Keep all facts accurate. Do NOT invent capabilities, pricing, or integrations that are not implied by the notes.
+- Professional, concise, trustworthy tone for US business users. No hype, no superlatives.
+- Every FAQ must include a helpful answer. If the notes cannot support an answer, write a cautious general answer that tells the user to verify on the official site.
+- "features" and "useCases" must be arrays of short original strings (max ~15 words each).
+- Output STRICT JSON only, no markdown fences, exactly this shape:
+
+{
+  "what": "2-4 sentence original description of what the tool is and who it is for",
+  "how": "2-4 sentence original description of how a new user gets started",
+  "features": ["...", "..."],
+  "useCases": ["...", "..."],
+  "faqs": [{ "question": "...", "answer": "..." }]
+}
+
+Reference notes (do not copy wording):
+${rawJson}`;
+}
+
+const rewriteDraftSchema = z.object({
+  what: z.string().min(1, "draft.what 不能为空"),
+  how: z.string().min(1, "draft.how 不能为空"),
+  features: z.array(z.string().min(1)).min(1, "draft.features 至少一项"),
+  useCases: z.array(z.string().min(1)).min(1, "draft.useCases 至少一项"),
+  faqs: z.array(
+    z.object({
+      question: z.string().min(1, "draft.faqs.question 不能为空"),
+      answer: z.string().min(1, "draft.faqs.answer 不能为空"),
+    })
+  ),
+});
+
+export type ParseDraftResult =
+  | { ok: true; draft: RewriteDraft }
+  | { ok: false; message: string };
+
+export const DRAFT_NOT_OBJECT_MESSAGE =
+  "请只粘贴 JSON 对象，不要包含说明文字或 Markdown 代码块。";
+export const DRAFT_PARSE_FAILED_MESSAGE =
+  "JSON 解析失败。可能原因：多余逗号、中文引号、字段名未加双引号、字符串中有未转义换行。";
+
+// 清理常见 AI 输出包装：```json / ``` 围栏与首尾空白。
+// 只做确定性的围栏剥离，不猜测解释文字的位置。
+export function cleanDraftInput(raw: string): string {
+  let text = raw.trim();
+  if (text.startsWith("```")) {
+    // 去掉第一行的 ``` 或 ```json
+    const firstLineBreak = text.indexOf("\n");
+    text = firstLineBreak >= 0 ? text.slice(firstLineBreak + 1) : "";
+  }
+  if (text.trimEnd().endsWith("```")) {
+    text = text.trimEnd();
+    text = text.slice(0, text.length - 3);
+  }
+  return text.trim();
+}
+
+export function parseRewriteDraft(rawJson: string): ParseDraftResult {
+  const cleaned = cleanDraftInput(rawJson);
+
+  // 前后有解释文字（或根本不是对象）时给明确指引，不做静默猜测
+  if (!cleaned.startsWith("{") || !cleaned.endsWith("}")) {
+    return { ok: false, message: DRAFT_NOT_OBJECT_MESSAGE };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return { ok: false, message: DRAFT_PARSE_FAILED_MESSAGE };
+  }
+  const result = rewriteDraftSchema.safeParse(parsed);
+  if (!result.success) {
+    return {
+      ok: false,
+      message: result.error.issues[0]?.message ?? "draft 结构校验失败",
+    };
+  }
+  // 禁止 HTML
+  const values = [
+    result.data.what,
+    result.data.how,
+    ...result.data.features,
+    ...result.data.useCases,
+    ...result.data.faqs.flatMap((faq) => [faq.question, faq.answer]),
+  ];
+  if (values.some((value) => value.includes("<"))) {
+    return { ok: false, message: "draft 不允许包含 HTML 标签" };
+  }
+  return { ok: true, draft: result.data };
+}
+
+// 首次进入改写流程时把当前内容固化为 raw 快照（只写一次，不覆盖）
+async function ensureRawSnapshot(websiteId: number): Promise<void> {
+  const detail = await prisma.toolDetail.findUnique({
+    where: { website_id: websiteId },
+    select: {
+      raw_imported_content: true,
+      what: true,
+      how: true,
+      features_text: true,
+      use_cases: true,
+    },
+  });
+  if (!detail || rawFromStored(detail.raw_imported_content)) return;
+
+  const faqs = await prisma.toolFAQ.findMany({
+    where: { website_id: websiteId },
+    orderBy: { position: "asc" },
+    select: { question: true, answer: true },
+  });
+  await prisma.toolDetail.update({
+    where: { website_id: websiteId },
+    data: {
+      raw_imported_content: buildRawSnapshot(
+        detail,
+        faqs
+      ) as unknown as Prisma.InputJsonValue,
+      rewrite_status: detail.raw_imported_content
+        ? undefined
+        : RewriteStatus.raw_imported,
+    },
+  });
+}
+
+// 保存 AI 改写草稿 → draft_generated（重新保存草稿会要求重新审核）
+export async function saveRewriteDraft(
+  websiteId: number,
+  draft: RewriteDraft
+): Promise<void> {
+  await ensureRawSnapshot(websiteId);
+  await prisma.toolDetail.update({
+    where: { website_id: websiteId },
+    data: {
+      ai_rewrite_draft: draft as unknown as Prisma.InputJsonValue,
+      rewrite_status: RewriteStatus.draft_generated,
+      reviewed_at: null,
+    },
+  });
+}
+
+// 把草稿应用到公开详情字段（覆盖 ToolDetail 四字段 + 整体替换 ToolFAQ）
+export async function applyRewriteDraft(
+  websiteId: number
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const detail = await prisma.toolDetail.findUnique({
+    where: { website_id: websiteId },
+    select: { ai_rewrite_draft: true },
+  });
+  if (!detail?.ai_rewrite_draft) {
+    return { ok: false, message: "尚未保存 AI 改写草稿" };
+  }
+  const parsed = parseRewriteDraft(JSON.stringify(detail.ai_rewrite_draft));
+  if (!parsed.ok) {
+    return { ok: false, message: `草稿数据无效: ${parsed.message}` };
+  }
+
+  await ensureRawSnapshot(websiteId);
+  await prisma.toolDetail.update({
+    where: { website_id: websiteId },
+    data: {
+      what: parsed.draft.what,
+      how: parsed.draft.how,
+      features: parsed.draft.features as Prisma.InputJsonValue,
+      use_cases: parsed.draft.useCases as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.toolFAQ.deleteMany({ where: { website_id: websiteId } });
+  if (parsed.draft.faqs.length) {
+    await prisma.toolFAQ.createMany({
+      data: parsed.draft.faqs.map((faq, position) => ({
+        website_id: websiteId,
+        question: faq.question,
+        answer: faq.answer,
+        position,
+      })),
+    });
+  }
+  return { ok: true };
+}
+
+// 标记人工已审核
+export async function markToolReviewed(
+  websiteId: number,
+  reviewNotes: string
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  const detail = await prisma.toolDetail.findUnique({
+    where: { website_id: websiteId },
+    select: { id: true },
+  });
+  if (!detail) {
+    return { ok: false, message: "该工具没有 ToolDetail，无需审核流程" };
+  }
+  await prisma.toolDetail.update({
+    where: { website_id: websiteId },
+    data: {
+      rewrite_status: RewriteStatus.human_reviewed,
+      reviewed_at: new Date(),
+      review_notes: reviewNotes.trim() || null,
+    },
+  });
+  return { ok: true };
+}
+
+// 发布守卫：有 ToolDetail（含来源内容）的工具必须 human_reviewed 才能 approved；
+// 无 ToolDetail 的普通目录提交不受影响
+export async function assertPublishAllowed(
+  websiteId: number,
+  nextStatus: string
+): Promise<{ ok: true } | { ok: false; message: string }> {
+  if (nextStatus !== "approved") return { ok: true };
+  const detail = await prisma.toolDetail.findUnique({
+    where: { website_id: websiteId },
+    select: { rewrite_status: true },
+  });
+  if (detail && detail.rewrite_status !== RewriteStatus.human_reviewed) {
+    return {
+      ok: false,
+      message: "Please complete human review before publishing this tool.",
+    };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // 读取
 // ---------------------------------------------------------------------------
 
@@ -480,6 +818,21 @@ export async function getAdminToolById(
         question: faq.question,
         answer: faq.answer ?? "",
       })),
+      rewrite: (() => {
+        const raw =
+          rawFromStored(detail?.raw_imported_content) ??
+          buildRawSnapshot(detail, website.toolFaqs);
+        return {
+          status: detail?.rewrite_status ?? null,
+          reviewedAt: detail?.reviewed_at?.toISOString() ?? null,
+          reviewNotes: detail?.review_notes ?? "",
+          draft: detail?.ai_rewrite_draft
+            ? JSON.stringify(detail.ai_rewrite_draft, null, 2)
+            : "",
+          raw,
+          prompt: buildRewritePrompt(website.title, raw),
+        };
+      })(),
     };
   } catch (error) {
     console.error("Error fetching admin tool:", error);

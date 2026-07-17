@@ -16,6 +16,7 @@ import path from "path";
 import {
   Prisma,
   PrismaClient,
+  RewriteStatus,
   ToolLinkKind,
   ToolTagKind,
 } from "@prisma/client";
@@ -642,7 +643,12 @@ async function importRecords(records: ToolRecord[]) {
           { url: { in: records.map((record) => record.site) } },
         ],
       },
-      select: { id: true, slug: true, url: true },
+      select: {
+        id: true,
+        slug: true,
+        url: true,
+        toolDetail: { select: { rewrite_status: true } },
+      },
     });
     const existingBySlug = new Map(
       existingWebsites.filter((w) => w.slug).map((w) => [w.slug as string, w])
@@ -667,6 +673,15 @@ async function importRecords(records: ToolRecord[]) {
         existingBySlug.get(record.slug) ?? existingByUrl.get(record.site);
       if (existing && !overwrite) {
         skippedExisting++;
+        continue;
+      }
+      // 已人工审核的工具不允许被覆盖导入清掉编辑成果
+      if (
+        existing &&
+        existing.toolDetail?.rewrite_status === RewriteStatus.human_reviewed
+      ) {
+        skippedExisting++;
+        console.log(`  跳过(已人工审核): ${record.name}`);
         continue;
       }
 
@@ -729,6 +744,15 @@ async function importRecords(records: ToolRecord[]) {
         listed_at: record.listedAt,
         source: IMPORT_SOURCE,
         external_raw: record.externalRaw || null,
+        // 原始导入底稿快照 + 审核流起点状态
+        raw_imported_content: {
+          what: record.what,
+          how: record.how,
+          featuresText: record.featuresText,
+          useCases: record.useCases,
+          faqs: record.faq.map((question) => ({ question, answer: null })),
+        } as unknown as Prisma.InputJsonValue,
+        rewrite_status: RewriteStatus.raw_imported,
       };
       await prisma.toolDetail.upsert({
         where: { website_id: websiteId },
