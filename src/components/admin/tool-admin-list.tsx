@@ -141,6 +141,9 @@ export function ToolAdminList({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/tools/import">批量导入</Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
             <Link href="/admin/tools/rewrite">批量 AI 改写</Link>
           </Button>
           <Button variant="outline" size="sm" asChild>

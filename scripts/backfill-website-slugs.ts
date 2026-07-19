@@ -13,7 +13,7 @@
  * - 旧 slug 中 tool-{id} 格式的链接仍可通过详情页 legacy id 回退访问。
  */
 import { PrismaClient } from "@prisma/client";
-import { bestToolSlug, isLowQualitySlug } from "./lib/slug-utils";
+import { bestToolSlug, isLowQualitySlug } from "../src/lib/website/slug-utils";
 
 const dryRun = process.argv.includes("--dry-run");
 const optimize = process.argv.includes("--optimize");

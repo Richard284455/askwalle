@@ -19,6 +19,10 @@
     "scripts/import-tools-from-xlsx.ts",
     "scripts/backfill-website-slugs.ts",
     "scripts/cache-tool-media.ts",
-    "scripts/lib/slug-utils.ts"
+    "src/lib/website/slug-utils.ts",
+    "src/lib/website/xlsx-reader.ts",
+    "src/lib/website/tool-import.ts",
+    "scripts/backfill-raw-imported-description.ts",
+    "scripts/backfill-approved-raw-description.ts"
   ]
 }

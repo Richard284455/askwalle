@@ -82,6 +82,7 @@ model Website {
   slug        String?  @unique
   category    Category @relation(fields: [category_id], references: [id])
   category_id Int
+  import_batch_id Int?
   thumbnail   String?
   thumbnail_base64 String?
   status      String   @default("pending")
@@ -100,6 +101,7 @@ model Website {
   @@map("websites")
   @@index([category_id])
   @@index([status])
+  @@index([import_batch_id])
 }
 
 model Category {

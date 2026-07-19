@@ -12,6 +12,8 @@
     "import:resources": "ts-node --project tsconfig.script.json scripts/import-resources.ts",
     "import:tools": "ts-node --project tsconfig.script.json scripts/import-tools-from-xlsx.ts",
     "backfill:slugs": "ts-node --project tsconfig.script.json scripts/backfill-website-slugs.ts",
+    "backfill:raw-description": "ts-node --project tsconfig.script.json scripts/backfill-raw-imported-description.ts",
+    "backfill:approved-raw-description": "ts-node --project tsconfig.script.json scripts/backfill-approved-raw-description.ts",
     "cache:tool-media": "ts-node --project tsconfig.script.json scripts/cache-tool-media.ts"
   },
   "dependencies": {
