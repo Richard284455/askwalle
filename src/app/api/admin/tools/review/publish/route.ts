@@ -4,7 +4,7 @@ import { requireAdmin } from "@/lib/auth/admin-auth";
 import { bulkPublish } from "@/lib/website/tool-review";
 
 // POST /api/admin/tools/review/publish
-// body: { websiteIds: number[], confirm: "PUBLISH" }
+// body: { websiteIds: number[] } —— 前端二次确认弹窗，无确认词
 // 只发布 pending + human_reviewed（复用现有发布守卫）
 export async function POST(request: Request) {
   const unauthorized = await requireAdmin();
@@ -12,12 +12,6 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json().catch(() => ({}));
-    if (body?.confirm !== "PUBLISH") {
-      return NextResponse.json(
-        AjaxResponse.fail("请输入确认词 PUBLISH 以确认批量发布"),
-        { status: 400 }
-      );
-    }
     const websiteIds = Array.isArray(body?.websiteIds)
       ? body.websiteIds.filter((id: unknown) => typeof id === "number")
       : [];

@@ -4,7 +4,7 @@ import { requireAdmin } from "@/lib/auth/admin-auth";
 import { bulkSetStatus } from "@/lib/website/tool-review";
 
 // POST /api/admin/tools/review/archive
-// body: { websiteIds: number[], confirm: "ARCHIVE", status?: "archived" | "rejected" }
+// body: { websiteIds: number[], status?: "archived" | "rejected" } —— 前端二次确认弹窗，无确认词
 // 仅改状态，不物理删除
 export async function POST(request: Request) {
   const unauthorized = await requireAdmin();
@@ -12,12 +12,6 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json().catch(() => ({}));
-    if (body?.confirm !== "ARCHIVE") {
-      return NextResponse.json(
-        AjaxResponse.fail("请输入确认词 ARCHIVE 以确认批量归档/拒绝"),
-        { status: 400 }
-      );
-    }
     const status = body?.status === "rejected" ? "rejected" : "archived";
     const websiteIds = Array.isArray(body?.websiteIds)
       ? body.websiteIds.filter((id: unknown) => typeof id === "number")

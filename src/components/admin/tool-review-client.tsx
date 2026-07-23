@@ -32,7 +32,11 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils/utils";
 import type { AdminCategoryOption } from "@/lib/website/tool-admin";
-import type { ReviewListItem, ReviewPreview } from "@/lib/website/tool-review";
+import type {
+  ReviewListItem,
+  ReviewPreview,
+  ReviewStats,
+} from "@/lib/website/tool-review";
 
 const REWRITE_STATUS_COLORS: Record<string, string> = {
   raw_imported: "text-yellow-500",
@@ -49,119 +53,180 @@ type BulkResult = {
   affectedIds: number[];
 };
 
-type ConfirmAction = {
-  title: string;
-  word: string;
-  endpoint: string;
-  extra?: Record<string, unknown>;
-  needsNotes?: boolean;
+// 每个 Tab 映射到一组筛选（业务状态由现有字段推出）
+type TabDef = {
+  key: string;
+  label: string;
+  statKey?: keyof ReviewStats;
+  filter: {
+    rewriteStatus?: string;
+    qcStatus?: string;
+    websiteStatus?: string;
+  };
 };
+
+const TABS: TabDef[] = [
+  { key: "pending", label: "待处理", statKey: "pendingRewrite", filter: { rewriteStatus: "raw_imported" } },
+  { key: "qc_failed", label: "QC 失败", statKey: "qcFailed", filter: { qcStatus: "failed" } },
+  { key: "review", label: "待审核", statKey: "pendingReview", filter: { rewriteStatus: "draft_generated", qcStatus: "passed" } },
+  { key: "publish", label: "待发布", statKey: "pendingPublish", filter: { rewriteStatus: "human_reviewed", websiteStatus: "pending" } },
+  { key: "published", label: "已发布", statKey: "published", filter: { websiteStatus: "approved" } },
+  { key: "archived", label: "已归档", statKey: "archived", filter: { websiteStatus: "archived" } },
+];
+
+// 批量操作定义（无确认词，二次确认弹窗）
+type BulkOp = {
+  key: string;
+  label: string;
+  endpoint: string;
+  variant?: "default" | "outline";
+  danger?: boolean;
+  needsNotes?: boolean;
+  extra?: Record<string, unknown>;
+  risk: string;
+};
+
+const BULK_OPS: BulkOp[] = [
+  {
+    key: "apply-and-review",
+    label: "Apply & Mark Reviewed",
+    endpoint: "mark-reviewed",
+    variant: "default",
+    needsNotes: true,
+    risk: "对 draft_generated + QC 通过的工具：先应用草稿到公开字段，再标记人工已审核（仍 pending，不发布）。",
+  },
+  {
+    key: "apply-only",
+    label: "Apply only（高级）",
+    endpoint: "apply-drafts",
+    variant: "outline",
+    risk: "只把草稿应用到公开字段，不标记审核、不发布。",
+  },
+  {
+    key: "publish",
+    label: "Publish",
+    endpoint: "publish",
+    variant: "default",
+    risk: "只发布 pending + human_reviewed 的工具（复用发布守卫），其它一律跳过。",
+  },
+  {
+    key: "archive",
+    label: "Archive",
+    endpoint: "archive",
+    variant: "outline",
+    danger: true,
+    extra: { status: "archived" },
+    risk: "把选中工具改为 archived（仅改状态，不删除数据）。",
+  },
+];
 
 export function ToolReviewClient({
   initialItems,
+  initialStats,
   categories,
   batches,
+  presetBatchId,
+  presetTab,
 }: {
   initialItems: ReviewListItem[];
+  initialStats: ReviewStats | null;
   categories: AdminCategoryOption[];
   batches: { id: number; label: string }[];
+  presetBatchId?: number | null;
+  presetTab?: string;
 }) {
   const { toast } = useToast();
   const [items, setItems] = useState(initialItems);
+  const [stats, setStats] = useState<ReviewStats | null>(initialStats);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
 
-  const [batchId, setBatchId] = useState("all");
+  const [tab, setTab] = useState(
+    TABS.some((t) => t.key === presetTab) ? presetTab! : "review"
+  );
+  const [batchId, setBatchId] = useState(presetBatchId ? String(presetBatchId) : "all");
   const [categoryId, setCategoryId] = useState("all");
-  const [rewriteStatus, setRewriteStatus] = useState("draft_generated");
-  const [websiteStatus, setWebsiteStatus] = useState("all");
   const [search, setSearch] = useState("");
 
   const [preview, setPreview] = useState<ReviewPreview | null>(null);
-  const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
-  const [confirmInput, setConfirmInput] = useState("");
+  const [pendingOp, setPendingOp] = useState<BulkOp | null>(null);
   const [reviewNotes, setReviewNotes] = useState("");
   const [result, setResult] = useState<BulkResult | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const reload = async () => {
-    setLoading(true);
+  const activeTab = TABS.find((t) => t.key === tab) ?? TABS[2];
+
+  const buildParams = (tabKey = tab) => {
+    const def = TABS.find((t) => t.key === tabKey) ?? activeTab;
     const params = new URLSearchParams();
+    if (def.filter.rewriteStatus) params.set("rewriteStatus", def.filter.rewriteStatus);
+    if (def.filter.qcStatus) params.set("qcStatus", def.filter.qcStatus);
+    if (def.filter.websiteStatus) params.set("websiteStatus", def.filter.websiteStatus);
     if (batchId !== "all") params.set("rewriteBatchId", batchId);
     if (categoryId !== "all") params.set("categoryId", categoryId);
-    if (rewriteStatus !== "all") params.set("rewriteStatus", rewriteStatus);
-    if (websiteStatus !== "all") params.set("websiteStatus", websiteStatus);
     if (search.trim()) params.set("search", search.trim());
+    return params;
+  };
+
+  const reload = async (tabKey = tab) => {
+    setLoading(true);
     try {
-      const data = await fetch(`/api/admin/tools/review?${params}`).then((r) =>
-        r.json()
-      );
-      if (data?.code === 200) {
-        setItems(data.data);
-        setSelected(new Set());
-      }
+      const [listRes, statsRes] = await Promise.all([
+        fetch(`/api/admin/tools/review?${buildParams(tabKey)}`).then((r) => r.json()),
+        fetch(`/api/admin/tools/review/stats`).then((r) => r.json()),
+      ]);
+      if (listRes?.code === 200) setItems(listRes.data);
+      if (statsRes?.code === 200) setStats(statsRes.data);
+      setSelected(new Set());
     } finally {
       setLoading(false);
     }
   };
 
-  const toggle = (id: number) => {
+  const switchTab = (key: string) => {
+    setTab(key);
+    setResult(null);
+    reload(key);
+  };
+
+  const toggle = (id: number) =>
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  };
-
-  const toggleAll = () => {
+  const toggleAll = () =>
     setSelected((prev) =>
       prev.size === items.length ? new Set() : new Set(items.map((i) => i.websiteId))
     );
-  };
 
   const openPreview = async (websiteId: number) => {
-    const data = await fetch(
-      `/api/admin/tools/review?websiteId=${websiteId}`
-    ).then((r) => r.json());
+    const data = await fetch(`/api/admin/tools/review?websiteId=${websiteId}`).then((r) => r.json());
     if (data?.code === 200) setPreview(data.data);
     else toast({ title: "预览失败", description: data?.message, variant: "destructive" });
   };
 
-  const runAction = async () => {
-    if (!confirmAction || busy) return;
-    if (confirmInput !== confirmAction.word) {
-      toast({
-        title: "确认词不正确",
-        description: `请输入 ${confirmAction.word}`,
-        variant: "destructive",
-      });
-      return;
-    }
+  const runOp = async () => {
+    if (!pendingOp || busy) return;
     setBusy(true);
     try {
-      const data = await fetch(confirmAction.endpoint, {
+      const data = await fetch(`/api/admin/tools/review/${pendingOp.endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           websiteIds: [...selected],
-          confirm: confirmAction.word,
-          ...(confirmAction.needsNotes ? { reviewNotes } : {}),
-          ...(confirmAction.extra ?? {}),
+          ...(pendingOp.needsNotes ? { reviewNotes } : {}),
+          ...(pendingOp.extra ?? {}),
         }),
       }).then((r) => r.json());
       if (data?.code === 200) {
         setResult(data.data as BulkResult);
-        setConfirmAction(null);
-        setConfirmInput("");
-        toast({ title: "操作完成", description: confirmAction.title });
+        setPendingOp(null);
+        toast({ title: "操作完成", description: pendingOp.label });
         await reload();
       } else {
-        toast({
-          title: "操作失败",
-          description: data?.message || "请重试",
-          variant: "destructive",
-        });
+        toast({ title: "操作失败", description: data?.message || "请重试", variant: "destructive" });
       }
     } finally {
       setBusy(false);
@@ -179,11 +244,9 @@ export function ToolReviewClient({
     >
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 bg-background/30 backdrop-blur-sm p-6 rounded-xl border border-border/40">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-semibold text-foreground">
-            批量审核 / 发布
-          </h1>
+          <h1 className="text-2xl sm:text-3xl font-semibold text-foreground">审核发布工作台</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            审核 AI 改写结果 → 应用草稿 → 标记人工已审核 → 发布（每步须输入确认词）
+            AI 草稿 → 应用+审核 → 发布，每步二次确认（无确认词），服务端逐条重校验
           </p>
         </div>
         <Button variant="outline" size="sm" asChild>
@@ -194,9 +257,46 @@ export function ToolReviewClient({
         </Button>
       </div>
 
+      {/* 统计卡片 */}
+      {stats && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+          <StatCard label="待改写" value={stats.pendingRewrite} />
+          <StatCard label="草稿已生成" value={stats.draftGenerated} />
+          <StatCard label="QC 通过" value={stats.qcPassed} />
+          <StatCard label="QC 失败" value={stats.qcFailed} />
+          <StatCard label="待应用" value={stats.pendingReview} />
+          <StatCard label="待审核" value={stats.pendingReview} />
+          <StatCard label="待发布" value={stats.pendingPublish} />
+          <StatCard label="已发布" value={stats.published} />
+        </div>
+      )}
+
+      {/* 状态 Tab */}
+      <div className="flex flex-wrap gap-2 border-b border-border/40 pb-2">
+        {TABS.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => switchTab(t.key)}
+            className={cn(
+              "px-3 py-1.5 rounded-lg border text-sm transition-all",
+              tab === t.key
+                ? "bg-background/40 border-primary/30 text-foreground shadow-sm"
+                : "bg-background/20 border-border/40 text-muted-foreground hover:text-foreground"
+            )}
+          >
+            {t.label}
+            {stats && t.statKey ? (
+              <Badge variant="outline" className="ml-1.5 px-1.5 py-0 text-[10px]">
+                {stats[t.statKey]}
+              </Badge>
+            ) : null}
+          </button>
+        ))}
+      </div>
+
       {/* 筛选 */}
       <div className="rounded-xl border border-border/40 bg-background/30 backdrop-blur-sm p-4 space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <Select value={batchId} onValueChange={setBatchId}>
             <SelectTrigger className="bg-background/40 border-border/40">
               <SelectValue placeholder="改写批次" />
@@ -204,9 +304,7 @@ export function ToolReviewClient({
             <SelectContent>
               <SelectItem value="all">全部批次</SelectItem>
               {batches.map((b) => (
-                <SelectItem key={b.id} value={b.id.toString()}>
-                  {b.label}
-                </SelectItem>
+                <SelectItem key={b.id} value={b.id.toString()}>{b.label}</SelectItem>
               ))}
             </SelectContent>
           </Select>
@@ -217,38 +315,11 @@ export function ToolReviewClient({
             <SelectContent>
               <SelectItem value="all">全部分类</SelectItem>
               {categories.map((c) => (
-                <SelectItem key={c.id} value={c.id.toString()}>
-                  {c.label}
-                </SelectItem>
+                <SelectItem key={c.id} value={c.id.toString()}>{c.label}</SelectItem>
               ))}
             </SelectContent>
           </Select>
-          <Select value={rewriteStatus} onValueChange={setRewriteStatus}>
-            <SelectTrigger className="bg-background/40 border-border/40">
-              <SelectValue placeholder="rewrite_status" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">全部改写状态</SelectItem>
-              <SelectItem value="raw_imported">raw_imported</SelectItem>
-              <SelectItem value="draft_generated">draft_generated</SelectItem>
-              <SelectItem value="human_reviewed">human_reviewed</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={websiteStatus} onValueChange={setWebsiteStatus}>
-            <SelectTrigger className="bg-background/40 border-border/40">
-              <SelectValue placeholder="website status" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">全部工具状态</SelectItem>
-              <SelectItem value="pending">pending</SelectItem>
-              <SelectItem value="approved">approved</SelectItem>
-              <SelectItem value="rejected">rejected</SelectItem>
-              <SelectItem value="archived">archived</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="flex flex-col sm:flex-row gap-3">
-          <div className="relative flex-1">
+          <div className="relative">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               value={search}
@@ -257,97 +328,54 @@ export function ToolReviewClient({
               className="pl-9 bg-background/40 border-border/40"
             />
           </div>
-          <Button onClick={reload} disabled={loading}>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button onClick={() => reload()} disabled={loading} size="sm">
             {loading ? "加载中..." : "应用筛选"}
           </Button>
+          <span className="text-xs text-muted-foreground">
+            import batch 映射：TODO（当前批次表未存 website 关联）。
+          </span>
         </div>
-        <p className="text-xs text-muted-foreground">
-          import batch 映射：TODO（当前批次表未存 website 关联）。
-        </p>
       </div>
 
       {/* 批量操作栏 */}
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border/40 bg-background/30 backdrop-blur-sm p-4">
-        <span className="text-sm text-muted-foreground">
-          已选 {selectedCount} 条：
-        </span>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={selectedCount === 0}
-          onClick={() =>
-            setConfirmAction({
-              title: "Apply selected drafts",
-              word: "APPLY",
-              endpoint: "/api/admin/tools/review/apply-drafts",
-            })
-          }
-        >
-          Apply drafts
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={selectedCount === 0}
-          onClick={() =>
-            setConfirmAction({
-              title: "Mark as human reviewed",
-              word: "REVIEWED",
-              endpoint: "/api/admin/tools/review/mark-reviewed",
-              needsNotes: true,
-            })
-          }
-        >
-          Mark reviewed
-        </Button>
-        <Button
-          size="sm"
-          disabled={selectedCount === 0}
-          onClick={() =>
-            setConfirmAction({
-              title: "Publish selected",
-              word: "PUBLISH",
-              endpoint: "/api/admin/tools/review/publish",
-            })
-          }
-        >
-          Publish
-        </Button>
-        <Button
-          size="sm"
-          variant="outline"
-          className="text-red-500 hover:text-red-600"
-          disabled={selectedCount === 0}
-          onClick={() =>
-            setConfirmAction({
-              title: "Archive selected",
-              word: "ARCHIVE",
-              endpoint: "/api/admin/tools/review/archive",
-              extra: { status: "archived" },
-            })
-          }
-        >
-          Archive
-        </Button>
+        <span className="text-sm text-muted-foreground">已选 {selectedCount} 条：</span>
+        {BULK_OPS.map((op) => (
+          <Button
+            key={op.key}
+            size="sm"
+            variant={op.variant ?? "outline"}
+            disabled={selectedCount === 0}
+            className={op.danger ? "text-red-500 hover:text-red-600" : undefined}
+            onClick={() => {
+              setReviewNotes("");
+              setPendingOp(op);
+            }}
+          >
+            {op.label}
+          </Button>
+        ))}
       </div>
 
-      {/* 结果报告 */}
+      {/* 结果区 */}
       {result && (
-        <div className="rounded-xl border border-border/40 bg-background/20 p-4 text-sm space-y-1">
+        <div className="rounded-xl border border-border/40 bg-background/20 p-4 text-sm space-y-2">
           <p className="font-medium">
-            结果：选中 {result.selected}，成功 {result.succeeded}，跳过{" "}
-            {result.skipped}，失败 {result.failed}
+            结果：选中 {result.selected}，成功 {result.succeeded}，跳过 {result.skipped}，失败 {result.failed}
           </p>
           {result.affectedIds.length > 0 && (
-            <p className="text-xs text-muted-foreground">
-              affected: {result.affectedIds.join(", ")}
-            </p>
+            <p className="text-xs text-muted-foreground">affected: {result.affectedIds.join(", ")}</p>
           )}
           {result.failedReasons.slice(0, 20).map((r, i) => (
-            <p key={i} className="text-xs text-orange-500">
-              #{r.websiteId}: {r.reason}
-            </p>
+            <p key={i} className="text-xs text-orange-500">#{r.websiteId}: {r.reason}</p>
           ))}
+          <div className="flex flex-wrap gap-2 pt-1">
+            <Button variant="outline" size="sm" onClick={() => reload()}>返回审核列表</Button>
+            <Button variant="outline" size="sm" onClick={() => switchTab("publish")}>查看待发布</Button>
+            <Button variant="outline" size="sm" onClick={() => switchTab("published")}>查看已发布</Button>
+          </div>
         </div>
       )}
 
@@ -384,66 +412,36 @@ export function ToolReviewClient({
                 items.map((item) => (
                   <TableRow key={item.websiteId}>
                     <TableCell>
-                      <input
-                        type="checkbox"
-                        checked={selected.has(item.websiteId)}
-                        onChange={() => toggle(item.websiteId)}
-                      />
+                      <input type="checkbox" checked={selected.has(item.websiteId)} onChange={() => toggle(item.websiteId)} />
                     </TableCell>
                     <TableCell className="max-w-[220px]">
                       <div className="font-medium truncate">{item.title}</div>
-                      <div className="text-xs text-muted-foreground truncate">
-                        {item.slug || "(无 slug)"}
-                      </div>
+                      <div className="text-xs text-muted-foreground truncate">{item.slug || "(无 slug)"}</div>
                     </TableCell>
                     <TableCell className="text-sm">{item.categoryName}</TableCell>
                     <TableCell className="text-sm">{item.websiteStatus}</TableCell>
                     <TableCell>
-                      <span
-                        className={cn(
-                          "text-sm font-medium",
-                          item.rewriteStatus
-                            ? REWRITE_STATUS_COLORS[item.rewriteStatus]
-                            : ""
-                        )}
-                      >
+                      <span className={cn("text-sm font-medium", item.rewriteStatus ? REWRITE_STATUS_COLORS[item.rewriteStatus] : "")}>
                         {item.rewriteStatus ?? "—"}
                       </span>
                     </TableCell>
                     <TableCell className="text-sm">
                       {item.qcStatus ? (
-                        <Badge
-                          variant="outline"
-                          className={cn(
-                            "text-[11px]",
-                            item.qcStatus === "passed"
-                              ? "border-green-500/30 text-green-600"
-                              : "border-orange-500/30 text-orange-500"
-                          )}
-                        >
+                        <Badge variant="outline" className={cn("text-[11px]", item.qcStatus === "passed" ? "border-green-500/30 text-green-600" : "border-orange-500/30 text-orange-500")}>
                           {item.qcStatus}
                         </Badge>
-                      ) : (
-                        "—"
-                      )}
+                      ) : "—"}
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       {item.provider ? `${item.provider}/${item.model}` : "—"}
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex items-center justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => openPreview(item.websiteId)}
-                          title="预览草稿"
-                        >
+                        <Button variant="ghost" size="sm" onClick={() => openPreview(item.websiteId)} title="预览草稿">
                           <Eye className="w-4 h-4" />
                         </Button>
                         <Button variant="ghost" size="sm" asChild>
-                          <Link href={`/admin/tools/${item.websiteId}/edit`}>
-                            编辑
-                          </Link>
+                          <Link href={`/admin/tools/${item.websiteId}/edit`}>编辑</Link>
                         </Button>
                       </div>
                     </TableCell>
@@ -459,9 +457,7 @@ export function ToolReviewClient({
       <Dialog open={preview !== null} onOpenChange={(o) => !o && setPreview(null)}>
         <DialogContent className="max-w-2xl max-h-[80vh] overflow-auto">
           <DialogHeader>
-            <DialogTitle>
-              草稿预览 — {preview?.title}（{preview?.rewriteStatus}）
-            </DialogTitle>
+            <DialogTitle>草稿预览 — {preview?.title}（{preview?.rewriteStatus}）</DialogTitle>
           </DialogHeader>
           {preview && (
             <div className="space-y-4 text-sm">
@@ -473,28 +469,20 @@ export function ToolReviewClient({
               <div>
                 <p className="font-semibold text-foreground/70">AI 改写草稿</p>
                 <pre className="mt-1 overflow-auto rounded-md border border-border/40 bg-background/40 p-3 text-xs whitespace-pre-wrap break-all">
-                  {preview.draft
-                    ? JSON.stringify(preview.draft, null, 2)
-                    : "（无草稿）"}
+                  {preview.draft ? JSON.stringify(preview.draft, null, 2) : "（无草稿）"}
                 </pre>
               </div>
               <div>
-                <p className="font-semibold text-foreground/70">
-                  公开页当前字段
-                </p>
+                <p className="font-semibold text-foreground/70">公开页当前字段</p>
                 <div className="mt-1 space-y-1 text-xs text-muted-foreground">
                   <p>description: {preview.current.description}</p>
                   <p>what: {preview.current.what || "（空）"}</p>
                   <p>how: {preview.current.how || "（空）"}</p>
-                  <p>features: {preview.current.features.length} 条</p>
-                  <p>useCases: {preview.current.useCases.length} 条</p>
-                  <p>faqs: {preview.current.faqs.length} 条</p>
+                  <p>features: {preview.current.features.length} 条 · useCases: {preview.current.useCases.length} 条 · faqs: {preview.current.faqs.length} 条</p>
                 </div>
               </div>
               <details>
-                <summary className="cursor-pointer text-xs font-medium text-foreground/70">
-                  Raw imported content（仅内部）
-                </summary>
+                <summary className="cursor-pointer text-xs font-medium text-foreground/70">Raw imported content（仅内部）</summary>
                 <pre className="mt-1 max-h-48 overflow-auto rounded-md border border-border/40 bg-background/40 p-3 text-xs whitespace-pre-wrap break-all">
                   {preview.raw ? JSON.stringify(preview.raw, null, 2) : "（无）"}
                 </pre>
@@ -504,26 +492,19 @@ export function ToolReviewClient({
         </DialogContent>
       </Dialog>
 
-      {/* 确认词对话框 */}
-      <Dialog
-        open={confirmAction !== null}
-        onOpenChange={(o) => {
-          if (!o) {
-            setConfirmAction(null);
-            setConfirmInput("");
-          }
-        }}
-      >
+      {/* 批量操作确认弹窗（无确认词） */}
+      <Dialog open={pendingOp !== null} onOpenChange={(o) => !o && setPendingOp(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{confirmAction?.title}</DialogTitle>
+            <DialogTitle>{pendingOp?.label}</DialogTitle>
           </DialogHeader>
           <div className="space-y-3 text-sm">
             <p>
               将对已选的 <strong>{selectedCount}</strong> 条工具执行此操作。
               服务端会逐条重新校验资格，不合格的会被跳过。
             </p>
-            {confirmAction?.needsNotes && (
+            <p className="text-muted-foreground">{pendingOp?.risk}</p>
+            {pendingOp?.needsNotes && (
               <Input
                 value={reviewNotes}
                 onChange={(e) => setReviewNotes(e.target.value)}
@@ -531,35 +512,24 @@ export function ToolReviewClient({
                 className="bg-background/40 border-border/40"
               />
             )}
-            <p className="text-muted-foreground">
-              输入确认词 <strong>{confirmAction?.word}</strong> 以继续：
-            </p>
-            <Input
-              value={confirmInput}
-              onChange={(e) => setConfirmInput(e.target.value)}
-              placeholder={confirmAction?.word}
-              className="bg-background/40 border-border/40"
-            />
           </div>
           <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setConfirmAction(null);
-                setConfirmInput("");
-              }}
-            >
-              取消
-            </Button>
-            <Button
-              onClick={runAction}
-              disabled={busy || confirmInput !== confirmAction?.word}
-            >
+            <Button variant="outline" onClick={() => setPendingOp(null)}>取消</Button>
+            <Button onClick={runOp} disabled={busy}>
               {busy ? "执行中..." : "确认执行"}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
     </motion.div>
+  );
+}
+
+function StatCard({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-lg border border-border/40 bg-background/20 p-3 text-center">
+      <p className="text-[11px] text-muted-foreground">{label}</p>
+      <p className="mt-0.5 text-lg font-semibold text-foreground">{value}</p>
+    </div>
   );
 }

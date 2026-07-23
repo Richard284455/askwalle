@@ -4,19 +4,13 @@ import { requireAdmin } from "@/lib/auth/admin-auth";
 import { bulkApplyDrafts } from "@/lib/website/tool-review";
 
 // POST /api/admin/tools/review/apply-drafts
-// body: { websiteIds: number[], confirm: "APPLY" }
+// body: { websiteIds: number[] } —— 前端二次确认弹窗，无确认词；服务端仍逐条重校验
 export async function POST(request: Request) {
   const unauthorized = await requireAdmin();
   if (unauthorized) return unauthorized;
 
   try {
     const body = await request.json().catch(() => ({}));
-    if (body?.confirm !== "APPLY") {
-      return NextResponse.json(
-        AjaxResponse.fail("请输入确认词 APPLY 以确认批量应用草稿"),
-        { status: 400 }
-      );
-    }
     const websiteIds = Array.isArray(body?.websiteIds)
       ? body.websiteIds.filter((id: unknown) => typeof id === "number")
       : [];

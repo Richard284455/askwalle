@@ -127,6 +127,65 @@ export async function getReviewList(
 }
 
 // ---------------------------------------------------------------------------
+// 统计卡片（全部由现有字段计算，不新增 DB 字段）
+// ---------------------------------------------------------------------------
+
+export type ReviewStats = {
+  pendingRewrite: number; // raw_imported（含待修复）
+  draftGenerated: number; // draft_generated
+  qcPassed: number; // draft_generated 且最近一次 QC 通过
+  qcFailed: number; // 最近一次 QC 失败
+  pendingReview: number; // = qcPassed（待应用/待审核合并）
+  pendingPublish: number; // human_reviewed + pending
+  published: number; // approved
+  archived: number; // archived
+};
+
+export async function getReviewStats(): Promise<ReviewStats> {
+  const websites = await prisma.website.findMany({
+    where: { toolDetail: { isNot: null } },
+    select: {
+      status: true,
+      toolDetail: { select: { rewrite_status: true } },
+      rewriteItems: {
+        orderBy: { id: "desc" },
+        take: 1,
+        select: { qc_status: true },
+      },
+    },
+  });
+
+  const stats: ReviewStats = {
+    pendingRewrite: 0,
+    draftGenerated: 0,
+    qcPassed: 0,
+    qcFailed: 0,
+    pendingReview: 0,
+    pendingPublish: 0,
+    published: 0,
+    archived: 0,
+  };
+
+  for (const w of websites) {
+    const rewrite = w.toolDetail?.rewrite_status;
+    const qc = w.rewriteItems[0]?.qc_status ?? null;
+    if (w.status === "approved") stats.published++;
+    else if (w.status === "archived") stats.archived++;
+
+    if (rewrite === RewriteStatus.raw_imported) stats.pendingRewrite++;
+    else if (rewrite === RewriteStatus.draft_generated) {
+      stats.draftGenerated++;
+      if (qc === "passed") stats.qcPassed++;
+    } else if (rewrite === RewriteStatus.human_reviewed && w.status === "pending") {
+      stats.pendingPublish++;
+    }
+    if (qc === "failed") stats.qcFailed++;
+  }
+  stats.pendingReview = stats.qcPassed;
+  return stats;
+}
+
+// ---------------------------------------------------------------------------
 // 单条预览（raw + draft + 公开当前字段 + QC 错误；不含任何 key）
 // ---------------------------------------------------------------------------
 

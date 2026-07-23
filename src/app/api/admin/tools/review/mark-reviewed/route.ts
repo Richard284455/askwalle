@@ -4,19 +4,14 @@ import { requireAdmin } from "@/lib/auth/admin-auth";
 import { bulkMarkReviewed } from "@/lib/website/tool-review";
 
 // POST /api/admin/tools/review/mark-reviewed
-// body: { websiteIds: number[], confirm: "REVIEWED", reviewNotes?: string }
+// body: { websiteIds: number[], reviewNotes? } —— 前端二次确认弹窗，无确认词
+// 服务端仍：先自动 apply 草稿再 mark reviewed；qc_failed / raw_imported 一律拒绝
 export async function POST(request: Request) {
   const unauthorized = await requireAdmin();
   if (unauthorized) return unauthorized;
 
   try {
     const body = await request.json().catch(() => ({}));
-    if (body?.confirm !== "REVIEWED") {
-      return NextResponse.json(
-        AjaxResponse.fail("请输入确认词 REVIEWED 以确认批量标记审核"),
-        { status: 400 }
-      );
-    }
     const reviewNotes =
       typeof body?.reviewNotes === "string" ? body.reviewNotes : "";
     if (reviewNotes.includes("<")) {
