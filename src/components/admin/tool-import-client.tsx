@@ -75,7 +75,12 @@ export function ToolImportClient({
   const [previewing, setPreviewing] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [result, setResult] = useState<{ batchId: number; imported: number; skipped: number; errors: number } | null>(null);
+  const [result, setResult] = useState<{ batchId: number; imported: number; skipped: number; errors: number; detailUrl?: string } | null>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const [slowNotice, setSlowNotice] = useState(false);
+
+  // 同步导入耗时可能较长（远程库逐条写入）；超过此值先给用户明确反馈，避免界面无限“导入中”
+  const CONFIRM_TIMEOUT_MS = 60_000;
 
   const addFiles = (list: FileList | null) => {
     if (!list) return;
@@ -100,12 +105,16 @@ export function ToolImportClient({
     }
     setPreview(null);
     setResult(null);
+    setImportError(null);
+    setSlowNotice(false);
   };
 
   const handlePreview = async () => {
     if (!files.length || previewing) return;
     setPreviewing(true);
     setResult(null);
+    setImportError(null);
+    setSlowNotice(false);
     try {
       const fd = new FormData();
       files.forEach((f) => fd.append("files", f));
@@ -126,14 +135,20 @@ export function ToolImportClient({
   const handleConfirm = async () => {
     if (!preview || importing) return;
     setImporting(true);
+    setImportError(null);
+    setSlowNotice(false);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), CONFIRM_TIMEOUT_MS);
     try {
       const res = await fetch("/api/admin/tools/import/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ previewToken: preview.previewToken, overwrite: preview.overwrite }),
+        signal: controller.signal,
       });
       const data = await res.json().catch(() => null);
       if (res.ok && data?.code === 200) {
+        // 成功：显示结果，清空预检与文件（token 已被服务端消费）
         setResult(data.data);
         setConfirmOpen(false);
         setPreview(null);
@@ -141,9 +156,31 @@ export function ToolImportClient({
         toast({ title: "导入完成", description: `批次 #${data.data.batchId}` });
         router.refresh();
       } else {
-        toast({ title: "导入失败", description: data?.message || "请重试", variant: "destructive" });
+        // 服务端明确失败：显示原因；token 已被消费，需重新预检
+        setImportError(data?.message || `导入失败（HTTP ${res.status}）`);
+        setConfirmOpen(false);
+        setPreview(null);
+        toast({ title: "导入失败", description: data?.message || "请重新预检后重试", variant: "destructive" });
+      }
+    } catch (err) {
+      const aborted = err instanceof DOMException && err.name === "AbortError";
+      if (aborted) {
+        // 请求超过 60s：后端可能仍在导入，引导用户去批次列表核对，避免重复导入
+        setSlowNotice(true);
+        setConfirmOpen(false);
+        setPreview(null);
+        toast({ title: "导入仍在进行", description: "请稍后在批次列表核对结果" });
+      } else {
+        setImportError(
+          err instanceof Error ? `请求失败：${err.message}` : "请求失败，请重试"
+        );
+        setConfirmOpen(false);
+        setPreview(null);
+        toast({ title: "导入失败", description: "网络异常，请重新预检后重试", variant: "destructive" });
       }
     } finally {
+      // 无论成功 / 失败 / 超时都结束 loading，界面不会永久卡在“导入中”
+      clearTimeout(timer);
       setImporting(false);
     }
   };
@@ -294,6 +331,43 @@ export function ToolImportClient({
           <Button onClick={() => setConfirmOpen(true)} disabled={preview.importableCount === 0} className="gap-2">
             确认导入
           </Button>
+        </div>
+      )}
+
+      {/* 导入失败区 */}
+      {importError && (
+        <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-6 space-y-3">
+          <h2 className="text-lg font-semibold text-red-700 dark:text-red-300">导入失败</h2>
+          <p className="text-sm">{importError}</p>
+          <p className="text-xs text-muted-foreground">
+            该预检已失效。请重新选择文件并预检后再次导入。
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" onClick={handlePreview} disabled={!files.length || previewing}>
+              {previewing ? "预检中..." : "重新预检"}
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => router.refresh()}>
+              刷新批次列表
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 导入较慢 / 超时提示区 */}
+      {slowNotice && (
+        <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-6 space-y-3">
+          <h2 className="text-lg font-semibold text-yellow-700 dark:text-yellow-300">
+            导入仍在进行或请求较慢
+          </h2>
+          <p className="text-sm">
+            请求超过 60 秒仍未返回。后端可能仍在导入（大批量逐条写入较慢）。
+            请稍后在下方“历史导入批次”核对结果，不要重复导入。
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" onClick={() => router.refresh()}>
+              刷新批次列表
+            </Button>
+          </div>
         </div>
       )}
 

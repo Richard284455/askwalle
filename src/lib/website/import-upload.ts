@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -75,7 +76,9 @@ export function sweepStaleUploads(maxAgeMs = UPLOAD_TTL_MS): void {
   if (!existsSync(UPLOAD_ROOT)) return;
   const now = Date.now();
   for (const entry of readdirSync(UPLOAD_ROOT)) {
-    if (!TOKEN_PATTERN.test(entry)) continue;
+    // 同时清理 preview 遗留（<token>）与 confirm 崩溃遗留（<token>.claimed）
+    const base = entry.endsWith(".claimed") ? entry.slice(0, -".claimed".length) : entry;
+    if (!TOKEN_PATTERN.test(base)) continue;
     const dir = path.join(UPLOAD_ROOT, entry);
     try {
       if (now - statSync(dir).mtimeMs > maxAgeMs) {
@@ -122,4 +125,42 @@ export function listUpload(token: string): SavedUpload | null {
 export function clearUpload(token: string): void {
   const dir = tokenDir(token);
   if (dir && existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+}
+
+/**
+ * 原子性占用 token：把 <token> 目录重命名为 <token>.claimed。
+ * renameSync 是原子操作——重复/并发 confirm 只有第一个成功，其余拿到 null，
+ * 从而避免同一 previewToken 被重复导入。返回占用后的文件列表（路径指向 .claimed 目录）。
+ */
+export function claimUpload(token: string): SavedUpload | null {
+  const dir = tokenDir(token);
+  if (!dir || !existsSync(dir)) return null;
+  const claimedDir = `${dir}.claimed`;
+  try {
+    renameSync(dir, claimedDir);
+  } catch {
+    // 已被其它请求占用或已过期
+    return null;
+  }
+  const files = readdirSync(claimedDir)
+    .filter((f) => f.toLowerCase().endsWith(".xlsx"))
+    .sort()
+    .map((stored) => ({
+      filePath: path.join(claimedDir, stored),
+      fileName: stored.replace(/^\d{2}-/, ""),
+    }));
+  if (!files.length) {
+    rmSync(claimedDir, { recursive: true, force: true });
+    return null;
+  }
+  return { token, files };
+}
+
+// 清理 claim 后的目录（confirm 结束后调用，成功失败都清）
+export function clearClaimedUpload(token: string): void {
+  const dir = tokenDir(token);
+  if (!dir) return;
+  const claimedDir = `${dir}.claimed`;
+  if (existsSync(claimedDir)) rmSync(claimedDir, { recursive: true, force: true });
+  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
 }

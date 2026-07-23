@@ -3,7 +3,7 @@ import { AjaxResponse } from "@/lib/utils";
 import { requireAdmin } from "@/lib/auth/admin-auth";
 import { prisma } from "@/lib/prisma";
 import { runImport } from "@/lib/website/tool-import";
-import { clearUpload, listUpload } from "@/lib/website/import-upload";
+import { claimUpload, clearClaimedUpload } from "@/lib/website/import-upload";
 
 export const runtime = "nodejs";
 
@@ -23,11 +23,12 @@ export async function POST(request: Request) {
       ? body.batchName.trim()
       : null;
 
-  const upload = listUpload(previewToken);
+  // 原子占用 token：重复/并发 confirm 只有第一个成功，避免同一预检被重复导入
+  const upload = claimUpload(previewToken);
   if (!upload) {
     return NextResponse.json(
-      AjaxResponse.fail("上传已过期或无效，请重新上传预检"),
-      { status: 400 }
+      AjaxResponse.fail("预检已使用或已过期，请重新上传预检"),
+      { status: 409 }
     );
   }
 
@@ -47,13 +48,23 @@ export async function POST(request: Request) {
         imported: result.totals.imported,
         skipped: result.totals.skipped,
         errors: result.totals.errors,
+        detailUrl: `/admin/tools/import/${result.batchId}`,
       })
     );
   } catch (error) {
     console.error("Import confirm failed:", error instanceof Error ? error.message : "unknown");
-    return NextResponse.json(AjaxResponse.fail("导入失败"), { status: 500 });
+    return NextResponse.json(AjaxResponse.fail("导入失败，请稍后重试或查看导入批次列表"), {
+      status: 500,
+    });
   } finally {
-    // 无论成功失败都清理临时上传文件
-    clearUpload(previewToken);
+    // 清理临时上传文件；清理失败不影响已返回的响应
+    try {
+      clearClaimedUpload(previewToken);
+    } catch (cleanupError) {
+      console.error(
+        "Cleanup after import failed:",
+        cleanupError instanceof Error ? cleanupError.message : "unknown"
+      );
+    }
   }
 }
