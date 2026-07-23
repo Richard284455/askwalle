@@ -133,15 +133,84 @@ export type BatchRewriteDraft = {
   faqs: { question: string; answer: string }[];
 };
 
-export type CreateBatchFilter = {
-  name?: string;
+// 选择工具的筛选条件（estimate 与 create 共用，确保预估与实际一致）
+export type SelectionFilter = {
   categoryId?: number;
+  importBatchId?: number;
   rewriteStatuses?: ("raw_imported" | "draft_generated")[];
+  search?: string;
+};
+
+export type CreateBatchFilter = SelectionFilter & {
+  name?: string;
   limit?: number;
   provider?: RewriteProviderId;
   model?: string;
-  // TODO: importBatchId 过滤（需要 ToolImportFile 与 Website 的映射，当前批次表未存 website 关联）
+  modelType?: string; // fast / general / reasoning / custom（仅 UI/metadata）
 };
+
+// 构建选择工具的 where 子句。永远只选 pending，且 rewrite_status 只在
+// raw_imported / draft_generated 之内（显式排除 human_reviewed 与 approved）。
+function selectionWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
+  const statuses = (filter.rewriteStatuses?.length
+    ? filter.rewriteStatuses
+    : ["raw_imported"]) as RewriteStatus[];
+  const allowed = statuses.filter((s) => s !== RewriteStatus.human_reviewed);
+  return {
+    status: "pending",
+    ...(filter.categoryId ? { category_id: filter.categoryId } : {}),
+    ...(filter.importBatchId ? { import_batch_id: filter.importBatchId } : {}),
+    ...(filter.search?.trim()
+      ? {
+          OR: [
+            { title: { contains: filter.search.trim(), mode: "insensitive" } },
+            { slug: { contains: filter.search.trim(), mode: "insensitive" } },
+          ],
+        }
+      : {}),
+    toolDetail: { rewrite_status: { in: allowed } },
+  };
+}
+
+// create 与 estimate 共用的请求体解析，保证预估与创建条件一致
+export function parseCreateBatchBody(body: unknown): CreateBatchFilter {
+  const b = (body ?? {}) as Record<string, unknown>;
+  const posInt = (v: unknown) =>
+    typeof v === "number" && v > 0 ? Math.floor(v) : undefined;
+  return {
+    name: typeof b.name === "string" ? b.name : undefined,
+    categoryId: posInt(b.categoryId),
+    importBatchId: posInt(b.importBatchId),
+    limit: posInt(b.limit),
+    search: typeof b.search === "string" ? b.search : undefined,
+    rewriteStatuses: Array.isArray(b.rewriteStatuses)
+      ? (b.rewriteStatuses.filter((s: unknown) =>
+          ["raw_imported", "draft_generated"].includes(String(s))
+        ) as ("raw_imported" | "draft_generated")[])
+      : undefined,
+    provider:
+      typeof b.provider === "string" && isRewriteProvider(b.provider)
+        ? (b.provider as RewriteProviderId)
+        : undefined,
+    model:
+      typeof b.model === "string" && b.model.trim() ? b.model.trim() : undefined,
+    modelType:
+      typeof b.modelType === "string" &&
+      ["fast", "general", "reasoning", "custom"].includes(b.modelType)
+        ? b.modelType
+        : undefined,
+  };
+}
+
+// 预估当前筛选下可处理/跳过数量（不写数据库）
+export async function estimateRewriteSelection(
+  filter: CreateBatchFilter
+): Promise<{ eligible: number; limit: number; wouldProcess: number; wouldSkip: number }> {
+  const limit = Math.min(Math.max(filter.limit ?? BATCH_LIMIT_MAX, 1), BATCH_LIMIT_MAX);
+  const eligible = await prisma.website.count({ where: selectionWhere(filter) });
+  const wouldProcess = Math.min(eligible, limit);
+  return { eligible, limit, wouldProcess, wouldSkip: eligible - wouldProcess };
+}
 
 export type RewriteBatchSummary = {
   id: number;
@@ -149,6 +218,8 @@ export type RewriteBatchSummary = {
   provider: string;
   providerMode: "batch" | "direct";
   model: string;
+  modelType: string | null;
+  categoryId: number | null;
   status: string;
   totalCount: number;
   submittedCount: number;
@@ -166,6 +237,7 @@ export type RewriteItemSummary = {
   id: number;
   websiteId: number;
   websiteTitle: string;
+  websiteSlug: string | null;
   status: string;
   customId: string;
   qcStatus: string | null;
@@ -184,13 +256,26 @@ export type RewriteBatchDetail = RewriteBatchSummary & {
 
 type BatchRow = Prisma.ToolRewriteBatchGetPayload<Record<string, never>>;
 
+function snapshotField(
+  snapshot: Prisma.JsonValue | null,
+  key: string
+): unknown {
+  return snapshot && typeof snapshot === "object" && !Array.isArray(snapshot)
+    ? (snapshot as Record<string, unknown>)[key]
+    : undefined;
+}
+
 function toSummary(batch: BatchRow): RewriteBatchSummary {
+  const modelType = snapshotField(batch.filter_snapshot, "modelType");
+  const categoryId = snapshotField(batch.filter_snapshot, "categoryId");
   return {
     id: batch.id,
     name: batch.name,
     provider: batch.provider,
     providerMode: getProviderMode(batch.provider),
     model: batch.model,
+    modelType: typeof modelType === "string" ? modelType : null,
+    categoryId: typeof categoryId === "number" ? categoryId : null,
     status: batch.status,
     totalCount: batch.total_count,
     submittedCount: batch.submitted_count,
@@ -221,7 +306,7 @@ export async function getRewriteBatch(
     include: {
       items: {
         orderBy: { id: "asc" },
-        include: { website: { select: { title: true } } },
+        include: { website: { select: { title: true, slug: true } } },
       },
     },
   });
@@ -233,6 +318,7 @@ export async function getRewriteBatch(
       id: item.id,
       websiteId: item.website_id,
       websiteTitle: item.website.title,
+      websiteSlug: item.website.slug,
       status: item.status,
       customId: item.custom_id,
       qcStatus: item.qc_status,
@@ -256,15 +342,9 @@ export async function createRewriteBatch(
     ? filter.rewriteStatuses
     : ["raw_imported"]) as RewriteStatus[];
 
-  // 只选 pending + 指定审核状态；显式排除 human_reviewed 与 approved
+  // 与 estimate 共用 selectionWhere：只选 pending + 指定审核状态，排除 human_reviewed / approved
   const websites = await prisma.website.findMany({
-    where: {
-      status: "pending",
-      ...(filter.categoryId ? { category_id: filter.categoryId } : {}),
-      toolDetail: {
-        rewrite_status: { in: statuses.filter((s) => s !== RewriteStatus.human_reviewed) },
-      },
-    },
+    where: selectionWhere(filter),
     orderBy: { id: "asc" },
     take: limit,
     select: { id: true },
@@ -283,7 +363,10 @@ export async function createRewriteBatch(
       model: filter.model?.trim() || providerSetting.defaultModel,
       filter_snapshot: {
         categoryId: filter.categoryId ?? null,
+        importBatchId: filter.importBatchId ?? null,
         rewriteStatuses: statuses,
+        search: filter.search?.trim() || null,
+        modelType: filter.modelType ?? null,
         limit,
       } as Prisma.InputJsonValue,
       total_count: websites.length,

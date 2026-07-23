@@ -3,8 +3,8 @@ import { AjaxResponse } from "@/lib/utils";
 import { requireAdmin } from "@/lib/auth/admin-auth";
 import {
   createRewriteBatch,
-  isRewriteProvider,
   listRewriteBatches,
+  parseCreateBatchBody,
 } from "@/lib/website/tool-rewrite-batch";
 
 // GET /api/admin/tools/rewrite — 历史批次列表
@@ -30,37 +30,7 @@ export async function POST(request: Request) {
 
   try {
     const body = await request.json().catch(() => ({}));
-    const categoryId =
-      typeof body?.categoryId === "number" && body.categoryId > 0
-        ? body.categoryId
-        : undefined;
-    const limit =
-      typeof body?.limit === "number" && body.limit > 0
-        ? Math.floor(body.limit)
-        : undefined;
-    const rewriteStatuses = Array.isArray(body?.rewriteStatuses)
-      ? body.rewriteStatuses.filter((s: unknown) =>
-          ["raw_imported", "draft_generated"].includes(String(s))
-        )
-      : undefined;
-    const name = typeof body?.name === "string" ? body.name : undefined;
-    const provider =
-      typeof body?.provider === "string" && isRewriteProvider(body.provider)
-        ? body.provider
-        : undefined;
-    const model =
-      typeof body?.model === "string" && body.model.trim()
-        ? body.model.trim()
-        : undefined;
-
-    const result = await createRewriteBatch({
-      name,
-      categoryId,
-      limit,
-      rewriteStatuses,
-      provider,
-      model,
-    });
+    const result = await createRewriteBatch(parseCreateBatchBody(body));
     if (!result.ok) {
       return NextResponse.json(AjaxResponse.fail(result.message), {
         status: 400,
