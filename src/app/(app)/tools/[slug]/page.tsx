@@ -742,7 +742,8 @@ async function ToolDetailPage({ slug }: { slug: string }) {
                     // eslint-disable-next-line @next/next/no-img-element
                     <img
                       key={media.id}
-                      src={media.url}
+                      // 优先本地化 URL，退回原始 URL；不暴露 original_url/cache_error
+                      src={media.local_url ?? media.url}
                       alt={media.alt || `${website.title} screenshot`}
                       loading="lazy"
                       className="w-full rounded-lg border border-border/80 bg-slate-50 object-cover shadow-sm dark:bg-background"

@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { PrismaClient } from "@prisma/client";
 import { AjaxResponse } from "@/lib/utils";
 import { requireAdmin } from "@/lib/auth/admin-auth";
 import { assertPublishAllowed } from "@/lib/website/tool-admin";
-
-const prisma = new PrismaClient();
+import { ensureMediaLocalizedBeforePublish } from "@/lib/website/tool-media-cache";
+// 共享连接池（与其它 admin 路由一致，避免每路由独立 PrismaClient）
+import { prisma } from "@/lib/prisma";
 
 export async function PUT(request: Request, props: { params: Promise<{ id: string }> }) {
   const unauthorized = await requireAdmin();
@@ -36,6 +36,13 @@ export async function PUT(request: Request, props: { params: Promise<{ id: strin
       const allowed = await assertPublishAllowed(websiteId, status);
       if (!allowed.ok) {
         return NextResponse.json(AjaxResponse.fail(allowed.message), {
+          status: 400,
+        });
+      }
+      // 媒体本地化 guard：外链缓存失败则不发布
+      const media = await ensureMediaLocalizedBeforePublish(prisma, websiteId);
+      if (!media.ok) {
+        return NextResponse.json(AjaxResponse.fail(media.message), {
           status: 400,
         });
       }

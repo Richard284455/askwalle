@@ -1,38 +1,32 @@
 /**
- * Cache remote ToolMedia images into public/cached-tool-media and
- * rewrite ToolMedia.url to the local path, removing the long-term
- * dependency on external CDNs.
+ * ToolMedia 热链本地化 CLI（辅助补历史数据；发布路径已有常态化 guard，
+ * 本脚本不替代 publish guard）。
+ *
+ * 与发布流程共用 src/lib/website/tool-media-cache 同一实现：
+ * 下载外部图片到 public/tool-media/{websiteId}/{sha256}.{ext}，
+ * 只写 local_url/original_url/cache_status，不改动原 url。幂等：
+ * cached 的不重复下载。
  *
  * Usage:
- *   npm run cache:tool-media -- --dry-run   # 只列出将要下载的图片
- *   npm run cache:tool-media                # 下载并把 url 重写为本地路径
- *
- * 行为：
- * - 只处理 url 为 http(s) 的记录；已是本地路径(/cached-tool-media/…)的跳过，天然幂等。
- * - 下载失败的记录保留原 URL 并记入统计，不中断整体执行。
- * - 不删除任何数据库记录。
+ *   npm run cache:tool-media -- --status approved --limit 20 --dry-run
+ *   npm run cache:tool-media -- --status approved --limit 20 --apply
  */
-import { mkdirSync, writeFileSync, existsSync } from "fs";
-import path from "path";
 import { PrismaClient } from "@prisma/client";
+import {
+  cacheToolMediaForWebsite,
+  isExternalHotlink,
+} from "../src/lib/website/tool-media-cache";
 
-const dryRun = process.argv.includes("--dry-run");
 const prisma = new PrismaClient();
 
-const OUTPUT_DIR = path.join(process.cwd(), "public", "cached-tool-media");
-const PUBLIC_PREFIX = "/cached-tool-media";
-const DOWNLOAD_TIMEOUT_MS = 20_000;
-const MAX_BYTES = 8 * 1024 * 1024; // 单张图片上限 8MB
+function argValue(name: string): string | undefined {
+  const index = process.argv.indexOf(`--${name}`);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
 
-const EXTENSION_BY_CONTENT_TYPE: Record<string, string> = {
-  "image/jpeg": "jpg",
-  "image/jpg": "jpg",
-  "image/png": "png",
-  "image/webp": "webp",
-  "image/gif": "gif",
-  "image/avif": "avif",
-  "image/svg+xml": "svg",
-};
+const dryRun = !process.argv.includes("--apply");
+const status = argValue("status") ?? "approved";
+const limit = Math.min(parseInt(argValue("limit") ?? "20") || 20, 200);
 
 function redactPotentialSecrets(message: string) {
   return message
@@ -40,83 +34,55 @@ function redactPotentialSecrets(message: string) {
     .replace(/(DATABASE_URL|DIRECT_URL|JWT_SECRET|ADMIN_PASSWORD)=\S+/gi, "$1=[redacted]");
 }
 
-async function downloadImage(
-  url: string
-): Promise<{ buffer: Buffer; extension: string } | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
-  try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: { "User-Agent": "AskWalleMediaCache/1.0" },
-    });
-    if (!response.ok) return null;
-
-    const contentType = (response.headers.get("content-type") ?? "")
-      .split(";")[0]
-      .trim()
-      .toLowerCase();
-    const extension = EXTENSION_BY_CONTENT_TYPE[contentType];
-    if (!extension) return null;
-
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (buffer.length === 0 || buffer.length > MAX_BYTES) return null;
-
-    return { buffer, extension };
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
 async function main() {
-  const remoteMedia = await prisma.toolMedia.findMany({
-    where: { url: { startsWith: "http" } },
-    select: { id: true, website_id: true, url: true },
+  // 只挑还有外链媒体的工具（按 status 过滤，limit 控制批量）
+  const websites = await prisma.website.findMany({
+    where: {
+      status,
+      toolMedia: { some: { url: { startsWith: "http" } } },
+    },
     orderBy: { id: "asc" },
+    take: limit,
+    select: {
+      id: true,
+      title: true,
+      toolMedia: { select: { url: true, local_url: true, cache_status: true } },
+    },
   });
 
-  const localCount = await prisma.toolMedia.count({
-    where: { url: { startsWith: PUBLIC_PREFIX } },
-  });
-  console.log(`远程图片: ${remoteMedia.length}，已本地化: ${localCount}`);
-
-  if (dryRun) {
-    for (const media of remoteMedia.slice(0, 30)) {
-      console.log(`  media#${media.id} <- ${media.url.slice(0, 90)}`);
-    }
-    console.log("--dry-run：未下载、未写数据库。");
-    return;
-  }
-
-  if (remoteMedia.length && !existsSync(OUTPUT_DIR)) {
-    mkdirSync(OUTPUT_DIR, { recursive: true });
-  }
+  const pending = websites.filter((w) =>
+    w.toolMedia.some(
+      (m) => isExternalHotlink(m.url) && !(m.local_url && m.cache_status === "cached")
+    )
+  );
+  console.log(
+    `status=${status} 含外链媒体的工具: ${websites.length}，其中待本地化: ${pending.length}` +
+      `（limit=${limit}，${dryRun ? "dry-run" : "apply"}）`
+  );
 
   let cached = 0;
   let failed = 0;
-
-  for (const media of remoteMedia) {
-    const result = await downloadImage(media.url);
-    if (!result) {
-      failed++;
-      console.warn(`  media#${media.id} 下载失败，保留原 URL`);
-      continue;
-    }
-
-    const fileName = `tool-${media.website_id}-media-${media.id}.${result.extension}`;
-    writeFileSync(path.join(OUTPUT_DIR, fileName), result.buffer);
-
-    await prisma.toolMedia.update({
-      where: { id: media.id },
-      data: { url: `${PUBLIC_PREFIX}/${fileName}` },
-    });
-    cached++;
-    console.log(`  media#${media.id} -> ${PUBLIC_PREFIX}/${fileName}`);
+  for (const website of pending) {
+    const result = await cacheToolMediaForWebsite(prisma, website.id, { dryRun });
+    cached += result.cached;
+    failed += result.failed;
+    const todo = result.external - result.alreadyCached;
+    console.log(
+      `  W#${website.id} ${website.title.slice(0, 30)}: 外链 ${result.external}` +
+        (dryRun
+          ? ` → 将下载 ${todo}`
+          : ` → 新缓存 ${result.cached}，已缓存 ${result.alreadyCached}，失败 ${result.failed}` +
+            (result.errors.length
+              ? ` [${result.errors.map((e) => e.reason).join("; ")}]`
+              : ""))
+    );
   }
 
-  console.log(`完成：本地化 ${cached} 张，失败 ${failed} 张（失败的保留原 URL，可重跑）。`);
+  console.log(
+    dryRun
+      ? "dry-run 完成：未下载、未写数据库。加 --apply 执行。"
+      : `完成：本地化 ${cached} 张，失败 ${failed} 张（失败可重跑，publish 时也会重试）。`
+  );
 }
 
 main()

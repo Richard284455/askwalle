@@ -1001,6 +1001,43 @@ export function ToolEditForm({
           placeholder={MEDIA_PLACEHOLDER}
           className="bg-background/40 border-border/40 font-mono text-xs"
         />
+        {initialTool.mediaCacheInfo.length > 0 && (
+          <div className="mt-3 space-y-1.5">
+            <p className="text-xs font-medium text-foreground/70">
+              本地化状态（发布时自动缓存外链图片）
+            </p>
+            {initialTool.mediaCacheInfo.map((m, i) => {
+              const external = /^https?:\/\//i.test(m.url);
+              const label = m.cacheStatus === "cached"
+                ? "Cached"
+                : m.cacheStatus === "failed"
+                ? "Failed"
+                : external
+                ? "External"
+                : "Local";
+              return (
+                <div key={i} className="rounded border border-border/40 bg-background/20 p-2 text-xs">
+                  <span
+                    className={
+                      label === "Cached" || label === "Local"
+                        ? "text-green-600 font-medium"
+                        : label === "Failed"
+                        ? "text-red-500 font-medium"
+                        : "text-yellow-600 font-medium"
+                    }
+                  >
+                    {label}
+                  </span>
+                  <span className="ml-2 text-muted-foreground break-all">{m.url.slice(0, 90)}</span>
+                  {m.localUrl && (
+                    <p className="text-muted-foreground">→ {m.localUrl}</p>
+                  )}
+                  {m.cacheError && <p className="text-red-500">{m.cacheError}</p>}
+                </div>
+              );
+            })}
+          </div>
+        )}
       </SectionCard>
 
       <SectionCard

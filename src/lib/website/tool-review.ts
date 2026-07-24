@@ -6,6 +6,7 @@ import {
   assertPublishAllowed,
   markToolReviewed,
 } from "@/lib/website/tool-admin";
+import { ensureMediaLocalizedBeforePublish } from "@/lib/website/tool-media-cache";
 
 // 单次批量操作上限；超过需分页批处理（后续再做）
 export const BULK_LIMIT_MAX = 100;
@@ -281,6 +282,10 @@ export type BulkResult = {
   failed: number;
   failedReasons: { websiteId: number; reason: string }[];
   affectedIds: number[];
+  // 仅 publish 填充：发布前媒体本地化统计
+  mediaLocalized?: number;
+  mediaAlreadyCached?: number;
+  mediaFailed?: number;
 };
 
 function emptyResult(selected: number): BulkResult {
@@ -466,6 +471,17 @@ export async function bulkPublish(
     if (!allowed.ok) {
       result.skipped++;
       result.failedReasons.push({ websiteId, reason: allowed.message });
+      continue;
+    }
+    // 媒体本地化 guard：外链缓存失败的工具不发布（单个失败不影响其它工具）
+    const media = await ensureMediaLocalizedBeforePublish(prisma, websiteId);
+    result.mediaLocalized = (result.mediaLocalized ?? 0) + media.stats.cached;
+    result.mediaAlreadyCached =
+      (result.mediaAlreadyCached ?? 0) + media.stats.alreadyCached;
+    result.mediaFailed = (result.mediaFailed ?? 0) + media.stats.failed;
+    if (!media.ok) {
+      result.skipped++;
+      result.failedReasons.push({ websiteId, reason: media.message });
       continue;
     }
     await prisma.website.update({

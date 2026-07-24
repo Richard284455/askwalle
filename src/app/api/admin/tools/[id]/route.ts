@@ -77,6 +77,13 @@ export async function PUT(
             status: 400,
           });
         }
+        // 媒体本地化 guard：外链缓存失败则不发布
+        const media = await ensureMediaLocalizedBeforePublish(prisma, id);
+        if (!media.ok) {
+          return NextResponse.json(AjaxResponse.fail(media.message), {
+            status: 400,
+          });
+        }
       }
     }
 

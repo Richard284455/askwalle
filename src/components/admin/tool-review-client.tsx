@@ -51,6 +51,18 @@ type BulkResult = {
   failed: number;
   failedReasons: { websiteId: number; reason: string }[];
   affectedIds: number[];
+  mediaLocalized?: number;
+  mediaAlreadyCached?: number;
+  mediaFailed?: number;
+};
+
+type MediaPrecheck = {
+  websites: number;
+  totalMedia: number;
+  externalMedia: number;
+  alreadyCached: number;
+  needsLocalize: number;
+  previouslyFailed: number;
 };
 
 // 每个 Tab 映射到一组筛选（业务状态由现有字段推出）
@@ -153,6 +165,22 @@ export function ToolReviewClient({
   const [reviewNotes, setReviewNotes] = useState("");
   const [result, setResult] = useState<BulkResult | null>(null);
   const [busy, setBusy] = useState(false);
+  const [mediaPrecheck, setMediaPrecheck] = useState<MediaPrecheck | null>(null);
+
+  // Publish 弹窗打开时做媒体预检（只读）
+  const loadMediaPrecheck = async (ids: number[]) => {
+    setMediaPrecheck(null);
+    try {
+      const data = await fetch("/api/admin/tools/review/media-precheck", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ websiteIds: ids }),
+      }).then((r) => r.json());
+      if (data?.code === 200) setMediaPrecheck(data.data);
+    } catch {
+      // 预检失败不阻塞弹窗；发布时服务端仍会执行媒体 guard
+    }
+  };
 
   const activeTab = TABS.find((t) => t.key === tab) ?? TABS[2];
 
@@ -352,6 +380,7 @@ export function ToolReviewClient({
             onClick={() => {
               setReviewNotes("");
               setPendingOp(op);
+              if (op.key === "publish") loadMediaPrecheck([...selected]);
             }}
           >
             {op.label}
@@ -375,6 +404,16 @@ export function ToolReviewClient({
           <p className="font-medium">
             结果：选中 {result.selected}，成功 {result.succeeded}，跳过 {result.skipped}，失败 {result.failed}
           </p>
+          {(result.mediaLocalized ?? result.mediaAlreadyCached ?? result.mediaFailed) !==
+            undefined && (
+            <p className="text-xs text-muted-foreground">
+              媒体：本次本地化 {result.mediaLocalized ?? 0} 张 · 此前已缓存{" "}
+              {result.mediaAlreadyCached ?? 0} 张 ·{" "}
+              <span className={result.mediaFailed ? "text-orange-500" : ""}>
+                失败 {result.mediaFailed ?? 0} 张
+              </span>
+            </p>
+          )}
           {result.affectedIds.length > 0 && (
             <p className="text-xs text-muted-foreground">affected: {result.affectedIds.join(", ")}</p>
           )}
@@ -514,6 +553,28 @@ export function ToolReviewClient({
               服务端会逐条重新校验资格，不合格的会被跳过。
             </p>
             <p className="text-muted-foreground">{pendingOp?.risk}</p>
+            {pendingOp?.key === "publish" && (
+              <div className="rounded-md border border-border/40 bg-background/30 p-3 text-xs space-y-1">
+                <p className="font-medium text-foreground/80">媒体预检</p>
+                {mediaPrecheck ? (
+                  <>
+                    <p>
+                      外链图片 {mediaPrecheck.externalMedia} 张 · 已本地化{" "}
+                      {mediaPrecheck.alreadyCached} 张 · 发布前将本地化{" "}
+                      {mediaPrecheck.needsLocalize} 张
+                      {mediaPrecheck.previouslyFailed > 0
+                        ? `（其中 ${mediaPrecheck.previouslyFailed} 张上次失败，将重试）`
+                        : ""}
+                    </p>
+                    <p className="text-muted-foreground">
+                      外链图片会先下载到本站再发布；本地化失败的工具将被跳过，不会静默发布。
+                    </p>
+                  </>
+                ) : (
+                  <p className="text-muted-foreground">预检中...</p>
+                )}
+              </div>
+            )}
             {pendingOp?.needsNotes && (
               <Input
                 value={reviewNotes}

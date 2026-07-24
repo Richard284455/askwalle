@@ -223,11 +223,18 @@ model ToolMedia {
   website_id Int
   website    Website  @relation(fields: [website_id], references: [id])
   kind       String   @default("screenshot")
-  // V1 存提取出来的源图 URL；TODO: 后续缓存到 public/ 或对象存储，不长期热链外部 CDN
+  // V1 存提取出来的源图 URL；发布前由 tool-media-cache 本地化（url 保留不动）
   url        String
   alt        String?
   position   Int      @default(0)
   created_at DateTime @default(now())
+
+  // 媒体本地化（纯加法字段）：公开页优先 local_url，其次 url
+  original_url String?
+  local_url    String?
+  cache_status String? // pending / cached / failed / skipped
+  cache_error  String?
+  cached_at    DateTime?
 
   @@map("tool_media")
   @@index([website_id])

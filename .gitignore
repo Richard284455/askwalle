@@ -39,6 +39,9 @@ yarn-error.log*
 # admin excel uploads (temporary)
 /.import-uploads
 
+# runtime-localized tool media cache (populated at publish time, not committed)
+/public/tool-media
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

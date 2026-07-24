@@ -88,6 +88,13 @@ export type AdminToolRecord = {
   };
   links: string;
   media: string;
+  // 媒体本地化状态（只读展示；编辑仍走 media JSON）
+  mediaCacheInfo: {
+    url: string;
+    localUrl: string | null;
+    cacheStatus: string | null;
+    cacheError: string | null;
+  }[];
   faqs: AdminToolFaq[];
   rewrite: AdminToolRewrite;
 };
@@ -826,6 +833,12 @@ export async function getAdminToolById(
             2
           )
         : "",
+      mediaCacheInfo: website.toolMedia.map((item) => ({
+        url: item.url,
+        localUrl: item.local_url,
+        cacheStatus: item.cache_status,
+        cacheError: item.cache_error,
+      })),
       faqs: website.toolFaqs.map((faq) => ({
         question: faq.question,
         answer: faq.answer ?? "",
