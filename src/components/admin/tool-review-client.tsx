@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { ArrowLeft, Eye, Search } from "lucide-react";
 import { Button } from "@/ui/common/button";
@@ -87,10 +88,12 @@ const TABS: TabDef[] = [
 ];
 
 // 批量操作定义（无确认词，二次确认弹窗）
+// asJob: 创建后台任务分块执行并跳转任务详情（避免长请求）；否则同步执行
 type BulkOp = {
   key: string;
   label: string;
   endpoint: string;
+  asJob?: boolean;
   variant?: "default" | "outline";
   danger?: boolean;
   needsNotes?: boolean;
@@ -102,10 +105,11 @@ const BULK_OPS: BulkOp[] = [
   {
     key: "apply-and-review",
     label: "Apply & Mark Reviewed",
-    endpoint: "mark-reviewed",
+    endpoint: "apply-and-review-job",
+    asJob: true,
     variant: "default",
     needsNotes: true,
-    risk: "对 draft_generated + QC 通过的工具：先应用草稿到公开字段，再标记人工已审核（仍 pending，不发布）。",
+    risk: "对 draft_generated + QC 通过的工具：先应用草稿到公开字段，再标记人工已审核（仍 pending，不发布）。将创建后台任务分块执行并跳转进度页。",
   },
   {
     key: "apply-only",
@@ -117,9 +121,10 @@ const BULK_OPS: BulkOp[] = [
   {
     key: "publish",
     label: "Publish",
-    endpoint: "publish",
+    endpoint: "publish-job",
+    asJob: true,
     variant: "default",
-    risk: "只发布 pending + human_reviewed 的工具（复用发布守卫），其它一律跳过。",
+    risk: "只发布 pending + human_reviewed 的工具（复用发布守卫 + 媒体本地化守卫），其它一律跳过。将创建后台任务分块执行并跳转进度页。",
   },
   {
     key: "archive",
@@ -148,6 +153,7 @@ export function ToolReviewClient({
   presetTab?: string;
 }) {
   const { toast } = useToast();
+  const router = useRouter();
   const [items, setItems] = useState(initialItems);
   const [stats, setStats] = useState<ReviewStats | null>(initialStats);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -249,6 +255,13 @@ export function ToolReviewClient({
         }),
       }).then((r) => r.json());
       if (data?.code === 200) {
+        if (pendingOp.asJob) {
+          // 异步任务：立即跳转任务详情页看进度，不等待同步完成
+          const jobId = (data.data as { jobId: number }).jobId;
+          toast({ title: "后台任务已创建", description: `任务 #${jobId}，正在跳转进度页` });
+          router.push(`/admin/jobs/${jobId}`);
+          return;
+        }
         setResult(data.data as BulkResult);
         setPendingOp(null);
         toast({ title: "操作完成", description: pendingOp.label });
@@ -277,12 +290,17 @@ export function ToolReviewClient({
             AI 草稿 → 应用+审核 → 发布，每步二次确认（无确认词），服务端逐条重校验
           </p>
         </div>
-        <Button variant="outline" size="sm" asChild>
-          <Link href="/admin/tools" className="flex items-center gap-2">
-            <ArrowLeft className="w-4 h-4" />
-            返回工具管理
-          </Link>
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/jobs">批量任务中心</Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/tools" className="flex items-center gap-2">
+              <ArrowLeft className="w-4 h-4" />
+              返回工具管理
+            </Link>
+          </Button>
+        </div>
       </div>
 
       {/* 统计卡片 */}

@@ -359,3 +359,44 @@ model ToolFAQ {
   @@map("tool_faqs")
   @@index([website_id])
 }
+
+// 通用后台批量任务（异步化长操作：apply&review / publish 等；分块执行 + 进度）
+model BulkJob {
+  id                      Int           @id @default(autoincrement())
+  type                    String // import_excel / rewrite_direct / apply_drafts / apply_and_review / mark_reviewed / publish / media_cache
+  status                  String        @default("queued") // queued / running / completed / completed_with_errors / failed / canceled
+  total_count             Int           @default(0)
+  processed_count         Int           @default(0)
+  success_count           Int           @default(0)
+  skipped_count           Int           @default(0)
+  failed_count            Int           @default(0)
+  params                  Json?
+  result                  Json?
+  error                   Json?
+  related_import_batch_id  Int?
+  related_rewrite_batch_id Int?
+  created_at              DateTime      @default(now())
+  started_at              DateTime?
+  finished_at             DateTime?
+  updated_at              DateTime      @updatedAt
+  items                   BulkJobItem[]
+
+  @@map("bulk_jobs")
+  @@index([type, status])
+}
+
+model BulkJobItem {
+  id         Int      @id @default(autoincrement())
+  job_id     Int
+  job        BulkJob  @relation(fields: [job_id], references: [id])
+  website_id Int?
+  status     String   @default("queued") // queued / running / success / skipped / failed
+  result     Json?
+  error      String?
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("bulk_job_items")
+  @@index([job_id, status])
+  @@index([website_id])
+}
