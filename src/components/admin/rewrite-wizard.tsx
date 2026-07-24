@@ -39,18 +39,39 @@ const BackToList = () => (
   </Button>
 );
 
+type EstimateView = {
+  eligible: number;
+  wouldProcess: number;
+  wouldSkip: number;
+  skippedApproved: number;
+  skippedHumanReviewed: number;
+  skippedMissingRaw: number;
+  skippedExistingDraft: number;
+  retryableFailed: number;
+  retryableQcFailed: number;
+};
+
+const RETRY_FILTERS = [
+  { value: "all", label: "全部符合条件" },
+  { value: "failed", label: "仅有失败记录的（重试）" },
+  { value: "qc_failed", label: "仅 QC 失败的（重试）" },
+  { value: "no_draft", label: "仅无草稿的" },
+] as const;
+
 export function RewriteWizard({
   categories,
   providers,
   defaultProvider,
   importBatches,
   presetImportBatchId,
+  presetRetryFilter,
 }: {
   categories: AdminCategoryOption[];
   providers: RewriteProviderInfo[];
   defaultProvider: RewriteProviderId;
   importBatches: { id: number; label: string }[];
   presetImportBatchId: number | null;
+  presetRetryFilter?: string | null;
 }) {
   const { toast } = useToast();
   const [step, setStep] = useState(1);
@@ -63,11 +84,13 @@ export function RewriteWizard({
   const [rewriteStatus, setRewriteStatus] = useState("raw_imported");
   const [search, setSearch] = useState("");
   const [limit, setLimit] = useState("20");
-  const [estimate, setEstimate] = useState<{
-    eligible: number;
-    wouldProcess: number;
-    wouldSkip: number;
-  } | null>(null);
+  const [retryFilter, setRetryFilter] = useState(
+    presetRetryFilter && ["failed", "qc_failed", "no_draft"].includes(presetRetryFilter)
+      ? presetRetryFilter
+      : "all"
+  );
+  const [overwriteDraft, setOverwriteDraft] = useState(false);
+  const [estimate, setEstimate] = useState<EstimateView | null>(null);
   const [estimating, setEstimating] = useState(false);
 
   // Step 2
@@ -90,6 +113,8 @@ export function RewriteWizard({
     rewriteStatuses: [rewriteStatus],
     search: search.trim() || undefined,
     limit: parseInt(limit) || 20,
+    retryFilter: retryFilter === "all" ? undefined : retryFilter,
+    overwriteExistingDraft: overwriteDraft,
     provider: providerId,
     model: model.trim() || undefined,
     modelType,
@@ -115,7 +140,7 @@ export function RewriteWizard({
   useEffect(() => {
     if (step === 1 || step === 3) runEstimate();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step, importBatchId, categoryId, rewriteStatus, search, limit]);
+  }, [step, importBatchId, categoryId, rewriteStatus, search, limit, retryFilter, overwriteDraft]);
 
   const handleCreate = async () => {
     if (creating) return;
@@ -224,19 +249,53 @@ export function RewriteWizard({
             <Field label="Limit（最大 20）">
               <Input value={limit} onChange={(e) => setLimit(e.target.value)} className="bg-background/40 border-border/40" />
             </Field>
+            <Field label="重试范围">
+              <Select value={retryFilter} onValueChange={setRetryFilter}>
+                <SelectTrigger className="bg-background/40 border-border/40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {RETRY_FILTERS.map((f) => (
+                    <SelectItem key={f.value} value={f.value}>
+                      {f.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+            <Field label="搜索 title / slug">
+              <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="可选" className="bg-background/40 border-border/40" />
+            </Field>
           </div>
-          <Field label="搜索 title / slug">
-            <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="可选" className="bg-background/40 border-border/40" />
-          </Field>
+          <label className="flex items-center gap-2 text-sm text-foreground/80">
+            <input
+              type="checkbox"
+              checked={overwriteDraft}
+              onChange={(e) => setOverwriteDraft(e.target.checked)}
+            />
+            覆盖已有 AI 草稿（默认跳过；human_reviewed / approved 始终不会被覆盖）
+          </label>
 
-          <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm">
+          <div className="rounded-lg border border-primary/20 bg-primary/5 p-4 text-sm space-y-2">
             {estimating ? (
               "预估中..."
             ) : estimate ? (
               <>
-                当前筛选下符合条件 <strong>{estimate.eligible}</strong> 条，本次将处理
-                <strong> {estimate.wouldProcess}</strong> 条，
-                跳过 <strong>{estimate.wouldSkip}</strong> 条（超出 limit 部分）。
+                <p>
+                  当前筛选下符合条件 <strong>{estimate.eligible}</strong> 条，本次将处理
+                  <strong> {estimate.wouldProcess}</strong> 条，
+                  跳过 <strong>{estimate.wouldSkip}</strong> 条（超出 limit 部分）。
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  可重试：有失败记录 {estimate.retryableFailed} · QC 失败 {estimate.retryableQcFailed}
+                  ｜范围内被排除：approved {estimate.skippedApproved} · human_reviewed {estimate.skippedHumanReviewed}
+                  · 缺 raw 数据 {estimate.skippedMissingRaw} · 已有草稿 {estimate.skippedExistingDraft}
+                </p>
+                {estimate.skippedMissingRaw > 0 && (
+                  <p className="text-xs text-orange-500">
+                    有 {estimate.skippedMissingRaw} 条缺 raw_imported_content，需先修复 raw 数据后才能改写。
+                  </p>
+                )}
               </>
             ) : (
               "无法预估"

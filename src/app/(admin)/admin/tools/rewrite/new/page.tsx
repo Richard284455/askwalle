@@ -11,9 +11,9 @@ export const dynamic = "force-dynamic";
 export default async function NewRewriteBatchPage({
   searchParams,
 }: {
-  searchParams: Promise<{ importBatchId?: string }>;
+  searchParams: Promise<{ importBatchId?: string; retry?: string }>;
 }) {
-  const { importBatchId } = await searchParams;
+  const { importBatchId, retry } = await searchParams;
   const [categories, providers, importBatches] = await Promise.all([
     getAdminCategoryOptions(),
     listRewriteProviders().catch(() => []),
@@ -37,6 +37,7 @@ export default async function NewRewriteBatchPage({
             ? parseInt(importBatchId)
             : null
         }
+        presetRetryFilter={retry ?? null}
       />
     </div>
   );

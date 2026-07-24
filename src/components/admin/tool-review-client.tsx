@@ -357,6 +357,16 @@ export function ToolReviewClient({
             {op.label}
           </Button>
         ))}
+        {tab === "qc_failed" && (
+          <Button size="sm" variant="outline" asChild>
+            <Link
+              href="/admin/tools/rewrite/new?retry=qc_failed"
+              title="跳转改写向导，按 QC 失败筛选创建重新改写任务（不在本页调用 AI）"
+            >
+              重新改写（按当前筛选创建任务）
+            </Link>
+          </Button>
+        )}
       </div>
 
       {/* 结果区 */}

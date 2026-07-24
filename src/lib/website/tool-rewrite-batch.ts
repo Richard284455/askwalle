@@ -139,6 +139,10 @@ export type SelectionFilter = {
   importBatchId?: number;
   rewriteStatuses?: ("raw_imported" | "draft_generated")[];
   search?: string;
+  // 只选有历史失败记录的工具（重试场景）/ 只选无草稿的工具
+  retryFilter?: "failed" | "qc_failed" | "no_draft";
+  // 已有 ai_rewrite_draft 时默认跳过；勾选后允许重写（仍不含 human_reviewed / approved）
+  overwriteExistingDraft?: boolean;
 };
 
 export type CreateBatchFilter = SelectionFilter & {
@@ -149,15 +153,19 @@ export type CreateBatchFilter = SelectionFilter & {
   modelType?: string; // fast / general / reasoning / custom（仅 UI/metadata）
 };
 
-// 构建选择工具的 where 子句。永远只选 pending，且 rewrite_status 只在
-// raw_imported / draft_generated 之内（显式排除 human_reviewed 与 approved）。
-function selectionWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
+// 可重试的历史 item 状态（重试永远新建 batch，不复用旧 batch）
+export const RETRYABLE_ITEM_STATUSES = ["failed", "parse_failed", "qc_failed"];
+
+function allowedStatuses(filter: SelectionFilter): RewriteStatus[] {
   const statuses = (filter.rewriteStatuses?.length
     ? filter.rewriteStatuses
     : ["raw_imported"]) as RewriteStatus[];
-  const allowed = statuses.filter((s) => s !== RewriteStatus.human_reviewed);
+  return statuses.filter((s) => s !== RewriteStatus.human_reviewed);
+}
+
+// 范围筛选（分类 / 导入批次 / 搜索），estimate 的 skipped 细分也复用
+function scopeWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
   return {
-    status: "pending",
     ...(filter.categoryId ? { category_id: filter.categoryId } : {}),
     ...(filter.importBatchId ? { import_batch_id: filter.importBatchId } : {}),
     ...(filter.search?.trim()
@@ -168,8 +176,48 @@ function selectionWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
           ],
         }
       : {}),
-    toolDetail: { rewrite_status: { in: allowed } },
   };
+}
+
+// 统一改写资格判断（estimate / create / retry 共用，不信任前端）：
+// - Website.status = pending（排除 approved / archived / rejected）
+// - rewrite_status ∈ raw_imported / draft_generated（排除 human_reviewed）
+// - reviewed_at 为空（人工审过的不允许 AI 覆盖）
+// - raw_imported_content 存在（缺 raw 的先修数据）
+// - 已有草稿默认跳过，除非显式 overwriteExistingDraft
+// 历史 failed / qc_failed item 不构成排除条件——失败的工具必须可以重试。
+function eligibleWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
+  const allowed = allowedStatuses(filter);
+  return {
+    status: "pending",
+    ...scopeWhere(filter),
+    toolDetail: {
+      rewrite_status: { in: allowed },
+      reviewed_at: null,
+      NOT: { raw_imported_content: { equals: Prisma.AnyNull } },
+      ...(filter.overwriteExistingDraft
+        ? {}
+        : { ai_rewrite_draft: { equals: Prisma.AnyNull } }),
+    },
+    ...(filter.retryFilter === "failed"
+      ? { rewriteItems: { some: { status: { in: ["failed", "parse_failed"] } } } }
+      : filter.retryFilter === "qc_failed"
+      ? { rewriteItems: { some: { status: "qc_failed" } } }
+      : {}),
+    // no_draft 已由默认的 ai_rewrite_draft=null 条件覆盖；显式选择时强制生效
+    ...(filter.retryFilter === "no_draft"
+      ? { toolDetail: {
+          rewrite_status: { in: allowed },
+          reviewed_at: null,
+          NOT: { raw_imported_content: { equals: Prisma.AnyNull } },
+          ai_rewrite_draft: { equals: Prisma.AnyNull },
+        } }
+      : {}),
+  };
+}
+
+function selectionWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
+  return eligibleWhere(filter);
 }
 
 // create 与 estimate 共用的请求体解析，保证预估与创建条件一致
@@ -188,6 +236,12 @@ export function parseCreateBatchBody(body: unknown): CreateBatchFilter {
           ["raw_imported", "draft_generated"].includes(String(s))
         ) as ("raw_imported" | "draft_generated")[])
       : undefined,
+    retryFilter:
+      typeof b.retryFilter === "string" &&
+      ["failed", "qc_failed", "no_draft"].includes(b.retryFilter)
+        ? (b.retryFilter as "failed" | "qc_failed" | "no_draft")
+        : undefined,
+    overwriteExistingDraft: b.overwriteExistingDraft === true,
     provider:
       typeof b.provider === "string" && isRewriteProvider(b.provider)
         ? (b.provider as RewriteProviderId)
@@ -202,14 +256,91 @@ export function parseCreateBatchBody(body: unknown): CreateBatchFilter {
   };
 }
 
+export type RewriteEstimate = {
+  eligible: number;
+  limit: number;
+  wouldProcess: number;
+  wouldSkip: number;
+  // 细分：为什么某些工具不会被处理
+  skippedApproved: number;
+  skippedHumanReviewed: number;
+  skippedMissingRaw: number;
+  skippedExistingDraft: number;
+  // 符合条件工具中有历史失败记录的（可重试）
+  retryableFailed: number;
+  retryableQcFailed: number;
+};
+
 // 预估当前筛选下可处理/跳过数量（不写数据库）
 export async function estimateRewriteSelection(
   filter: CreateBatchFilter
-): Promise<{ eligible: number; limit: number; wouldProcess: number; wouldSkip: number }> {
+): Promise<RewriteEstimate> {
   const limit = Math.min(Math.max(filter.limit ?? BATCH_LIMIT_MAX, 1), BATCH_LIMIT_MAX);
-  const eligible = await prisma.website.count({ where: selectionWhere(filter) });
+  const scope = scopeWhere(filter);
+  const allowed = allowedStatuses(filter);
+  const base = selectionWhere(filter);
+
+  const [
+    eligible,
+    retryableFailed,
+    retryableQcFailed,
+    skippedApproved,
+    skippedHumanReviewed,
+    skippedMissingRaw,
+    skippedExistingDraft,
+  ] = await Promise.all([
+    prisma.website.count({ where: base }),
+    prisma.website.count({
+      where: { AND: [base, { rewriteItems: { some: { status: { in: ["failed", "parse_failed"] } } } }] },
+    }),
+    prisma.website.count({
+      where: { AND: [base, { rewriteItems: { some: { status: "qc_failed" } } }] },
+    }),
+    prisma.website.count({
+      where: { ...scope, status: "approved", toolDetail: { isNot: null } },
+    }),
+    prisma.website.count({
+      where: { ...scope, status: "pending", toolDetail: { rewrite_status: RewriteStatus.human_reviewed } },
+    }),
+    prisma.website.count({
+      where: {
+        ...scope,
+        status: "pending",
+        toolDetail: {
+          rewrite_status: { in: allowed },
+          reviewed_at: null,
+          raw_imported_content: { equals: Prisma.AnyNull },
+        },
+      },
+    }),
+    filter.overwriteExistingDraft
+      ? Promise.resolve(0)
+      : prisma.website.count({
+          where: {
+            ...scope,
+            status: "pending",
+            toolDetail: {
+              rewrite_status: { in: allowed },
+              reviewed_at: null,
+              NOT: { ai_rewrite_draft: { equals: Prisma.AnyNull } },
+            },
+          },
+        }),
+  ]);
+
   const wouldProcess = Math.min(eligible, limit);
-  return { eligible, limit, wouldProcess, wouldSkip: eligible - wouldProcess };
+  return {
+    eligible,
+    limit,
+    wouldProcess,
+    wouldSkip: eligible - wouldProcess,
+    skippedApproved,
+    skippedHumanReviewed,
+    skippedMissingRaw,
+    skippedExistingDraft,
+    retryableFailed,
+    retryableQcFailed,
+  };
 }
 
 export type RewriteBatchSummary = {
@@ -367,6 +498,8 @@ export async function createRewriteBatch(
         rewriteStatuses: statuses,
         search: filter.search?.trim() || null,
         modelType: filter.modelType ?? null,
+        retryFilter: filter.retryFilter ?? null,
+        overwriteExistingDraft: filter.overwriteExistingDraft ?? false,
         limit,
       } as Prisma.InputJsonValue,
       total_count: websites.length,
@@ -382,6 +515,88 @@ export async function createRewriteBatch(
   });
 
   return { ok: true, batchId: batch.id, total: websites.length };
+}
+
+// ---------------------------------------------------------------------------
+// Retry Failed：为旧批次的失败条目新建批次（保留历史 batch/item 作审计）
+// ---------------------------------------------------------------------------
+
+export async function retryFailedBatch(
+  batchId: number
+): Promise<
+  | { ok: true; batchId: number; total: number; skipped: number }
+  | { ok: false; message: string }
+> {
+  const source = await prisma.toolRewriteBatch.findUnique({
+    where: { id: batchId },
+    include: {
+      items: {
+        where: { status: { in: RETRYABLE_ITEM_STATUSES } },
+        select: { website_id: true },
+      },
+    },
+  });
+  if (!source) return { ok: false, message: "批次不存在" };
+  if (!source.items.length) {
+    return { ok: false, message: "该批次没有可重试的失败条目" };
+  }
+
+  // 服务端重新校验资格（统一 eligibleWhere，不信任前端）：
+  // 仍 pending、未 human_reviewed、未 reviewed、raw 存在；draft 已存在的默认跳过
+  const failedIds = [...new Set(source.items.map((item) => item.website_id))];
+  const eligible = await prisma.website.findMany({
+    where: {
+      AND: [
+        selectionWhere({
+          rewriteStatuses: ["raw_imported", "draft_generated"],
+          overwriteExistingDraft: false, // 已在别的批次成功出草稿的不重复改写
+        }),
+        { id: { in: failedIds } },
+      ],
+    },
+    orderBy: { id: "asc" },
+    take: BATCH_LIMIT_MAX,
+    select: { id: true },
+  });
+  if (!eligible.length) {
+    return {
+      ok: false,
+      message:
+        "失败条目均不可重试（已审核 / 已发布 / 已有草稿 / 缺 raw 数据）",
+    };
+  }
+
+  const snapshot =
+    source.filter_snapshot && typeof source.filter_snapshot === "object"
+      ? (source.filter_snapshot as Record<string, unknown>)
+      : {};
+  const batch = await prisma.toolRewriteBatch.create({
+    data: {
+      name: `retry-of-${batchId}`,
+      provider: source.provider,
+      model: source.model,
+      filter_snapshot: {
+        ...snapshot,
+        retryOfBatchId: batchId,
+        limit: eligible.length,
+      } as Prisma.InputJsonValue,
+      total_count: eligible.length,
+    },
+  });
+  await prisma.toolRewriteItem.createMany({
+    data: eligible.map((website) => ({
+      batch_id: batch.id,
+      website_id: website.id,
+      custom_id: `tool-${website.id}-batch-${batch.id}`,
+    })),
+  });
+
+  return {
+    ok: true,
+    batchId: batch.id,
+    total: eligible.length,
+    skipped: failedIds.length - eligible.length,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -469,6 +684,10 @@ Strict requirements:
 - "useCases": 2-8 short original use cases.
 - "faqs": 2-8 entries; every answer must be helpful and non-empty. If the notes cannot support a factual answer, write a cautious answer telling the user to verify on the official site.
 - No HTML, no Markdown.
+
+Output format:
+Respond with a single valid JSON object only (no prose, no code fences), with exactly these keys:
+{"description": string, "what": string, "how": string, "features": string[], "useCases": string[], "faqs": [{"question": string, "answer": string}]}
 
 Reference notes (facts only, do not copy wording):
 ${reference}`;
@@ -714,9 +933,18 @@ async function runDirectRewrite(
   let failed = 0;
 
   for (const item of pendingItems) {
-    const prompt =
-      item.prompt ??
-      buildBatchRewritePrompt(item.website.title, rawForWebsite(item.website));
+    // 始终用当前模板重建 prompt（旧存量 prompt 可能缺少 response_format 所需的
+    // "json" 字样），并回写 item.prompt 作审计
+    const prompt = buildBatchRewritePrompt(
+      item.website.title,
+      rawForWebsite(item.website)
+    );
+    if (item.prompt !== prompt) {
+      await prisma.toolRewriteItem.update({
+        where: { id: item.id },
+        data: { prompt },
+      });
+    }
 
     let outcome: "saved" | "qc_failed" | "failed";
     try {

@@ -186,6 +186,20 @@ export function RewriteBatchDetailView({
       setTimeout(() => window.location.reload(), 800);
     },
   };
+  // 为失败条目新建重试批次（服务端重新校验资格；只创建不运行 AI），成功后跳新批次
+  const retryFailed: ExecAction = {
+    key: "retry",
+    title: "Retry Failed（新建批次）",
+    endpoint: "retry",
+    run: (data) => {
+      const p = data.data as { batchId: number; total: number; skipped: number };
+      toast({
+        title: "重试批次已创建",
+        description: `新批次 #${p.batchId}：${p.total} 条待运行${p.skipped ? `，跳过 ${p.skipped} 条不合格` : ""}`,
+      });
+      router.push(`/admin/tools/rewrite/${p.batchId}`);
+    },
+  };
 
   const hasQcPassed = batch.qcPassedCount > 0 || statusCounts.saved > 0;
 
@@ -274,11 +288,24 @@ export function RewriteBatchDetailView({
               </Button>
             </>
           )}
-          {batch.providerMode === "direct" && (
-            <Button variant="outline" size="sm" disabled title="V1 暂不支持，重建批次即可">
-              Retry Failed (TODO)
-            </Button>
-          )}
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={
+              busy !== null ||
+              (statusCounts.failed ?? 0) + (statusCounts.qc_failed ?? 0) === 0
+            }
+            title={
+              (statusCounts.failed ?? 0) + (statusCounts.qc_failed ?? 0) === 0
+                ? "没有可重试的失败条目"
+                : "为失败条目新建重试批次（不运行 AI）"
+            }
+            onClick={() => setPendingAction(retryFailed)}
+            className="gap-2"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Retry Failed
+          </Button>
         </div>
         <p className="text-xs text-muted-foreground">
           结果只写入 ai_rewrite_draft（rewrite_status=draft_generated），不会自动 human_reviewed / approved。
@@ -406,7 +433,14 @@ export function RewriteBatchDetailView({
             <DialogTitle>{pendingAction?.title}</DialogTitle>
           </DialogHeader>
           <div className="space-y-2 text-sm">
-            <p>将对本批次的 <strong>{batch.totalCount}</strong> 条工具执行「{pendingAction?.title}」。</p>
+            {pendingAction?.key === "retry" ? (
+              <p>
+                将为本批次的 <strong>{(statusCounts.failed ?? 0) + (statusCounts.qc_failed ?? 0)}</strong>{" "}
+                条失败工具<strong>新建重试批次</strong>（只创建，不自动运行 AI；服务端会跳过已审核/已发布/已有草稿的工具）。
+              </p>
+            ) : (
+              <p>将对本批次的 <strong>{batch.totalCount}</strong> 条工具执行「{pendingAction?.title}」。</p>
+            )}
             <p className="text-muted-foreground">
               Provider: {batch.provider} · Model: {batch.model}
             </p>
