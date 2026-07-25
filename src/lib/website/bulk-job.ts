@@ -8,6 +8,13 @@ import {
   type ImportFileInput,
 } from "@/lib/website/tool-import";
 import { clearClaimedUpload } from "@/lib/website/import-upload";
+import {
+  finalizeDirectRewriteBatch,
+  markDirectRewriteStarted,
+  prepareDirectRewrite,
+  runDirectRewriteItem,
+  type DirectRewriteContext,
+} from "@/lib/website/tool-rewrite-batch";
 
 /**
  * 通用后台批量任务：长操作异步化（第一版无外部队列）。
@@ -24,9 +31,26 @@ import { clearClaimedUpload } from "@/lib/website/import-upload";
 
 export const CHUNK_SIZE = 5;
 
-export type BulkJobType = "apply_and_review" | "publish" | "import_excel";
+// 直连 AI 改写每条要等 provider 返回（可达数十秒），每块只跑 1 条：
+// 既避免单个 run-next 请求超时，也让进度条按条推进。
+export const REWRITE_CHUNK_SIZE = 1;
 
-const JOB_TYPES: BulkJobType[] = ["apply_and_review", "publish", "import_excel"];
+export type BulkJobType =
+  | "apply_and_review"
+  | "publish"
+  | "import_excel"
+  | "rewrite_direct";
+
+const JOB_TYPES: BulkJobType[] = [
+  "apply_and_review",
+  "publish",
+  "import_excel",
+  "rewrite_direct",
+];
+
+function chunkSizeFor(type: BulkJobType): number {
+  return type === "rewrite_direct" ? REWRITE_CHUNK_SIZE : CHUNK_SIZE;
+}
 
 export function isBulkJobType(value: string): value is BulkJobType {
   return (JOB_TYPES as string[]).includes(value);
@@ -148,6 +172,55 @@ export async function createImportJob(
 }
 
 // ---------------------------------------------------------------------------
+// 直连 AI 改写任务：创建
+// ---------------------------------------------------------------------------
+
+// 把改写批次的待处理条目转成后台任务（不在本请求内调用 AI）。
+// 资格与 provider 校验全部复用 prepareDirectRewrite，不降低任何 guard；
+// 结果仍只写 ai_rewrite_draft（draft_generated），不会自动 human_reviewed / approved。
+export async function createRewriteJob(
+  rewriteBatchId: number
+): Promise<{ ok: true; jobId: number; total: number } | { ok: false; message: string }> {
+  const running = await prisma.bulkJob.findFirst({
+    where: {
+      type: "rewrite_direct",
+      related_rewrite_batch_id: rewriteBatchId,
+      status: { in: ["queued", "running"] },
+    },
+    select: { id: true },
+  });
+  if (running) {
+    return {
+      ok: false,
+      message: `该批次已有进行中的任务 #${running.id}，请在任务页查看进度`,
+    };
+  }
+
+  const prepared = await prepareDirectRewrite(rewriteBatchId);
+  if (!prepared.ok) return prepared;
+  const websiteIds = prepared.pendingWebsiteIds;
+  if (!websiteIds.length) {
+    return { ok: false, message: "批次没有待处理条目" };
+  }
+
+  const job = await prisma.bulkJob.create({
+    data: {
+      type: "rewrite_direct",
+      status: "queued",
+      total_count: websiteIds.length,
+      related_rewrite_batch_id: rewriteBatchId,
+      params: { rewriteBatchId } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.bulkJobItem.createMany({
+    data: websiteIds.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
+  });
+  await markDirectRewriteStarted(rewriteBatchId, websiteIds.length);
+
+  return { ok: true, jobId: job.id, total: websiteIds.length };
+}
+
+// ---------------------------------------------------------------------------
 // 分块执行
 // ---------------------------------------------------------------------------
 
@@ -211,9 +284,31 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
   const queued = await prisma.bulkJobItem.findMany({
     where: { job_id: jobId, status: "queued" },
     orderBy: { id: "asc" },
-    take: CHUNK_SIZE,
+    take: chunkSizeFor(job.type),
     select: { id: true, website_id: true },
   });
+
+  // 直连改写：每块开始前重新解析 provider 运行时（key 只在进程内传递）。
+  // provider 不可用时直接把任务标记失败，避免前端无限重试。
+  let rewriteContext: DirectRewriteContext | null = null;
+  if (job.type === "rewrite_direct" && queued.length) {
+    const prepared = job.related_rewrite_batch_id
+      ? await prepareDirectRewrite(job.related_rewrite_batch_id)
+      : ({ ok: false, message: "任务缺少关联改写批次" } as const);
+    if (!prepared.ok) {
+      await prisma.bulkJob.update({
+        where: { id: jobId },
+        data: {
+          status: "failed",
+          finished_at: new Date(),
+          error: { message: prepared.message } as Prisma.InputJsonValue,
+        },
+      });
+      const view = await getBulkJob(jobId);
+      return { ok: true, job: view!, processedNow: 0 };
+    }
+    rewriteContext = prepared.context;
+  }
 
   // Excel 导入：item 与解析出的记录按序号一一对应，需先重建 plan
   let importPlan: Awaited<ReturnType<typeof buildImportPlan>> | null = null;
@@ -290,6 +385,16 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
       } else if (!item.website_id) {
         itemStatus = "failed";
         itemError = "缺少 website_id";
+      } else if (job.type === "rewrite_direct") {
+        const outcome = await runDirectRewriteItem(rewriteContext!, item.website_id);
+        itemStatus =
+          outcome.outcome === "saved"
+            ? "success"
+            : outcome.outcome === "skipped"
+            ? "skipped"
+            : "failed";
+        itemError = outcome.outcome === "saved" ? null : outcome.message ?? null;
+        itemResult = { rewriteOutcome: outcome.outcome } as Prisma.InputJsonValue;
       } else {
         const single = await runSingleItem(job.type, item.website_id, params);
         itemStatus = single.status;
@@ -345,6 +450,17 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
       }
     }
     jobResult = { mediaLocalized, mediaAlreadyCached, mediaFailed };
+  }
+
+  // 改写任务收尾：按条目实际状态重算批次计数并置 imported
+  if (done && job.type === "rewrite_direct" && job.related_rewrite_batch_id) {
+    const totals = await finalizeDirectRewriteBatch(job.related_rewrite_batch_id);
+    jobResult = {
+      saved: totals.saved,
+      qcFailed: totals.qcFailed,
+      failed: totals.failed,
+      rewriteBatchId: job.related_rewrite_batch_id,
+    };
   }
 
   // 导入任务收尾：回填 ToolImportBatch / ToolImportFile 计数，并清理临时上传文件
@@ -466,6 +582,7 @@ export type BulkJobView = {
   skippedCount: number;
   failedCount: number;
   result: unknown;
+  error: unknown;
   relatedImportBatchId: number | null;
   relatedRewriteBatchId: number | null;
   createdAt: string;
@@ -503,6 +620,7 @@ export async function getBulkJob(jobId: number): Promise<BulkJobView | null> {
     skippedCount: job.skipped_count,
     failedCount: job.failed_count,
     result: job.result,
+    error: job.error,
     relatedImportBatchId: job.related_import_batch_id,
     relatedRewriteBatchId: job.related_rewrite_batch_id,
     createdAt: job.created_at.toISOString(),
@@ -517,6 +635,17 @@ export async function getBulkJob(jobId: number): Promise<BulkJobView | null> {
       error: item.error,
     })),
   };
+}
+
+// 改写批次页用：该批次最近一次后台改写任务（用于展示进度入口）
+export async function findLatestRewriteJob(
+  rewriteBatchId: number
+): Promise<{ id: number; status: string } | null> {
+  return prisma.bulkJob.findFirst({
+    where: { type: "rewrite_direct", related_rewrite_batch_id: rewriteBatchId },
+    orderBy: { id: "desc" },
+    select: { id: true, status: true },
+  });
 }
 
 export type BulkJobSummary = Omit<BulkJobView, "items">;
@@ -536,6 +665,7 @@ export async function listBulkJobs(limit = 50): Promise<BulkJobSummary[]> {
     skippedCount: job.skipped_count,
     failedCount: job.failed_count,
     result: job.result,
+    error: job.error,
     relatedImportBatchId: job.related_import_batch_id,
     relatedRewriteBatchId: job.related_rewrite_batch_id,
     createdAt: job.created_at.toISOString(),

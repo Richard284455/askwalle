@@ -90,10 +90,12 @@ export function RewriteBatchDetailView({
   initialBatch,
   providerHasKey,
   providerKeyEnv,
+  rewriteJob = null,
 }: {
   initialBatch: RewriteBatchDetail;
   providerHasKey: boolean;
   providerKeyEnv: string;
+  rewriteJob?: { id: number; status: string } | null;
 }) {
   const router = useRouter();
   const { toast } = useToast();
@@ -145,25 +147,32 @@ export function RewriteBatchDetailView({
       toast({ title: "JSONL 已生成", description: `${p.lineCount} 行` });
     },
   };
-  const submit: ExecAction = {
+  const submitToOpenAI: ExecAction = {
     key: "submit",
-    title: batch.providerMode === "batch" ? "Submit to OpenAI" : "Run rewrite now",
+    title: "Submit to OpenAI",
     endpoint: "submit",
     run: (data) => {
-      const p = data.data as
-        | { mode: "batch"; openaiBatchId: string }
-        | { mode: "direct"; saved: number; qcFailed: number; failed: number };
-      toast({
-        title: p.mode === "batch" ? "已提交到 OpenAI" : "直连改写完成",
-        description:
-          p.mode === "batch"
-            ? p.openaiBatchId
-            : `saved: ${p.saved}, qc_failed: ${p.qcFailed}, failed: ${p.failed}`,
-      });
+      const p = data.data as { mode: "batch"; openaiBatchId: string };
+      toast({ title: "已提交到 OpenAI", description: p.openaiBatchId });
       router.refresh();
       setTimeout(() => window.location.reload(), 800);
     },
   };
+  // 直连 provider：不在本请求内跑 AI，改为创建后台任务并跳转进度页
+  const submitDirectJob: ExecAction = {
+    key: "submit",
+    title: "Run rewrite now",
+    endpoint: "submit-job",
+    run: (data) => {
+      const p = data.data as { jobId: number; total: number; jobUrl: string };
+      toast({
+        title: "改写任务已创建",
+        description: `任务 #${p.jobId}：${p.total} 条排队中，正在进度页逐条执行`,
+      });
+      router.push(p.jobUrl);
+    },
+  };
+  const submit = batch.providerMode === "batch" ? submitToOpenAI : submitDirectJob;
   const refresh: ExecAction = {
     key: "refresh",
     title: "Refresh status",
@@ -202,6 +211,9 @@ export function RewriteBatchDetailView({
   };
 
   const hasQcPassed = batch.qcPassedCount > 0 || statusCounts.saved > 0;
+  const jobRunning = Boolean(
+    rewriteJob && ["queued", "running"].includes(rewriteJob.status)
+  );
 
   return (
     <motion.div
@@ -252,6 +264,20 @@ export function RewriteBatchDetailView({
         </div>
       )}
 
+      {/* 后台改写任务入口（直连 provider 异步执行） */}
+      {rewriteJob && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-primary/30 bg-primary/5 p-4 text-sm">
+          <span className="text-muted-foreground">
+            本批次{jobRunning ? "有正在执行的" : "最近一次"}后台改写任务 #{rewriteJob.id}
+            （{rewriteJob.status}）
+            {jobRunning ? "，需保持任务页打开以继续推进。" : ""}
+          </span>
+          <Button variant={jobRunning ? "default" : "outline"} size="sm" asChild>
+            <Link href={`/admin/jobs/${rewriteJob.id}`}>查看任务进度</Link>
+          </Button>
+        </div>
+      )}
+
       {/* 执行控制（按 provider 模式，所有按钮弹确认） */}
       <div className="rounded-xl border border-border/40 bg-background/30 backdrop-blur-sm p-6 space-y-4">
         <div className="flex flex-wrap gap-2">
@@ -268,8 +294,21 @@ export function RewriteBatchDetailView({
           </Button>
           <Button
             size="sm"
-            disabled={busy !== null || Boolean(batch.openaiBatchId) || batch.status === "imported"}
-            title={batch.openaiBatchId ? "已提交过" : batch.status === "imported" ? "批次已完成" : undefined}
+            disabled={
+              busy !== null ||
+              Boolean(batch.openaiBatchId) ||
+              batch.status === "imported" ||
+              jobRunning
+            }
+            title={
+              batch.openaiBatchId
+                ? "已提交过"
+                : batch.status === "imported"
+                ? "批次已完成"
+                : jobRunning
+                ? `已有进行中的任务 #${rewriteJob?.id}`
+                : undefined
+            }
             onClick={() => setPendingAction(submit)}
             className="gap-2"
           >
@@ -437,6 +476,11 @@ export function RewriteBatchDetailView({
               <p>
                 将为本批次的 <strong>{(statusCounts.failed ?? 0) + (statusCounts.qc_failed ?? 0)}</strong>{" "}
                 条失败工具<strong>新建重试批次</strong>（只创建，不自动运行 AI；服务端会跳过已审核/已发布/已有草稿的工具）。
+              </p>
+            ) : pendingAction?.key === "submit" && batch.providerMode === "direct" ? (
+              <p>
+                将为本批次待处理条目创建<strong>后台改写任务</strong>并跳转进度页，
+                逐条调用 AI（每次 1 条，可随时看到进度）。任务页关闭会暂停，重新打开可继续。
               </p>
             ) : (
               <p>将对本批次的 <strong>{batch.totalCount}</strong> 条工具执行「{pendingAction?.title}」。</p>

@@ -693,29 +693,39 @@ Reference notes (facts only, do not copy wording):
 ${reference}`;
 }
 
+const REWRITE_ITEM_INCLUDE = {
+  website: {
+    select: {
+      id: true,
+      title: true,
+      description: true,
+      toolDetail: {
+        select: {
+          raw_imported_content: true,
+          what: true,
+          how: true,
+          features_text: true,
+          use_cases: true,
+          rewrite_status: true,
+        },
+      },
+    },
+  },
+} satisfies Prisma.ToolRewriteItemInclude;
+
+// 单条加载（批次内 website_id 唯一，由 createRewriteBatch 去重保证）
+async function loadBatchWebsite(batchId: number, websiteId: number) {
+  return prisma.toolRewriteItem.findFirst({
+    where: { batch_id: batchId, website_id: websiteId },
+    include: REWRITE_ITEM_INCLUDE,
+  });
+}
+
 async function loadBatchWebsites(batchId: number) {
   return prisma.toolRewriteItem.findMany({
     where: { batch_id: batchId },
     orderBy: { id: "asc" },
-    include: {
-      website: {
-        select: {
-          id: true,
-          title: true,
-          description: true,
-          toolDetail: {
-            select: {
-              raw_imported_content: true,
-              what: true,
-              how: true,
-              features_text: true,
-              use_cases: true,
-              rewrite_status: true,
-            },
-          },
-        },
-      },
-    },
+    include: REWRITE_ITEM_INCLUDE,
   });
 }
 
@@ -794,10 +804,12 @@ type ProviderHttpRuntime = { baseUrl: string; apiKey: string };
 async function providerFetch(
   runtime: ProviderHttpRuntime,
   pathName: string,
-  init?: RequestInit
+  init?: RequestInit & { timeoutMs?: number }
 ) {
+  const { timeoutMs, ...requestInit } = init ?? {};
   const response = await fetch(`${runtime.baseUrl}${pathName}`, {
-    ...init,
+    ...requestInit,
+    ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
     headers: {
       Authorization: `Bearer ${runtime.apiKey}`,
       ...(init?.headers ?? {}),
@@ -848,8 +860,9 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
   }
 
   // 直连模式：同步逐条改写并完成 QC 入库
+  // （后台任务模式见 prepareDirectRewrite / runDirectRewriteItem）
   if (getProviderMode(provider) === "direct") {
-    return runDirectRewrite(batchId, runtime, batch.model);
+    return runDirectRewrite(batchId, { batchId, runtime, model: batch.model });
   }
 
   // OpenAI Batch API 模式
@@ -909,95 +922,191 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
   return { ok: true, mode: "batch", openaiBatchId: openaiBatch.id };
 }
 
-// 直连模式执行：逐条 chat/completions → QC → 入库（单条失败不影响其它条目）
-async function runDirectRewrite(
-  batchId: number,
-  runtime: ProviderHttpRuntime,
-  model: string
-): Promise<SubmitResult> {
-  const items = await loadBatchWebsites(batchId);
-  const pendingItems = items.filter((item) =>
-    ["queued", "failed", "qc_failed"].includes(item.status)
-  );
-  if (!pendingItems.length) {
-    return { ok: false, message: "批次没有待处理条目" };
+// ---------------------------------------------------------------------------
+// 直连模式：逐条 chat/completions → QC → 入库
+//
+// 同步执行（submitRewriteBatch）与后台任务分块执行（bulk-job 的 rewrite_direct）
+// 共用同一套单条实现：prepare → 逐条 runDirectRewriteItem → finalize。
+// ---------------------------------------------------------------------------
+
+// 单条 AI 请求超时上限：避免 provider 挂起导致分块请求永不返回
+const DIRECT_REWRITE_TIMEOUT_MS = 180_000;
+
+// 直连执行上下文：仅在服务端进程内传递（含 apiKey，绝不序列化 / 落库 / 进日志）
+export type DirectRewriteContext = {
+  batchId: number;
+  runtime: ProviderHttpRuntime;
+  model: string;
+};
+
+// 待处理条目状态（失败 / QC 失败允许重跑）
+const DIRECT_REWRITE_PENDING = ["queued", "failed", "qc_failed"];
+
+// 直连前置校验：provider / key / 批次状态，并返回待处理条目
+export async function prepareDirectRewrite(
+  batchId: number
+): Promise<
+  | { ok: true; context: DirectRewriteContext; pendingWebsiteIds: number[] }
+  | { ok: false; message: string }
+> {
+  const batch = await prisma.toolRewriteBatch.findUnique({ where: { id: batchId } });
+  if (!batch) return { ok: false, message: "批次不存在" };
+  if (!isRewriteProvider(batch.provider)) {
+    return { ok: false, message: `未知 provider: ${batch.provider}` };
+  }
+  if (getProviderMode(batch.provider) !== "direct") {
+    return { ok: false, message: `${batch.provider} 为 Batch API 模式，请使用提交流程` };
+  }
+  if (batch.openai_batch_id) {
+    return { ok: false, message: `批次已提交过 (${batch.openai_batch_id})` };
+  }
+  if (batch.status === "imported") {
+    return { ok: false, message: "批次已完成，请新建批次" };
   }
 
-  await prisma.toolRewriteBatch.update({
-    where: { id: batchId },
-    data: { status: "in_progress", submitted_at: new Date(), submitted_count: pendingItems.length },
+  const runtime = await resolveProviderRuntime(batch.provider, batch.model);
+  if (!runtime.ok) return { ok: false, message: runtime.message };
+  if (!runtime.enabled) {
+    return { ok: false, message: `${batch.provider} 已在配置中心禁用，无法提交真实任务` };
+  }
+
+  const pending = await prisma.toolRewriteItem.findMany({
+    where: { batch_id: batchId, status: { in: DIRECT_REWRITE_PENDING } },
+    orderBy: { id: "asc" },
+    select: { website_id: true },
   });
 
-  let saved = 0;
-  let qcFailed = 0;
-  let failed = 0;
+  return {
+    ok: true,
+    context: { batchId, runtime, model: batch.model },
+    pendingWebsiteIds: pending.map((item) => item.website_id),
+  };
+}
 
-  for (const item of pendingItems) {
-    // 始终用当前模板重建 prompt（旧存量 prompt 可能缺少 response_format 所需的
-    // "json" 字样），并回写 item.prompt 作审计
-    const prompt = buildBatchRewritePrompt(
-      item.website.title,
-      rawForWebsite(item.website)
-    );
-    if (item.prompt !== prompt) {
-      await prisma.toolRewriteItem.update({
-        where: { id: item.id },
-        data: { prompt },
-      });
-    }
+// 标记批次开始执行（同步与任务模式共用）
+export async function markDirectRewriteStarted(
+  batchId: number,
+  pendingCount: number
+): Promise<void> {
+  await prisma.toolRewriteBatch.update({
+    where: { id: batchId },
+    data: {
+      status: "in_progress",
+      submitted_at: new Date(),
+      submitted_count: pendingCount,
+    },
+  });
+}
 
-    let outcome: "saved" | "qc_failed" | "failed";
-    try {
-      const response = await providerFetch(runtime, "/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_object" },
-        }),
-      });
-      if (!response.ok) {
-        outcome = "failed";
-        await prisma.toolRewriteItem.update({
-          where: { id: item.id },
-          data: {
-            status: "failed",
-            attempt_count: { increment: 1 },
-            error_message: apiErrorMessage(response.body, `HTTP ${response.status}`),
-          },
-        });
-      } else {
-        const content = extractChatContent(response.body);
-        let draftJson: unknown = null;
-        if (content) {
-          try {
-            draftJson = JSON.parse(
-              content.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "")
-            );
-          } catch {
-            draftJson = null;
-          }
-        }
-        outcome = await applyDraftOutcome(item, draftJson, content);
-      }
-    } catch (error) {
-      outcome = "failed";
+export type DirectRewriteItemOutcome = {
+  outcome: "saved" | "qc_failed" | "failed" | "skipped";
+  message?: string;
+};
+
+// 单条改写：条目资格在服务端重新校验（已 saved 的不会重复调用 AI）
+export async function runDirectRewriteItem(
+  context: DirectRewriteContext,
+  websiteId: number
+): Promise<DirectRewriteItemOutcome> {
+  const item = await loadBatchWebsite(context.batchId, websiteId);
+  if (!item) return { outcome: "failed", message: "批次中找不到该工具条目" };
+  if (!DIRECT_REWRITE_PENDING.includes(item.status)) {
+    return { outcome: "skipped", message: `条目状态为 ${item.status}，无需重复改写` };
+  }
+
+  // 始终用当前模板重建 prompt（旧存量 prompt 可能缺少 response_format 所需的
+  // "json" 字样），并回写 item.prompt 作审计
+  const prompt = buildBatchRewritePrompt(
+    item.website.title,
+    rawForWebsite(item.website)
+  );
+  if (item.prompt !== prompt) {
+    await prisma.toolRewriteItem.update({
+      where: { id: item.id },
+      data: { prompt },
+    });
+  }
+
+  try {
+    const response = await providerFetch(context.runtime, "/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      timeoutMs: DIRECT_REWRITE_TIMEOUT_MS,
+      body: JSON.stringify({
+        model: context.model,
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+      }),
+    });
+    if (!response.ok) {
+      const message = apiErrorMessage(response.body, `HTTP ${response.status}`);
       await prisma.toolRewriteItem.update({
         where: { id: item.id },
         data: {
           status: "failed",
           attempt_count: { increment: 1 },
-          error_message:
-            error instanceof Error ? error.message.slice(0, 300) : "请求失败",
+          error_message: message,
         },
       });
+      return { outcome: "failed", message };
     }
 
-    if (outcome === "saved") saved++;
-    else if (outcome === "qc_failed") qcFailed++;
-    else failed++;
+    const content = extractChatContent(response.body);
+    let draftJson: unknown = null;
+    if (content) {
+      try {
+        draftJson = JSON.parse(
+          content.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "")
+        );
+      } catch {
+        draftJson = null;
+      }
+    }
+    const outcome = await applyDraftOutcome(item, draftJson, content);
+    if (outcome === "saved") return { outcome };
+    // QC / 写入失败的原因已写进条目，回读用于任务详情展示
+    const after = await prisma.toolRewriteItem.findUnique({
+      where: { id: item.id },
+      select: { error_message: true, qc_errors: true },
+    });
+    const qcErrors = Array.isArray(after?.qc_errors)
+      ? (after?.qc_errors as unknown[]).filter((e): e is string => typeof e === "string")
+      : [];
+    return {
+      outcome,
+      message:
+        after?.error_message ??
+        (qcErrors.length ? `QC 未通过: ${qcErrors.join("; ").slice(0, 240)}` : "QC 未通过"),
+    };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message.slice(0, 300) : "请求失败";
+    await prisma.toolRewriteItem.update({
+      where: { id: item.id },
+      data: {
+        status: "failed",
+        attempt_count: { increment: 1 },
+        error_message: message,
+      },
+    });
+    return { outcome: "failed", message };
   }
+}
+
+// 批次收尾：按条目实际状态重算计数并置 imported（可重复调用）
+export async function finalizeDirectRewriteBatch(
+  batchId: number
+): Promise<{ saved: number; qcFailed: number; failed: number }> {
+  const counts = await prisma.toolRewriteItem.groupBy({
+    by: ["status"],
+    where: { batch_id: batchId },
+    _count: true,
+  });
+  const count = (status: string) =>
+    counts.find((c) => c.status === status)?._count ?? 0;
+  const saved = count("saved");
+  const qcFailed = count("qc_failed");
+  const failed = count("failed");
 
   await prisma.toolRewriteBatch.update({
     where: { id: batchId },
@@ -1011,7 +1120,30 @@ async function runDirectRewrite(
     },
   });
 
-  return { ok: true, mode: "direct", saved, qcFailed, failed };
+  return { saved, qcFailed, failed };
+}
+
+// 同步直连执行（保留原有一次性接口）：复用单条实现，串行跑完全部待处理条目
+async function runDirectRewrite(
+  batchId: number,
+  context: DirectRewriteContext
+): Promise<SubmitResult> {
+  const pending = await prisma.toolRewriteItem.findMany({
+    where: { batch_id: batchId, status: { in: DIRECT_REWRITE_PENDING } },
+    orderBy: { id: "asc" },
+    select: { website_id: true },
+  });
+  if (!pending.length) {
+    return { ok: false, message: "批次没有待处理条目" };
+  }
+
+  await markDirectRewriteStarted(batchId, pending.length);
+  for (const item of pending) {
+    await runDirectRewriteItem(context, item.website_id);
+  }
+  const totals = await finalizeDirectRewriteBatch(batchId);
+
+  return { ok: true, mode: "direct", ...totals };
 }
 
 function extractChatContent(body: unknown): string | null {

@@ -72,11 +72,10 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
     ? Math.round((job.processedCount / job.totalCount) * 100)
     : 0;
   const done = TERMINAL.includes(job.status);
-  const mediaStats = (job.result ?? null) as {
-    mediaLocalized?: number;
-    mediaAlreadyCached?: number;
-    mediaFailed?: number;
-  } | null;
+  const result = (job.result ?? null) as Record<string, number> | null;
+  const mediaStats = job.type === "publish" ? result : null;
+  const rewriteStats = job.type === "rewrite_direct" ? result : null;
+  const jobError = (job.error ?? null) as { message?: string } | null;
   const failures = job.items.filter((item) => item.status === "failed" || item.status === "skipped");
 
   return (
@@ -148,6 +147,16 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
             {mediaStats.mediaAlreadyCached ?? 0} 张 · 失败 {mediaStats.mediaFailed ?? 0} 张
           </p>
         )}
+        {rewriteStats && (
+          <p className="text-xs text-muted-foreground">
+            改写批次：QC 通过 {rewriteStats.saved ?? 0} 条 · QC 失败{" "}
+            {rewriteStats.qcFailed ?? 0} 条 · 失败 {rewriteStats.failed ?? 0} 条（结果只写
+            AI 草稿，不会自动发布）
+          </p>
+        )}
+        {jobError?.message && (
+          <p className="text-xs text-red-500">任务中断：{jobError.message}</p>
+        )}
       </div>
 
       {/* 完成后下一步 */}
@@ -170,6 +179,15 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
           {job.relatedRewriteBatchId && (
             <Button variant="outline" size="sm" asChild>
               <Link href={`/admin/tools/rewrite/${job.relatedRewriteBatchId}`}>查看改写批次</Link>
+            </Button>
+          )}
+          {job.type === "rewrite_direct" && job.relatedRewriteBatchId && (
+            <Button variant="outline" size="sm" asChild>
+              <Link
+                href={`/admin/tools/review?rewriteBatchId=${job.relatedRewriteBatchId}&qcStatus=passed`}
+              >
+                去审核本批草稿
+              </Link>
             </Button>
           )}
           {job.relatedImportBatchId && (

@@ -8,6 +8,7 @@ import {
   parseToolUpdatePayload,
   updateTool,
 } from "@/lib/website/tool-admin";
+import { ensureMediaLocalizedBeforePublish } from "@/lib/website/tool-media-cache";
 import { prisma } from "@/lib/prisma";
 
 async function resolveId(params: Promise<{ id: string }>) {

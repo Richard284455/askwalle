@@ -3,6 +3,7 @@ import {
   getRewriteBatch,
   listRewriteProviders,
 } from "@/lib/website/tool-rewrite-batch";
+import { findLatestRewriteJob } from "@/lib/website/bulk-job";
 import { RewriteBatchDetailView } from "@/components/admin/rewrite-batch-detail";
 
 export const dynamic = "force-dynamic";
@@ -24,6 +25,7 @@ export default async function RewriteBatchDetailPage({
 
   const providers = await listRewriteProviders();
   const providerInfo = providers.find((p) => p.id === batch.provider) ?? null;
+  const rewriteJob = await findLatestRewriteJob(batchId);
 
   return (
     <div>
@@ -31,6 +33,7 @@ export default async function RewriteBatchDetailPage({
         initialBatch={batch}
         providerHasKey={providerInfo?.hasKey ?? false}
         providerKeyEnv={providerInfo?.keyEnv ?? "OPENAI_API_KEY"}
+        rewriteJob={rewriteJob}
       />
     </div>
   );
