@@ -235,6 +235,27 @@ export async function createRewriteJob(
 // 分块执行
 // ---------------------------------------------------------------------------
 
+// 条目心跳间隔：远小于 job-worker 的僵死回收阈值
+const ITEM_HEARTBEAT_MS = 60_000;
+
+/**
+ * 条目处理期间定期 touch updated_at。
+ *
+ * 单条可能跑很久（AI 改写上限 180s、媒体下载、数据库变慢时更久），若不刷新
+ * 时间戳，僵死回收会把「还在跑」误判成「进程已死」并放回 queued，导致同一条被
+ * 并发执行两次 —— 对 AI 改写就是重复计费。写 status: "running" 是空操作，
+ * 目的只是触发 Prisma 更新 @updatedAt；条目一旦不再是 running 就不会被改到。
+ */
+function startItemHeartbeat(itemId: number): () => void {
+  const timer = setInterval(() => {
+    void prisma.bulkJobItem
+      .updateMany({ where: { id: itemId, status: "running" }, data: { status: "running" } })
+      .catch(() => {});
+  }, ITEM_HEARTBEAT_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 // 单条执行：复用现有批量助手（含全部 guard），把 1 条的结果翻译成 item 结果
 async function runSingleItem(
   type: BulkJobType,
@@ -380,6 +401,9 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     });
     if (claimed.count !== 1) continue;
 
+    // 处理期间持续刷新 updated_at，让僵死回收只挑真正被中断的条目
+    const stopHeartbeat = startItemHeartbeat(item.id);
+
     let itemStatus: "success" | "skipped" | "failed";
     let itemError: string | null = null;
     let itemResult: Prisma.InputJsonValue | undefined;
@@ -431,18 +455,37 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     } catch (error) {
       itemStatus = "failed";
       itemError = error instanceof Error ? error.message.slice(0, 300) : "执行异常";
+    } finally {
+      stopHeartbeat();
     }
 
-    await prisma.bulkJobItem.update({
-      where: { id: item.id },
-      data: {
-        status: itemStatus,
-        error: itemError,
-        ...(itemResult !== undefined ? { result: itemResult } : {}),
-        ...(itemWebsiteId !== undefined ? { website_id: itemWebsiteId } : {}),
-      },
-    });
-    processedNow++;
+    try {
+      await prisma.bulkJobItem.update({
+        where: { id: item.id },
+        data: {
+          status: itemStatus,
+          error: itemError,
+          ...(itemResult !== undefined ? { result: itemResult } : {}),
+          ...(itemWebsiteId !== undefined ? { website_id: itemWebsiteId } : {}),
+        },
+      });
+      processedNow++;
+    } catch (error) {
+      // 写回失败（多半是数据库瞬断）：活可能已经干完，但记账没落库。
+      // 把条目退回 queued 让下一块立刻重跑，而不是留在 running 空等僵死回收窗口。
+      // 重跑是安全的：三种任务的单条执行都会重新校验状态，已完成的会被判为
+      // skipped（publish 只接受 pending、改写跳过已 saved、导入跳过已存在）。
+      console.error(
+        `[bulk-job] 条目 #${item.id} 结果写回失败，已退回 queued 重试:`,
+        error instanceof Error ? error.message : "unknown"
+      );
+      await prisma.bulkJobItem
+        .updateMany({
+          where: { id: item.id, status: "running" },
+          data: { status: "queued", error: null },
+        })
+        .catch(() => {});
+    }
   }
 
   // 重算进度；无剩余 queued/running 则收尾

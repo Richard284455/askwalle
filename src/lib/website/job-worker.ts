@@ -32,7 +32,9 @@ const IDLE_DELAY_MS = 15_000; // 空闲轮询间隔
 const BUSY_DELAY_MS = 500; // 有进展时的下一块间隔
 const ERROR_DELAY_MS = 30_000; // 异常后退避
 const RECLAIM_EVERY_MS = 60_000; // 僵死条目回收频率
-const STALE_ITEM_MS = 10 * 60_000; // running 超过 10 分钟视为中断
+// running 超过 5 分钟没有心跳视为中断。条目处理期间每 60s 会 touch 一次
+// updated_at（见 bulk-job 的 startItemHeartbeat），所以慢条目不会被误判。
+const STALE_ITEM_MS = 5 * 60_000;
 const MAX_CONSECUTIVE_FAILURES = 3; // AI 改写熔断阈值
 
 type WorkerState = {
