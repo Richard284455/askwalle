@@ -75,11 +75,10 @@ export function ToolImportClient({
   const [previewing, setPreviewing] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [result, setResult] = useState<{ batchId: number; imported: number; skipped: number; errors: number; detailUrl?: string } | null>(null);
   const [importError, setImportError] = useState<string | null>(null);
   const [slowNotice, setSlowNotice] = useState(false);
 
-  // 同步导入耗时可能较长（远程库逐条写入）；超过此值先给用户明确反馈，避免界面无限“导入中”
+  // 创建任务只做解析（不逐行导入），正常秒级返回；超时兜底避免界面无限 loading
   const CONFIRM_TIMEOUT_MS = 60_000;
 
   const addFiles = (list: FileList | null) => {
@@ -104,7 +103,6 @@ export function ToolImportClient({
       setFiles(merged);
     }
     setPreview(null);
-    setResult(null);
     setImportError(null);
     setSlowNotice(false);
   };
@@ -112,7 +110,6 @@ export function ToolImportClient({
   const handlePreview = async () => {
     if (!files.length || previewing) return;
     setPreviewing(true);
-    setResult(null);
     setImportError(null);
     setSlowNotice(false);
     try {
@@ -140,7 +137,8 @@ export function ToolImportClient({
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CONFIRM_TIMEOUT_MS);
     try {
-      const res = await fetch("/api/admin/tools/import/confirm", {
+      // 创建后台导入任务：本请求只解析建 job，不做逐行导入，秒级返回
+      const res = await fetch("/api/admin/tools/import/confirm-job", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ previewToken: preview.previewToken, overwrite: preview.overwrite }),
@@ -148,28 +146,31 @@ export function ToolImportClient({
       });
       const data = await res.json().catch(() => null);
       if (res.ok && data?.code === 200) {
-        // 成功：显示结果，清空预检与文件（token 已被服务端消费）
-        setResult(data.data);
+        // 任务已创建：跳转任务进度页分块执行（token 已被服务端消费）
         setConfirmOpen(false);
         setPreview(null);
         setFiles([]);
-        toast({ title: "导入完成", description: `批次 #${data.data.batchId}` });
-        router.refresh();
+        toast({
+          title: "导入任务已创建",
+          description: `任务 #${data.data.jobId}（批次 #${data.data.batchId}），正在跳转进度页`,
+        });
+        router.push(data.data.jobUrl);
+        return;
       } else {
         // 服务端明确失败：显示原因；token 已被消费，需重新预检
-        setImportError(data?.message || `导入失败（HTTP ${res.status}）`);
+        setImportError(data?.message || `创建导入任务失败（HTTP ${res.status}）`);
         setConfirmOpen(false);
         setPreview(null);
-        toast({ title: "导入失败", description: data?.message || "请重新预检后重试", variant: "destructive" });
+        toast({ title: "创建导入任务失败", description: data?.message || "请重新预检后重试", variant: "destructive" });
       }
     } catch (err) {
       const aborted = err instanceof DOMException && err.name === "AbortError";
       if (aborted) {
-        // 请求超过 60s：后端可能仍在导入，引导用户去批次列表核对，避免重复导入
+        // 创建任务超过 60s（解析大文件较慢）：任务可能已创建，引导去任务中心核对
         setSlowNotice(true);
         setConfirmOpen(false);
         setPreview(null);
-        toast({ title: "导入仍在进行", description: "请稍后在批次列表核对结果" });
+        toast({ title: "任务创建较慢", description: "请稍后在批量任务中心核对" });
       } else {
         setImportError(
           err instanceof Error ? `请求失败：${err.message}` : "请求失败，请重试"
@@ -198,15 +199,20 @@ export function ToolImportClient({
             批量导入工具（Excel）
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
-            上传 .xlsx（≤20 个、≤20MB/个）→ 预检 → 确认导入为 pending/raw_imported
+            上传 .xlsx（≤20 个、≤20MB/个）→ 预检 → 确认后创建后台导入任务，逐行分块执行
           </p>
         </div>
-        <Button variant="outline" size="sm" asChild>
-          <Link href="/admin/tools" className="flex items-center gap-2">
-            <ArrowLeft className="w-4 h-4" />
-            返回工具管理
-          </Link>
-        </Button>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/jobs">批量任务中心</Link>
+          </Button>
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/admin/tools" className="flex items-center gap-2">
+              <ArrowLeft className="w-4 h-4" />
+              返回工具管理
+            </Link>
+          </Button>
+        </div>
       </div>
 
       {/* 上传区 */}
@@ -334,10 +340,10 @@ export function ToolImportClient({
         </div>
       )}
 
-      {/* 导入失败区 */}
+      {/* 创建导入任务失败区 */}
       {importError && (
         <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-6 space-y-3">
-          <h2 className="text-lg font-semibold text-red-700 dark:text-red-300">导入失败</h2>
+          <h2 className="text-lg font-semibold text-red-700 dark:text-red-300">创建导入任务失败</h2>
           <p className="text-sm">{importError}</p>
           <p className="text-xs text-muted-foreground">
             该预检已失效。请重新选择文件并预检后再次导入。
@@ -353,42 +359,22 @@ export function ToolImportClient({
         </div>
       )}
 
-      {/* 导入较慢 / 超时提示区 */}
+      {/* 创建任务较慢 / 超时提示区 */}
       {slowNotice && (
         <div className="rounded-xl border border-yellow-500/30 bg-yellow-500/10 p-6 space-y-3">
           <h2 className="text-lg font-semibold text-yellow-700 dark:text-yellow-300">
-            导入仍在进行或请求较慢
+            任务创建较慢
           </h2>
           <p className="text-sm">
-            请求超过 60 秒仍未返回。后端可能仍在导入（大批量逐条写入较慢）。
-            请稍后在下方“历史导入批次”核对结果，不要重复导入。
+            请求超过 60 秒仍未返回（解析大文件较慢）。任务可能已创建，
+            请到批量任务中心核对，不要重复提交。
           </p>
           <div className="flex flex-wrap gap-2">
-            <Button size="sm" onClick={() => router.refresh()}>
-              刷新批次列表
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {/* 导入结果区 */}
-      {result && (
-        <div className="rounded-xl border border-green-500/30 bg-green-500/10 p-6 space-y-3">
-          <h2 className="text-lg font-semibold text-green-700 dark:text-green-300">
-            导入完成 — 批次 #{result.batchId}
-          </h2>
-          <p className="text-sm">导入 {result.imported} · 跳过 {result.skipped} · 错误 {result.errors}</p>
-          <div className="flex flex-wrap gap-2">
             <Button size="sm" asChild>
-              <Link href={`/admin/tools/import/${result.batchId}`}>查看本批次详情</Link>
+              <Link href="/admin/jobs">前往批量任务中心</Link>
             </Button>
-            <Button variant="outline" size="sm" asChild>
-              <Link href="/admin/tools/import">返回导入列表</Link>
-            </Button>
-            <Button variant="outline" size="sm" asChild>
-              <Link href={`/admin/tools/rewrite/new?importBatchId=${result.batchId}`}>
-                创建 AI 改写任务
-              </Link>
+            <Button variant="outline" size="sm" onClick={() => router.refresh()}>
+              刷新批次列表
             </Button>
           </div>
         </div>
@@ -462,12 +448,15 @@ export function ToolImportClient({
               <p className="text-xs text-muted-foreground">
                 导入内容作为内部底稿（raw_imported），不会自动发布。
               </p>
+              <p className="text-xs text-muted-foreground">
+                将创建后台导入任务并跳转进度页，逐行分块执行，无需在此等待。
+              </p>
             </div>
           )}
           <DialogFooter>
             <Button variant="outline" onClick={() => setConfirmOpen(false)}>取消</Button>
             <Button onClick={handleConfirm} disabled={importing}>
-              {importing ? "导入中..." : "确认导入"}
+              {importing ? "创建任务中..." : "确认导入"}
             </Button>
           </DialogFooter>
         </DialogContent>

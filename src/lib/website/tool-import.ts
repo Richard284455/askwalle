@@ -747,6 +747,119 @@ export type RunImportResult = {
   totalInvalidUrl: number;
 };
 
+// ---------------------------------------------------------------------------
+// 分块导入（后台任务用）：把「解析 + slug 消歧」抽成可重复执行的 plan。
+//
+// buildRecords 对已存在 URL 会沿用其现有 slug（urlToExistingSlug 优先），
+// 因此同一批文件在多次调用间 records 顺序与长度稳定 —— 后台任务的每个分块
+// 都重新构建 plan，再按 offset 取本块要处理的记录，无需把记录落库。
+// ---------------------------------------------------------------------------
+
+export type ImportPlanFile = {
+  filePath: string;
+  fileName: string;
+  rowCount: number;
+  validCount: number;
+  errorCount: number;
+  errorLog: string | null;
+  level1: string | null;
+  level2: string | null;
+  recordStart: number; // 该文件记录在 plan.records 中的起始下标
+  recordCount: number;
+};
+
+export type ImportPlan = {
+  records: ToolRecord[];
+  files: ImportPlanFile[];
+  totalRows: number;
+  totalValid: number;
+  totalErrors: number;
+};
+
+export async function buildImportPlan(
+  prisma: PrismaClient,
+  files: ImportFileInput[]
+): Promise<ImportPlan> {
+  const usedSlugs = new Set<string>();
+  const urlToExistingSlug = new Map<string, string>();
+
+  const existing = await prisma.website.findMany({
+    where: { slug: { not: null } },
+    select: { slug: true, url: true },
+  });
+  for (const row of existing) {
+    if (row.slug) {
+      usedSlugs.add(row.slug);
+      urlToExistingSlug.set(row.url, row.slug);
+    }
+  }
+
+  const records: ToolRecord[] = [];
+  const planFiles: ImportPlanFile[] = [];
+  let totalRows = 0;
+  let totalErrors = 0;
+
+  for (const file of files) {
+    const fileName = file.fileName ?? basename(file.filePath);
+    const fileStats = emptyStats();
+    const recordStart = records.length;
+    let thrownError: string | null = null;
+
+    try {
+      const rows = readXlsx(file.filePath);
+      fileStats.totalRows = rows.length;
+      const built = buildRecords(rows, usedSlugs, urlToExistingSlug, fileStats);
+      records.push(...built);
+    } catch (error) {
+      thrownError = redactPotentialSecrets(
+        error instanceof Error ? error.message : "Unknown error"
+      );
+    }
+
+    const rowErrors = fileStats.skippedRows.map(
+      (skip) => `第 ${skip.row} 行 (${skip.name}): ${skip.reason}`
+    );
+    if (thrownError) rowErrors.unshift(`文件级错误: ${thrownError}`);
+    const errorCount = fileStats.skippedRows.length + (thrownError ? 1 : 0);
+
+    planFiles.push({
+      filePath: file.filePath,
+      fileName,
+      rowCount: fileStats.totalRows,
+      validCount: fileStats.valid,
+      errorCount,
+      errorLog: rowErrors.length ? rowErrors.join("\n").slice(0, ERROR_LOG_LIMIT) : null,
+      level1: records[recordStart]?.level1 ?? null,
+      level2: records[recordStart]?.level2 ?? null,
+      recordStart,
+      recordCount: records.length - recordStart,
+    });
+    totalRows += fileStats.totalRows;
+    totalErrors += errorCount;
+  }
+
+  return { records, files: planFiles, totalRows, totalValid: records.length, totalErrors };
+}
+
+// 导入单条记录（分块任务用）：复用 importRecords 的全部保护逻辑
+// （approved / human_reviewed 永不覆盖、overwrite 语义、分类与标签缓存）
+export async function importSingleRecord(
+  prisma: PrismaClient,
+  record: ToolRecord,
+  options: ImportRecordsOptions
+): Promise<{ outcome: "imported" | "skipped" }> {
+  const result = await importRecords(
+    prisma,
+    [record],
+    new Map<string, number>(),
+    new Map<string, number>(),
+    options
+  );
+  return {
+    outcome: result.inserted + result.updated > 0 ? "imported" : "skipped",
+  };
+}
+
 export async function runImport(
   options: RunImportOptions
 ): Promise<RunImportResult> {

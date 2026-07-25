@@ -2,6 +2,12 @@ import { Prisma } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 import { bulkMarkReviewed, bulkPublish, BULK_LIMIT_MAX } from "@/lib/website/tool-review";
+import {
+  buildImportPlan,
+  importSingleRecord,
+  type ImportFileInput,
+} from "@/lib/website/tool-import";
+import { clearClaimedUpload } from "@/lib/website/import-upload";
 
 /**
  * 通用后台批量任务：长操作异步化（第一版无外部队列）。
@@ -18,9 +24,9 @@ import { bulkMarkReviewed, bulkPublish, BULK_LIMIT_MAX } from "@/lib/website/too
 
 export const CHUNK_SIZE = 5;
 
-export type BulkJobType = "apply_and_review" | "publish";
+export type BulkJobType = "apply_and_review" | "publish" | "import_excel";
 
-const JOB_TYPES: BulkJobType[] = ["apply_and_review", "publish"];
+const JOB_TYPES: BulkJobType[] = ["apply_and_review", "publish", "import_excel"];
 
 export function isBulkJobType(value: string): value is BulkJobType {
   return (JOB_TYPES as string[]).includes(value);
@@ -53,6 +59,92 @@ export async function createBulkJob(
     data: ids.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
   });
   return { ok: true, jobId: job.id, total: ids.length };
+}
+
+// ---------------------------------------------------------------------------
+// Excel 导入任务：创建
+// ---------------------------------------------------------------------------
+
+// 导入按行分块执行，不存在单请求超时问题，因此行数上限比 websiteIds 批量宽松
+export const IMPORT_JOB_MAX_ROWS = 2000;
+
+export type CreateImportJobInput = {
+  files: ImportFileInput[];
+  overwrite: boolean;
+  batchName?: string | null;
+  previewToken: string;
+};
+
+export async function createImportJob(
+  input: CreateImportJobInput
+): Promise<
+  | { ok: true; jobId: number; batchId: number; total: number; skippedRows: number }
+  | { ok: false; message: string }
+> {
+  const plan = await buildImportPlan(prisma, input.files);
+  if (!plan.records.length) {
+    return { ok: false, message: "没有可导入的有效行" };
+  }
+  if (plan.records.length > IMPORT_JOB_MAX_ROWS) {
+    return {
+      ok: false,
+      message: `单次最多导入 ${IMPORT_JOB_MAX_ROWS} 行，请拆分文件`,
+    };
+  }
+
+  const batch = await prisma.toolImportBatch.create({
+    data: {
+      name: input.batchName ?? null,
+      source_dir: "admin-upload",
+      file_count: plan.files.length,
+      row_count: plan.totalRows,
+      error_count: plan.totalErrors,
+    },
+  });
+  // 文件行先落库（导入过程中可见），计数在任务收尾时回填
+  await prisma.toolImportFile.createMany({
+    data: plan.files.map((file) => ({
+      batch_id: batch.id,
+      file_path: file.filePath,
+      file_name: file.fileName,
+      row_count: file.rowCount,
+      error_count: file.errorCount,
+      error_log: file.errorLog,
+      level1_category: file.level1,
+      level2_category: file.level2,
+    })),
+  });
+
+  const job = await prisma.bulkJob.create({
+    data: {
+      type: "import_excel",
+      status: "queued",
+      total_count: plan.records.length,
+      related_import_batch_id: batch.id,
+      params: {
+        files: input.files.map((file) => ({
+          filePath: file.filePath,
+          fileName: file.fileName ?? null,
+        })),
+        overwrite: input.overwrite,
+        previewToken: input.previewToken,
+        batchName: input.batchName ?? null,
+        totalRows: plan.totalRows,
+        skippedRows: plan.totalErrors,
+      } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.bulkJobItem.createMany({
+    data: plan.records.map(() => ({ job_id: job.id })),
+  });
+
+  return {
+    ok: true,
+    jobId: job.id,
+    batchId: batch.id,
+    total: plan.records.length,
+    skippedRows: plan.totalErrors,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +215,40 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     select: { id: true, website_id: true },
   });
 
+  // Excel 导入：item 与解析出的记录按序号一一对应，需先重建 plan
+  let importPlan: Awaited<ReturnType<typeof buildImportPlan>> | null = null;
+  let recordIndexById: Map<number, number> | null = null;
+  if (job.type === "import_excel" && queued.length) {
+    const files = Array.isArray(params.files)
+      ? (params.files as { filePath: string; fileName: string | null }[]).map((f) => ({
+          filePath: f.filePath,
+          fileName: f.fileName ?? undefined,
+        }))
+      : [];
+    importPlan = await buildImportPlan(prisma, files);
+    if (importPlan.records.length !== job.total_count) {
+      // 源文件与创建任务时不一致（被删除/改动），停止并标记失败，避免错位导入
+      await prisma.bulkJob.update({
+        where: { id: jobId },
+        data: {
+          status: "failed",
+          finished_at: new Date(),
+          error: {
+            message: `源文件已变化：解析到 ${importPlan.records.length} 行，任务创建时为 ${job.total_count} 行`,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      const view = await getBulkJob(jobId);
+      return { ok: true, job: view!, processedNow: 0 };
+    }
+    const allItems = await prisma.bulkJobItem.findMany({
+      where: { job_id: jobId },
+      orderBy: { id: "asc" },
+      select: { id: true },
+    });
+    recordIndexById = new Map(allItems.map((item, index) => [item.id, index]));
+  }
+
   let processedNow = 0;
   for (const item of queued) {
     // 原子占用：并发 run-next 时同一条只会被一个请求处理
@@ -135,8 +261,33 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     let itemStatus: "success" | "skipped" | "failed";
     let itemError: string | null = null;
     let itemResult: Prisma.InputJsonValue | undefined;
+    let itemWebsiteId: number | undefined;
     try {
-      if (!item.website_id) {
+      if (job.type === "import_excel") {
+        const index = recordIndexById?.get(item.id);
+        const record = index === undefined ? undefined : importPlan?.records[index];
+        if (!record) {
+          itemStatus = "failed";
+          itemError = "找不到对应的导入记录";
+        } else {
+          const imported = await importSingleRecord(prisma, record, {
+            overwrite: params.overwrite === true,
+            importBatchId: job.related_import_batch_id,
+          });
+          itemStatus = imported.outcome === "imported" ? "success" : "skipped";
+          itemError =
+            imported.outcome === "skipped"
+              ? "已存在且未覆盖，或已发布/已人工审核（受覆盖保护）"
+              : null;
+          itemResult = { name: record.name, slug: record.slug } as Prisma.InputJsonValue;
+          // 关联到实际落库的工具，便于任务详情页跳转
+          const website = await prisma.website.findFirst({
+            where: { OR: [{ slug: record.slug }, { url: record.site }] },
+            select: { id: true },
+          });
+          itemWebsiteId = website?.id;
+        }
+      } else if (!item.website_id) {
         itemStatus = "failed";
         itemError = "缺少 website_id";
       } else {
@@ -156,6 +307,7 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
         status: itemStatus,
         error: itemError,
         ...(itemResult !== undefined ? { result: itemResult } : {}),
+        ...(itemWebsiteId !== undefined ? { website_id: itemWebsiteId } : {}),
       },
     });
     processedNow++;
@@ -195,6 +347,22 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     jobResult = { mediaLocalized, mediaAlreadyCached, mediaFailed };
   }
 
+  // 导入任务收尾：回填 ToolImportBatch / ToolImportFile 计数，并清理临时上传文件
+  if (done && job.type === "import_excel" && job.related_import_batch_id) {
+    await finalizeImportJob(jobId, job.related_import_batch_id, params, {
+      imported: success,
+      skipped,
+      failed,
+    });
+    jobResult = {
+      imported: success,
+      skipped,
+      failed,
+      skippedRows: typeof params.skippedRows === "number" ? params.skippedRows : 0,
+      batchId: job.related_import_batch_id,
+    };
+  }
+
   await prisma.bulkJob.update({
     where: { id: jobId },
     data: {
@@ -214,6 +382,65 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
 
   const view = await getBulkJob(jobId);
   return { ok: true, job: view!, processedNow };
+}
+
+// 导入任务收尾：按文件回填计数、关闭批次、删除临时上传目录
+async function finalizeImportJob(
+  jobId: number,
+  batchId: number,
+  params: Record<string, unknown>,
+  totals: { imported: number; skipped: number; failed: number }
+): Promise<void> {
+  const files = Array.isArray(params.files)
+    ? (params.files as { filePath: string; fileName: string | null }[]).map((f) => ({
+        filePath: f.filePath,
+        fileName: f.fileName ?? undefined,
+      }))
+    : [];
+
+  // 按 item 顺序把结果归属到各文件（每个文件占用连续的记录区间）
+  try {
+    const plan = await buildImportPlan(prisma, files);
+    const items = await prisma.bulkJobItem.findMany({
+      where: { job_id: jobId },
+      orderBy: { id: "asc" },
+      select: { status: true },
+    });
+    for (const file of plan.files) {
+      const slice = items.slice(file.recordStart, file.recordStart + file.recordCount);
+      await prisma.toolImportFile.updateMany({
+        where: { batch_id: batchId, file_name: file.fileName },
+        data: {
+          imported_count: slice.filter((i) => i.status === "success").length,
+          skipped_count: slice.filter((i) => i.status === "skipped").length,
+        },
+      });
+    }
+  } catch {
+    // 源文件此时可能已不可读；批次总计仍按 job 统计写入，不阻塞收尾
+  }
+
+  await prisma.toolImportBatch.update({
+    where: { id: batchId },
+    data: {
+      imported_count: totals.imported,
+      skipped_count: totals.skipped + totals.failed,
+      finished_at: new Date(),
+    },
+  });
+
+  const previewToken =
+    typeof params.previewToken === "string" ? params.previewToken : "";
+  if (previewToken) {
+    try {
+      clearClaimedUpload(previewToken);
+    } catch (error) {
+      console.error(
+        "Cleanup after import job failed:",
+        error instanceof Error ? error.message : "unknown"
+      );
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
