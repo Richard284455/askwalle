@@ -33,6 +33,7 @@ export const JOB_STATUS_COLORS: Record<string, string> = {
   completed: "text-green-600",
   completed_with_errors: "text-orange-500",
   failed: "text-red-500",
+  paused: "text-yellow-600",
   canceled: "text-muted-foreground",
 };
 

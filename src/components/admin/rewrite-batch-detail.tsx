@@ -211,8 +211,9 @@ export function RewriteBatchDetailView({
   };
 
   const hasQcPassed = batch.qcPassedCount > 0 || statusCounts.saved > 0;
+  // paused（熔断暂停）也算未结束：批次仍在这个任务手里，不允许再建新任务
   const jobRunning = Boolean(
-    rewriteJob && ["queued", "running"].includes(rewriteJob.status)
+    rewriteJob && ["queued", "running", "paused"].includes(rewriteJob.status)
   );
 
   return (
@@ -268,9 +269,13 @@ export function RewriteBatchDetailView({
       {rewriteJob && (
         <div className="flex flex-wrap items-center gap-3 rounded-xl border border-primary/30 bg-primary/5 p-4 text-sm">
           <span className="text-muted-foreground">
-            本批次{jobRunning ? "有正在执行的" : "最近一次"}后台改写任务 #{rewriteJob.id}
+            本批次{jobRunning ? "有未结束的" : "最近一次"}后台改写任务 #{rewriteJob.id}
             （{rewriteJob.status}）
-            {jobRunning ? "，需保持任务页打开以继续推进。" : ""}
+            {rewriteJob.status === "paused"
+              ? "，已自动暂停，需在任务页确认后继续。"
+              : jobRunning
+              ? "，服务端会自动推进，无需守着页面。"
+              : ""}
           </span>
           <Button variant={jobRunning ? "default" : "outline"} size="sm" asChild>
             <Link href={`/admin/jobs/${rewriteJob.id}`}>查看任务进度</Link>
@@ -480,7 +485,8 @@ export function RewriteBatchDetailView({
             ) : pendingAction?.key === "submit" && batch.providerMode === "direct" ? (
               <p>
                 将为本批次待处理条目创建<strong>后台改写任务</strong>并跳转进度页，
-                逐条调用 AI（每次 1 条，可随时看到进度）。任务页关闭会暂停，重新打开可继续。
+                逐条调用 AI（每次 1 条）。服务端会自动推进，<strong>关闭页面也会继续跑</strong>；
+                连续失败会自动暂停，避免无人看管时白烧额度。
               </p>
             ) : (
               <p>将对本批次的 <strong>{batch.totalCount}</strong> 条工具执行「{pendingAction?.title}」。</p>

@@ -27,31 +27,40 @@ const ITEM_STATUS_COLORS: Record<string, string> = {
 };
 
 const TERMINAL = ["completed", "completed_with_errors", "failed", "canceled"];
+// 暂停：服务端 worker 不再自动推进，需人工确认后继续
+const PAUSED = "paused";
 
 export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
   const [job, setJob] = useState(initialJob);
   const [driveError, setDriveError] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
   const drivingRef = useRef(false);
 
-  // 自驱动：任务未完成时循环调用 run-next（每次服务端最多处理 5 条），
-  // 请求间隔 ~800ms；完成后停止。页面关闭任务保持在库中，重新打开可继续。
+  const runChunk = async (): Promise<boolean> => {
+    const data = await fetch(`/api/admin/jobs/${job.id}/run-next`, {
+      method: "POST",
+    }).then((r) => r.json());
+    if (data?.code === 200) {
+      setJob(data.data.job);
+      setDriveError(null);
+      return true;
+    }
+    setDriveError(data?.message || "执行分块失败，将自动重试");
+    return false;
+  };
+
+  // 服务端 worker 已经在后台推进任务（关页面也继续）。页面这里的循环只是
+  // 「看着的时候更快 + worker 未启用时的兜底」：条目领取是原子的，不会重复执行。
+  // 暂停（熔断）状态不自动推进，必须人工点「继续执行」。
   useEffect(() => {
-    if (TERMINAL.includes(job.status)) return;
+    if (TERMINAL.includes(job.status) || job.status === PAUSED) return;
     let cancelled = false;
 
     const tick = async () => {
       if (cancelled || drivingRef.current) return;
       drivingRef.current = true;
       try {
-        const data = await fetch(`/api/admin/jobs/${job.id}/run-next`, {
-          method: "POST",
-        }).then((r) => r.json());
-        if (!cancelled && data?.code === 200) {
-          setJob(data.data.job);
-          setDriveError(null);
-        } else if (!cancelled) {
-          setDriveError(data?.message || "执行分块失败，将自动重试");
-        }
+        await runChunk();
       } catch {
         if (!cancelled) setDriveError("网络异常，将自动重试");
       } finally {
@@ -66,12 +75,25 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
       clearInterval(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job.id, TERMINAL.includes(job.status)]);
+  }, [job.id, job.status]);
+
+  const handleResume = async () => {
+    if (resuming) return;
+    setResuming(true);
+    try {
+      await runChunk();
+    } catch {
+      setDriveError("网络异常，请重试");
+    } finally {
+      setResuming(false);
+    }
+  };
 
   const percent = job.totalCount
     ? Math.round((job.processedCount / job.totalCount) * 100)
     : 0;
   const done = TERMINAL.includes(job.status);
+  const paused = job.status === PAUSED;
   const result = (job.result ?? null) as Record<string, number> | null;
   const mediaStats = job.type === "publish" ? result : null;
   const rewriteStats = job.type === "rewrite_direct" ? result : null;
@@ -135,9 +157,10 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
             style={{ width: `${percent}%` }}
           />
         </div>
-        {!done && (
+        {!done && !paused && (
           <p className="text-xs text-muted-foreground">
-            正在分块执行（每块最多 5 条），页面自动推进并刷新，无需等待整体完成……
+            正在分块执行，服务端后台会自动推进 —— <strong>关闭本页任务也会继续跑</strong>，
+            回来打开即可看到最新进度。
             {driveError ? ` ${driveError}` : ""}
           </p>
         )}
@@ -154,10 +177,22 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
             AI 草稿，不会自动发布）
           </p>
         )}
-        {jobError?.message && (
+        {jobError?.message && !paused && (
           <p className="text-xs text-red-500">任务中断：{jobError.message}</p>
         )}
       </div>
+
+      {/* 熔断暂停：需人工确认后继续 */}
+      {paused && (
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-yellow-500/40 bg-yellow-500/10 p-4 text-sm">
+          <span className="text-yellow-700 dark:text-yellow-300">
+            任务已自动暂停：{jobError?.message ?? "连续失败"}
+          </span>
+          <Button size="sm" onClick={handleResume} disabled={resuming}>
+            {resuming ? "继续中..." : "继续执行"}
+          </Button>
+        </div>
+      )}
 
       {/* 完成后下一步 */}
       {done && (

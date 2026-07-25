@@ -29,6 +29,14 @@ import {
  * - publish 仍要求 pending + human_reviewed + 媒体本地化通过
  */
 
+// 叫醒后台 worker（动态 import 避免与 job-worker 形成静态循环依赖）。
+// worker 未启动 / 未启用时静默忽略，任务仍可由任务页驱动。
+function nudgeJobWorker(): void {
+  void import("@/lib/website/job-worker")
+    .then((m) => m.requestJobWorkerTick())
+    .catch(() => {});
+}
+
 export const CHUNK_SIZE = 5;
 
 // 直连 AI 改写每条要等 provider 返回（可达数十秒），每块只跑 1 条：
@@ -82,6 +90,7 @@ export async function createBulkJob(
   await prisma.bulkJobItem.createMany({
     data: ids.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
   });
+  nudgeJobWorker();
   return { ok: true, jobId: job.id, total: ids.length };
 }
 
@@ -161,6 +170,7 @@ export async function createImportJob(
   await prisma.bulkJobItem.createMany({
     data: plan.records.map(() => ({ job_id: job.id })),
   });
+  nudgeJobWorker();
 
   return {
     ok: true,
@@ -216,6 +226,7 @@ export async function createRewriteJob(
     data: websiteIds.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
   });
   await markDirectRewriteStarted(rewriteBatchId, websiteIds.length);
+  nudgeJobWorker();
 
   return { ok: true, jobId: job.id, total: websiteIds.length };
 }
@@ -256,6 +267,17 @@ async function runSingleItem(
   return { status: "skipped", error: reason };
 }
 
+// 终态：不再推进
+export const TERMINAL_JOB_STATUSES = [
+  "completed",
+  "completed_with_errors",
+  "failed",
+  "canceled",
+];
+
+// 后台 worker 会自动推进的状态（paused 需要人工在任务页点「继续执行」）
+export const DRIVABLE_JOB_STATUSES = ["queued", "running"];
+
 export type RunNextOutcome =
   | { ok: true; job: BulkJobView; processedNow: number }
   | { ok: false; message: string };
@@ -264,15 +286,20 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
   const job = await prisma.bulkJob.findUnique({ where: { id: jobId } });
   if (!job) return { ok: false, message: "任务不存在" };
   if (!isBulkJobType(job.type)) return { ok: false, message: `不支持的任务类型: ${job.type}` };
-  if (["completed", "completed_with_errors", "failed", "canceled"].includes(job.status)) {
+  if (TERMINAL_JOB_STATUSES.includes(job.status)) {
     const view = await getBulkJob(jobId);
     return { ok: true, job: view!, processedNow: 0 };
   }
 
-  if (job.status === "queued") {
+  // queued → running；paused 说明是人工点了「继续执行」，清掉暂停原因
+  if (job.status === "queued" || job.status === "paused") {
     await prisma.bulkJob.update({
       where: { id: jobId },
-      data: { status: "running", started_at: job.started_at ?? new Date() },
+      data: {
+        status: "running",
+        started_at: job.started_at ?? new Date(),
+        ...(job.status === "paused" ? { error: Prisma.DbNull } : {}),
+      },
     });
   }
 
@@ -635,6 +662,62 @@ export async function getBulkJob(jobId: number): Promise<BulkJobView | null> {
       error: item.error,
     })),
   };
+}
+
+// ---------------------------------------------------------------------------
+// 无人值守支持：worker 调度用的查询与状态操作
+// ---------------------------------------------------------------------------
+
+// 取最早一个可推进的任务（FIFO，一次只驱动一个，避免并发打满 provider / DB）
+export async function findNextDrivableJob(): Promise<{
+  id: number;
+  type: string;
+  successCount: number;
+  skippedCount: number;
+  failedCount: number;
+} | null> {
+  const job = await prisma.bulkJob.findFirst({
+    where: { status: { in: DRIVABLE_JOB_STATUSES } },
+    orderBy: { id: "asc" },
+    select: {
+      id: true,
+      type: true,
+      success_count: true,
+      skipped_count: true,
+      failed_count: true,
+    },
+  });
+  if (!job) return null;
+  return {
+    id: job.id,
+    type: job.type,
+    successCount: job.success_count,
+    skippedCount: job.skipped_count,
+    failedCount: job.failed_count,
+  };
+}
+
+// 回收僵死条目：进程在处理中被杀会留下 running 的 item，任务将永远无法收尾。
+// 超过阈值未更新的 running 条目放回 queued，由下一轮重新领取。
+export async function reclaimStalledItems(staleMs: number): Promise<number> {
+  const threshold = new Date(Date.now() - staleMs);
+  const reclaimed = await prisma.bulkJobItem.updateMany({
+    where: {
+      status: "running",
+      updated_at: { lt: threshold },
+      job: { status: { notIn: TERMINAL_JOB_STATUSES } },
+    },
+    data: { status: "queued", error: null },
+  });
+  return reclaimed.count;
+}
+
+// 熔断：连续失败时暂停任务（非终态，人工在任务页点「继续执行」可恢复）
+export async function pauseJob(jobId: number, message: string): Promise<void> {
+  await prisma.bulkJob.updateMany({
+    where: { id: jobId, status: { notIn: TERMINAL_JOB_STATUSES } },
+    data: { status: "paused", error: { message } as Prisma.InputJsonValue },
+  });
 }
 
 // 改写批次页用：该批次最近一次后台改写任务（用于展示进度入口）
