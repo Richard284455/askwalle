@@ -24,7 +24,11 @@ export async function POST(request: Request) {
       ? body.websiteIds.filter((id: unknown) => typeof id === "number")
       : [];
 
-    const result = await bulkMarkReviewed(websiteIds, reviewNotes);
+    // recheckQc 缺省为 false：qc_status 在回溯复检之后是准的，逐条重跑闸门只在
+    // 怀疑它漂移时才需要
+    const result = await bulkMarkReviewed(websiteIds, reviewNotes, {
+      recheckQc: body?.recheckQc === true,
+    });
     if (!result.ok) {
       return NextResponse.json(AjaxResponse.fail(result.message), {
         status: 400,

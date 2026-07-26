@@ -97,6 +97,8 @@ type BulkOp = {
   variant?: "default" | "outline";
   danger?: boolean;
   needsNotes?: boolean;
+  // 支持「提交前用当前闸门复检草稿」的开关（默认不勾）
+  supportsRecheck?: boolean;
   extra?: Record<string, unknown>;
   risk: string;
 };
@@ -109,6 +111,7 @@ const BULK_OPS: BulkOp[] = [
     asJob: true,
     variant: "default",
     needsNotes: true,
+    supportsRecheck: true,
     risk: "对 draft_generated + QC 通过的工具：先应用草稿到公开字段，再标记人工已审核（仍 pending，不发布）。将创建后台任务分块执行并跳转进度页。",
   },
   {
@@ -116,6 +119,7 @@ const BULK_OPS: BulkOp[] = [
     label: "Apply only（高级）",
     endpoint: "apply-drafts",
     variant: "outline",
+    supportsRecheck: true,
     risk: "只把草稿应用到公开字段，不标记审核、不发布。",
   },
   {
@@ -184,6 +188,9 @@ export function ToolReviewClient({
   const [preview, setPreview] = useState<ReviewPreview | null>(null);
   const [pendingOp, setPendingOp] = useState<BulkOp | null>(null);
   const [reviewNotes, setReviewNotes] = useState("");
+  // 默认不复检：列表里的 QC 状态在每次回溯复检之后就是准的，
+  // 逐条重跑闸门只在怀疑它漂移时才需要（几百条会明显变慢）
+  const [recheckQc, setRecheckQc] = useState(false);
   const [result, setResult] = useState<BulkResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [mediaPrecheck, setMediaPrecheck] = useState<MediaPrecheck | null>(null);
@@ -289,6 +296,7 @@ export function ToolReviewClient({
       body: JSON.stringify({
         websiteIds,
         ...(op.needsNotes ? { reviewNotes } : {}),
+        ...(op.supportsRecheck ? { recheckQc } : {}),
         ...(op.extra ?? {}),
       }),
     }).then((r) => r.json());
@@ -726,6 +734,26 @@ export function ToolReviewClient({
                   <p className="text-muted-foreground">预检中...</p>
                 )}
               </div>
+            )}
+            {pendingOp?.supportsRecheck && (
+              <label className="flex cursor-pointer items-start gap-2 rounded-md border border-border/40 bg-background/30 p-3 text-xs">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={recheckQc}
+                  onChange={(e) => setRecheckQc(e.target.checked)}
+                />
+                <span className="space-y-1">
+                  <span className="block font-medium text-foreground/80">
+                    提交前用当前 QC 规则复检草稿
+                  </span>
+                  <span className="block text-muted-foreground">
+                    默认不复检，直接采用列表里的 QC 状态。勾选后会逐条拿当前草稿重跑一遍相似度等
+                    校验，不通过的跳过 —— 适合 QC 规则刚改过、列表状态可能已经过时的时候，
+                    几百条会明显变慢。
+                  </span>
+                </span>
+              </label>
             )}
             {pendingOp?.needsNotes && (
               <Input

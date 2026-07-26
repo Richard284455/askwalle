@@ -25,6 +25,8 @@ export async function POST(request: Request) {
     }
     const created = await createBulkJob("apply_and_review", websiteIds, {
       reviewNotes,
+      // 随任务存进 params，执行每一条时沿用同一个开关
+      recheckQc: body?.recheckQc === true,
     });
     if (!created.ok) {
       return NextResponse.json(AjaxResponse.fail(created.message), { status: 400 });

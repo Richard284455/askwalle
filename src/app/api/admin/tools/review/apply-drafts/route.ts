@@ -15,7 +15,9 @@ export async function POST(request: Request) {
       ? body.websiteIds.filter((id: unknown) => typeof id === "number")
       : [];
 
-    const result = await bulkApplyDrafts(websiteIds);
+    const result = await bulkApplyDrafts(websiteIds, {
+      recheckQc: body?.recheckQc === true,
+    });
     if (!result.ok) {
       return NextResponse.json(AjaxResponse.fail(result.message), {
         status: 400,

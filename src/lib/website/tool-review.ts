@@ -434,6 +434,15 @@ type QcRecheckSubject = Prisma.WebsiteGetPayload<{
 export type CurrentQcVerdict = { ok: true } | { ok: false; reason: string };
 
 /**
+ * 复检开关。默认**不**复检 —— 落库的 qc_status 在每次回溯复检之后是准的，
+ * 而复检要对每条草稿跑词级 DP，100 条的批量会明显变慢。闸门改动之后先跑一次
+ * 回溯复检把 qc_status 刷新，日常批量就不必每次重算。
+ *
+ * 什么时候该打开：闸门刚改过、还没跑回溯复检，或者不确定 qc_status 是否已经漂移。
+ */
+export type ReviewOptions = { recheckQc?: boolean };
+
+/**
  * 用当前生产闸门判定一条工具的草稿。
  *
  * 没有草稿时返回通过 —— 这条路径是「人工直接编辑公开字段后标记审核」，本来就
@@ -475,7 +484,8 @@ export async function currentQcVerdicts(
 
 // A. 批量应用草稿到公开字段（复用单条 applyRewriteDraft；不改 status）
 export async function bulkApplyDrafts(
-  websiteIds: number[]
+  websiteIds: number[],
+  options: ReviewOptions = {}
 ): Promise<{ ok: true; result: BulkResult } | { ok: false; message: string }> {
   const check = validateBulkInput(websiteIds);
   if (!check.ok) return check;
@@ -508,12 +518,14 @@ export async function bulkApplyDrafts(
       result.failedReasons.push({ websiteId, reason: "最近一次 QC 未通过" });
       continue;
     }
-    // 历史 qc_status 只说明「当时通过」；闸门改过之后必须拿当前草稿重判
-    const current = currentQcVerdictFor(subject);
-    if (!current.ok) {
-      result.skipped++;
-      result.failedReasons.push({ websiteId, reason: current.reason });
-      continue;
+    // 历史 qc_status 只说明「当时通过」。开启复检时拿当前草稿再判一次
+    if (options.recheckQc) {
+      const current = currentQcVerdictFor(subject);
+      if (!current.ok) {
+        result.skipped++;
+        result.failedReasons.push({ websiteId, reason: current.reason });
+        continue;
+      }
     }
     const applied = await applyRewriteDraft(websiteId);
     if (applied.ok) {
@@ -530,7 +542,8 @@ export async function bulkApplyDrafts(
 // B. 批量标记人工已审核（先自动 apply 再 mark；qc_failed / raw_imported 一律拒绝）
 export async function bulkMarkReviewed(
   websiteIds: number[],
-  reviewNotes: string
+  reviewNotes: string,
+  options: ReviewOptions = {}
 ): Promise<{ ok: true; result: BulkResult } | { ok: false; message: string }> {
   const check = validateBulkInput(websiteIds);
   if (!check.ok) return check;
@@ -569,12 +582,14 @@ export async function bulkMarkReviewed(
       result.failedReasons.push({ websiteId, reason: "QC 未通过，不能标记审核" });
       continue;
     }
-    // 同 apply：不信历史 qc_status，用当前闸门重判当前草稿
-    const current = currentQcVerdictFor(subject);
-    if (!current.ok) {
-      result.skipped++;
-      result.failedReasons.push({ websiteId, reason: current.reason });
-      continue;
+    // 同 apply：开启复检时用当前闸门重判当前草稿
+    if (options.recheckQc) {
+      const current = currentQcVerdictFor(subject);
+      if (!current.ok) {
+        result.skipped++;
+        result.failedReasons.push({ websiteId, reason: current.reason });
+        continue;
+      }
     }
 
     // 尚未 apply 的草稿先 apply（applyRewriteDraft 会重跑结构校验，兜底 HTML 等）

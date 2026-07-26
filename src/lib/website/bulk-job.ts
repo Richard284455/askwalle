@@ -92,12 +92,12 @@ export async function createBulkJob(
     return { ok: false, message: `单次最多 ${BULK_LIMIT_MAX} 条，请分批执行` };
   }
 
-  // 审核类任务在建任务时先用当前闸门筛一遍，不合格的不进队列。
+  // 开了复检的审核任务，在建任务时先用当前闸门筛一遍，不合格的不进队列。
   // 执行时 bulkMarkReviewed 还会再判一次 —— 这里挡在前面只是让用户当场看到
   // 「N 条因当前 QC 不通过未入队」，而不是等任务跑完才发现全被 skip。
   const skipped: { websiteId: number; reason: string }[] = [];
   let eligible = ids;
-  if (type === "apply_and_review") {
+  if (type === "apply_and_review" && params.recheckQc === true) {
     const verdicts = await currentQcVerdicts(ids);
     eligible = ids.filter((id) => {
       const verdict = verdicts.get(id);
@@ -347,9 +347,11 @@ async function runSingleItem(
   params: Record<string, unknown>
 ): Promise<{ status: "success" | "skipped" | "failed"; error?: string; result?: Prisma.InputJsonValue }> {
   const reviewNotes = typeof params.reviewNotes === "string" ? params.reviewNotes : "";
+  // 复检开关随任务参数走：建任务时勾了，执行每一条时也照样复检
+  const recheckQc = params.recheckQc === true;
   const outcome =
     type === "apply_and_review"
-      ? await bulkMarkReviewed([websiteId], reviewNotes)
+      ? await bulkMarkReviewed([websiteId], reviewNotes, { recheckQc })
       : await bulkPublish([websiteId]);
 
   if (!outcome.ok) return { status: "failed", error: outcome.message };
