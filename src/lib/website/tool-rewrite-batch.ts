@@ -1423,9 +1423,58 @@ function splitSentences(text: string): string[] {
 //
 // 阈值取 15 词：实测中位数 9 词、90 分位 14 词（同领域词汇天然重合，属正常），
 // 15 词以上的连续雷同已无法用巧合解释。313 条历史草稿里 6.7% 会被这条挡下。
+//
+// 比对必须**逐单元**做，不能把字段拼成一大段再比：拼接会让连续词串跨越两个数组
+// 元素的边界，把「上一条尾巴 7 词 + 下一条开头 8 词」这种正常重合算成 15 词抄袭。
 // ---------------------------------------------------------------------------
 
 const MAX_COPIED_RUN_WORDS = Number(process.env.REWRITE_MAX_COPIED_RUN) || 15;
+
+// 参与相似度检测的最小文本单元。数组逐条成单元，绝不 join。
+//
+// FAQ **问句**两侧都不参与：「Does X support multiple languages?」这类问题本来
+// 就只有一种自然问法，把它算作抄袭会误杀大量草稿，还逼模型把问句改得别扭。
+// 答案是散文，照抄就是照抄，仍然全查。
+export type SimilarityUnit = { field: string; text: string };
+
+export function draftSimilarityUnits(draft: {
+  description: string;
+  what: string;
+  how: string;
+  features: string[];
+  useCases: string[];
+  faqs: { answer: string }[];
+}): SimilarityUnit[] {
+  return [
+    { field: "description", text: draft.description },
+    { field: "what", text: draft.what },
+    { field: "how", text: draft.how },
+    ...draft.features.map((text, i) => ({ field: `features[${i}]`, text })),
+    ...draft.useCases.map((text, i) => ({ field: `useCases[${i}]`, text })),
+    ...draft.faqs.map((faq, i) => ({
+      field: `faqs[${i}].answer`,
+      text: faq.answer,
+    })),
+  ].filter((unit) => Boolean(unit.text));
+}
+
+export function rawSimilarityUnits(
+  raw: RawImportedContent & { description: string }
+): SimilarityUnit[] {
+  return [
+    { field: "description", text: raw.description },
+    { field: "what", text: raw.what },
+    { field: "how", text: raw.how },
+    // featuresText 在原文里本来就是一整段文本（不是数组），保持整段能查到
+    // 「草稿把连续两条特性合并复述」的情况
+    { field: "featuresText", text: raw.featuresText },
+    ...raw.useCases.map((text, i) => ({ field: `useCases[${i}]`, text })),
+    ...raw.faqs.map((faq, i) => ({
+      field: `faqs[${i}].answer`,
+      text: faq.answer ?? "",
+    })),
+  ].filter((unit) => Boolean(unit.text));
+}
 
 function normalizeWords(text: string): string[] {
   return text
@@ -1457,6 +1506,53 @@ function longestCommonWordRun(
     prev = cur;
   }
   return { length: best, text: a.slice(bestEnd - best, bestEnd).join(" ") };
+}
+
+// 逐单元 × 逐单元求最长连续雷同。导出给回溯审计用 —— 审计如果自己复写一套
+// 归一化，报出来的词数就会和线上闸门对不上（曾经因此把 14 词报成 46 词）。
+export function longestCopiedRun(
+  draftUnits: SimilarityUnit[],
+  rawUnits: SimilarityUnit[]
+): { length: number; text: string; draftField: string; rawField: string } {
+  const rawWords = rawUnits.map((unit) => ({
+    field: unit.field,
+    words: normalizeWords(unit.text),
+  }));
+  let best = { length: 0, text: "", draftField: "", rawField: "" };
+  for (const unit of draftUnits) {
+    const words = normalizeWords(unit.text);
+    if (!words.length) continue;
+    for (const raw of rawWords) {
+      if (!raw.words.length) continue;
+      const run = longestCommonWordRun(words, raw.words);
+      if (run.length > best.length) {
+        best = {
+          length: run.length,
+          text: run.text,
+          draftField: unit.field,
+          rawField: raw.field,
+        };
+      }
+    }
+  }
+  return best;
+}
+
+// 原样搬运整句：句子也必须在单元内切，否则两条无标点结尾的 useCase 拼在一起
+// 会被切出一个跨条目的假句子。
+export function findCopiedSentence(
+  draftUnits: SimilarityUnit[],
+  rawUnits: SimilarityUnit[]
+): { sentence: string; draftField: string; rawField: string } | null {
+  for (const raw of rawUnits) {
+    for (const sentence of splitSentences(raw.text)) {
+      const hit = draftUnits.find((unit) => unit.text.includes(sentence));
+      if (hit) {
+        return { sentence, draftField: hit.field, rawField: raw.field };
+      }
+    }
+  }
+  return null;
 }
 
 export function validateRewriteDraft(
@@ -1517,37 +1613,31 @@ export function validateRewriteDraft(
   if (allText.includes("```")) errors.push("包含 Markdown 代码块");
   if (/toolify/i.test(allText)) errors.push("包含 Toolify 字样");
 
-  // 用于查重的原文范围：在 description/what/how 之外补上 featuresText / useCases /
-  // FAQ 答案 —— 实测最严重的照抄就发生在这些列表里（最长一处 39 个词逐词相同）。
-  //
-  // 刻意排除 FAQ 的**问句**：「Does X support multiple languages?」这种问题本来就
-  // 只有一种自然问法，把它算作抄袭会让 313 条历史草稿里 60% 被误杀，且逼着模型
-  // 把问句改得更别扭。答案是散文，仍然要查。
-  const rawFull = [
-    raw.description,
-    raw.what,
-    raw.how,
-    raw.featuresText,
-    ...raw.useCases,
-    ...raw.faqs.map((faq) => faq.answer ?? ""),
-  ]
-    .filter(Boolean)
-    .join("\n");
+  // 查重的两侧都按「单元」切开：数组逐条、FAQ 只取答案。两条规则共用同一套单元，
+  // 保证「整句复制」和「连续雷同」的口径一致。
+  const draftUnits = draftSimilarityUnits({
+    description,
+    what,
+    how,
+    features,
+    useCases,
+    faqs,
+  });
+  const rawUnits = rawSimilarityUnits(raw);
 
   // 1) 原样搬运整句
-  const rawSentences = splitSentences(rawFull);
-  for (const sentence of rawSentences) {
-    if (allText.includes(sentence)) {
-      errors.push(`复制了原文句子: "${sentence.slice(0, 50)}…"`);
-      break;
-    }
+  const copied = findCopiedSentence(draftUnits, rawUnits);
+  if (copied) {
+    errors.push(
+      `复制了原文句子（${copied.draftField} ← raw.${copied.rawField}）: "${copied.sentence.slice(0, 50)}…"`
+    );
   }
 
   // 2) 长段连续雷同（不依赖句子边界，能抓住列表被逐词复述的情况）
-  const run = longestCommonWordRun(normalizeWords(allText), normalizeWords(rawFull));
+  const run = longestCopiedRun(draftUnits, rawUnits);
   if (run.length >= MAX_COPIED_RUN_WORDS) {
     errors.push(
-      `与原文连续雷同 ${run.length} 个词（上限 ${MAX_COPIED_RUN_WORDS}）: "${run.text.slice(0, 60)}…"`
+      `与原文连续雷同 ${run.length} 个词（上限 ${MAX_COPIED_RUN_WORDS}，${run.draftField} ← raw.${run.rawField}）: "${run.text.slice(0, 60)}…"`
     );
   }
 
