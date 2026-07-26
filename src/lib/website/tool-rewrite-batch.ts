@@ -15,6 +15,7 @@ import {
 // ---------------------------------------------------------------------------
 
 import {
+  checkProviderModelHealth,
   getProviderSetting,
   getProviderSettings,
   isProviderKey,
@@ -532,7 +533,7 @@ export async function retryFailedBatch(
     include: {
       items: {
         where: { status: { in: RETRYABLE_ITEM_STATUSES } },
-        select: { website_id: true },
+        select: { website_id: true, attempt_count: true },
       },
     },
   });
@@ -583,11 +584,22 @@ export async function retryFailedBatch(
       total_count: eligible.length,
     },
   });
+  // 尝试次数继承到新条目：否则连环点 Retry Failed 就能绕过 MAX_ITEM_ATTEMPTS，
+  // 每一轮都是真实的 AI 调用。走向导新建批次属于人工重新发起，那里从 0 计数。
+  const attemptsByWebsite = new Map<number, number>();
+  for (const item of source.items) {
+    attemptsByWebsite.set(
+      item.website_id,
+      Math.max(attemptsByWebsite.get(item.website_id) ?? 0, item.attempt_count)
+    );
+  }
+
   await prisma.toolRewriteItem.createMany({
     data: eligible.map((website) => ({
       batch_id: batch.id,
       website_id: website.id,
       custom_id: `tool-${website.id}-batch-${batch.id}`,
+      attempt_count: attemptsByWebsite.get(website.id) ?? 0,
     })),
   });
 
@@ -822,7 +834,14 @@ async function providerFetch(
   } catch {
     body = text;
   }
-  return { status: response.status, ok: response.ok, body, text };
+  return {
+    status: response.status,
+    ok: response.ok,
+    body,
+    text,
+    // 重试要读 Retry-After
+    retryAfter: response.headers.get("retry-after"),
+  };
 }
 
 function apiErrorMessage(body: unknown, fallback: string): string {
@@ -858,6 +877,9 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
   if (batch.status === "imported") {
     return { ok: false, message: "批次已完成，请新建批次" };
   }
+
+  const health = await checkProviderModelHealth(provider, batch.model);
+  if (!health.ok) return { ok: false, message: health.message };
 
   // 直连模式：同步逐条改写并完成 QC 入库
   // （后台任务模式见 prepareDirectRewrite / runDirectRewriteItem）
@@ -929,8 +951,105 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
 // 共用同一套单条实现：prepare → 逐条 runDirectRewriteItem → finalize。
 // ---------------------------------------------------------------------------
 
-// 单条 AI 请求超时上限：避免 provider 挂起导致分块请求永不返回
-const DIRECT_REWRITE_TIMEOUT_MS = 180_000;
+// 单条 AI 请求超时上限：避免 provider 挂起导致分块请求永不返回。
+// 可用 REWRITE_TIMEOUT_MS 覆盖（故障注入测试需要秒级超时；生产保持 180s）
+const DIRECT_REWRITE_TIMEOUT_MS =
+  Number(process.env.REWRITE_TIMEOUT_MS) || 180_000;
+
+// ---------------------------------------------------------------------------
+// 重试策略
+//
+// 分两层，各管各的：
+// - 层一（本文件内的 chatCompletionWithRetry）：一次执行内针对**瞬时故障**重试。
+//   超时、网络中断、429、5xx 属于瞬时；400/401/403/404（模型不存在、key 无效、
+//   参数错误）重试多少次都是一样的结果，只会白烧配额，必须立即失败。
+// - 层二（MAX_ITEM_ATTEMPTS）：跨任务/跨 Retry Failed 的执行次数上限。没有它，
+//   「Retry Failed」可以被无限点下去，每一轮都是真金白银的 AI 调用。
+// ---------------------------------------------------------------------------
+
+// 一次执行内的最大 HTTP 尝试次数（含首次）
+const RETRY_MAX_ATTEMPTS = Number(process.env.REWRITE_RETRY_ATTEMPTS) || 3;
+const RETRY_BASE_DELAY_MS = Number(process.env.REWRITE_RETRY_BASE_MS) || 1_000;
+const RETRY_MAX_DELAY_MS = 30_000;
+
+// 单个条目允许被执行的总次数上限（attempt_count）。retryFailedBatch 会把计数
+// 继承到新条目，所以连环重试同样受限；走向导新建批次则视为人工重新发起，重新计数。
+export const MAX_ITEM_ATTEMPTS =
+  Number(process.env.REWRITE_MAX_ITEM_ATTEMPTS) || 3;
+
+// 仅限流与服务端瞬时故障可重试
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function retryDelayMs(attempt: number, retryAfter: string | null): number {
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(seconds * 1000, RETRY_MAX_DELAY_MS);
+    }
+  }
+  const backoff = Math.min(
+    RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+    RETRY_MAX_DELAY_MS
+  );
+  // 抖动：同一批多条同时失败时，别让它们又同时回来把 provider 打挂
+  return Math.round(backoff * (0.5 + Math.random() * 0.5));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type ChatAttemptResult =
+  | { ok: true; body: unknown; attempts: number }
+  | { ok: false; message: string; attempts: number; retryable: boolean };
+
+async function chatCompletionWithRetry(
+  context: DirectRewriteContext,
+  prompt: string
+): Promise<ChatAttemptResult> {
+  let lastMessage = "请求失败";
+  let attempt = 0;
+
+  while (attempt < RETRY_MAX_ATTEMPTS) {
+    attempt++;
+    let retryAfter: string | null = null;
+    try {
+      const response = await providerFetch(context.runtime, "/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        timeoutMs: DIRECT_REWRITE_TIMEOUT_MS,
+        body: JSON.stringify({
+          model: context.model,
+          messages: [{ role: "user", content: prompt }],
+          response_format: { type: "json_object" },
+        }),
+      });
+      if (response.ok) return { ok: true, body: response.body, attempts: attempt };
+
+      lastMessage = apiErrorMessage(response.body, `HTTP ${response.status}`);
+      if (!isRetryableStatus(response.status)) {
+        return { ok: false, message: lastMessage, attempts: attempt, retryable: false };
+      }
+      retryAfter = response.retryAfter;
+    } catch (error) {
+      // 超时（AbortSignal.timeout）与网络错误都按瞬时故障处理
+      lastMessage = error instanceof Error ? error.message.slice(0, 300) : "请求失败";
+    }
+
+    if (attempt < RETRY_MAX_ATTEMPTS) {
+      await sleep(retryDelayMs(attempt, retryAfter));
+    }
+  }
+
+  return {
+    ok: false,
+    message: `${lastMessage}（已尝试 ${attempt} 次）`,
+    attempts: attempt,
+    retryable: true,
+  };
+}
 
 // 直连执行上下文：仅在服务端进程内传递（含 apiKey，绝不序列化 / 落库 / 进日志）
 export type DirectRewriteContext = {
@@ -970,8 +1089,17 @@ export async function prepareDirectRewrite(
     return { ok: false, message: `${batch.provider} 已在配置中心禁用，无法提交真实任务` };
   }
 
+  // 模型/key 失效要在建任务时就挡住，别等跑到第一条才发现（结果有缓存）
+  const health = await checkProviderModelHealth(batch.provider, batch.model);
+  if (!health.ok) return { ok: false, message: health.message };
+
   const pending = await prisma.toolRewriteItem.findMany({
-    where: { batch_id: batchId, status: { in: DIRECT_REWRITE_PENDING } },
+    where: {
+      batch_id: batchId,
+      status: { in: DIRECT_REWRITE_PENDING },
+      // 达到次数上限的条目不再排队，避免任务反复领到必然失败的活
+      attempt_count: { lt: MAX_ITEM_ATTEMPTS },
+    },
     orderBy: { id: "asc" },
     select: { website_id: true },
   });
@@ -1013,6 +1141,13 @@ export async function runDirectRewriteItem(
   if (!DIRECT_REWRITE_PENDING.includes(item.status)) {
     return { outcome: "skipped", message: `条目状态为 ${item.status}，无需重复改写` };
   }
+  // 次数上限：挡住无人值守时的无限重试，也挡住连环点 Retry Failed
+  if (item.attempt_count >= MAX_ITEM_ATTEMPTS) {
+    return {
+      outcome: "skipped",
+      message: `已尝试 ${item.attempt_count} 次达到上限（${MAX_ITEM_ATTEMPTS}），不再重试`,
+    };
+  }
 
   // 始终用当前模板重建 prompt（旧存量 prompt 可能缺少 response_format 所需的
   // "json" 字样），并回写 item.prompt 作审计
@@ -1028,27 +1163,17 @@ export async function runDirectRewriteItem(
   }
 
   try {
-    const response = await providerFetch(context.runtime, "/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      timeoutMs: DIRECT_REWRITE_TIMEOUT_MS,
-      body: JSON.stringify({
-        model: context.model,
-        messages: [{ role: "user", content: prompt }],
-        response_format: { type: "json_object" },
-      }),
-    });
+    const response = await chatCompletionWithRetry(context, prompt);
     if (!response.ok) {
-      const message = apiErrorMessage(response.body, `HTTP ${response.status}`);
       await prisma.toolRewriteItem.update({
         where: { id: item.id },
         data: {
           status: "failed",
           attempt_count: { increment: 1 },
-          error_message: message,
+          error_message: response.message,
         },
       });
-      return { outcome: "failed", message };
+      return { outcome: "failed", message: response.message };
     }
 
     const content = extractChatContent(response.body);
@@ -1129,7 +1254,12 @@ async function runDirectRewrite(
   context: DirectRewriteContext
 ): Promise<SubmitResult> {
   const pending = await prisma.toolRewriteItem.findMany({
-    where: { batch_id: batchId, status: { in: DIRECT_REWRITE_PENDING } },
+    where: {
+      batch_id: batchId,
+      status: { in: DIRECT_REWRITE_PENDING },
+      // 达到次数上限的条目不再排队，避免任务反复领到必然失败的活
+      attempt_count: { lt: MAX_ITEM_ATTEMPTS },
+    },
     orderBy: { id: "asc" },
     select: { website_id: true },
   });

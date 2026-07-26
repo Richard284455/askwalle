@@ -1,4 +1,4 @@
-import { Prisma } from "@prisma/client";
+import { Prisma, type BulkJob } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 import { bulkMarkReviewed, bulkPublish, BULK_LIMIT_MAX } from "@/lib/website/tool-review";
@@ -246,14 +246,65 @@ const ITEM_HEARTBEAT_MS = 60_000;
  * 并发执行两次 —— 对 AI 改写就是重复计费。写 status: "running" 是空操作，
  * 目的只是触发 Prisma 更新 @updatedAt；条目一旦不再是 running 就不会被改到。
  */
-function startItemHeartbeat(itemId: number): () => void {
+function startItemHeartbeat(itemId: number, jobId: number): () => void {
   const timer = setInterval(() => {
     void prisma.bulkJobItem
       .updateMany({ where: { id: itemId, status: "running" }, data: { status: "running" } })
       .catch(() => {});
+    // 顺带给任务租约续期：条目可能跑得比一个租约周期还久
+    void renewJobLease(jobId).catch(() => {});
   }, ITEM_HEARTBEAT_MS);
   timer.unref?.();
   return () => clearInterval(timer);
+}
+
+// ---------------------------------------------------------------------------
+// 任务级租约
+//
+// 条目领取是原子的，所以多个 worker 不会把同一条跑两遍 —— 但每多一个 worker
+// 就多一路并发打向 provider（两个进程 = 两条 AI 请求同时在飞）。限流和账单都
+// 受不了这个放大，所以再加一层：同一时刻只有一个 worker 能推进同一个任务。
+//
+// 租约是有期限的：持有者进程被杀也不会把任务永久锁死，过期后其它 worker 自然
+// 接管；处理期间由心跳续期。
+// ---------------------------------------------------------------------------
+
+const WORKER_INSTANCE_ID = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+const JOB_LEASE_MS = Number(process.env.BULK_JOB_LEASE_MS) || 2 * 60_000;
+
+async function acquireJobLease(jobId: number): Promise<boolean> {
+  const now = new Date();
+  const acquired = await prisma.bulkJob.updateMany({
+    where: {
+      id: jobId,
+      OR: [
+        { locked_until: null },
+        { locked_until: { lt: now } },
+        { locked_by: WORKER_INSTANCE_ID }, // 本进程续持
+      ],
+    },
+    data: {
+      locked_by: WORKER_INSTANCE_ID,
+      locked_until: new Date(Date.now() + JOB_LEASE_MS),
+    },
+  });
+  return acquired.count === 1;
+}
+
+async function renewJobLease(jobId: number): Promise<void> {
+  await prisma.bulkJob.updateMany({
+    where: { id: jobId, locked_by: WORKER_INSTANCE_ID },
+    data: { locked_until: new Date(Date.now() + JOB_LEASE_MS) },
+  });
+}
+
+async function releaseJobLease(jobId: number): Promise<void> {
+  await prisma.bulkJob
+    .updateMany({
+      where: { id: jobId, locked_by: WORKER_INSTANCE_ID },
+      data: { locked_by: null, locked_until: null },
+    })
+    .catch(() => {});
 }
 
 // 单条执行：复用现有批量助手（含全部 guard），把 1 条的结果翻译成 item 结果
@@ -312,6 +363,26 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     return { ok: true, job: view!, processedNow: 0 };
   }
 
+  // 拿不到租约 = 另一个驱动者（别的实例，或打开着的任务详情页）正在推进。
+  // 不报错也不空转：把当前进度原样返回，调用方照常轮询即可。
+  if (!(await acquireJobLease(jobId))) {
+    const view = await getBulkJob(jobId);
+    return { ok: true, job: view!, processedNow: 0 };
+  }
+
+  try {
+    return await runChunkLocked(jobId, job, job.type);
+  } finally {
+    await releaseJobLease(jobId);
+  }
+}
+
+// 已持有任务租约时的实际分块执行（jobType 已在上面收窄）
+async function runChunkLocked(
+  jobId: number,
+  job: BulkJob,
+  jobType: BulkJobType
+): Promise<RunNextOutcome> {
   // queued → running；paused 说明是人工点了「继续执行」，清掉暂停原因
   if (job.status === "queued" || job.status === "paused") {
     await prisma.bulkJob.update({
@@ -332,7 +403,7 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
   const queued = await prisma.bulkJobItem.findMany({
     where: { job_id: jobId, status: "queued" },
     orderBy: { id: "asc" },
-    take: chunkSizeFor(job.type),
+    take: chunkSizeFor(jobType),
     select: { id: true, website_id: true },
   });
 
@@ -402,7 +473,7 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     if (claimed.count !== 1) continue;
 
     // 处理期间持续刷新 updated_at，让僵死回收只挑真正被中断的条目
-    const stopHeartbeat = startItemHeartbeat(item.id);
+    const stopHeartbeat = startItemHeartbeat(item.id, jobId);
 
     let itemStatus: "success" | "skipped" | "failed";
     let itemError: string | null = null;
@@ -447,7 +518,7 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
         itemError = outcome.outcome === "saved" ? null : outcome.message ?? null;
         itemResult = { rewriteOutcome: outcome.outcome } as Prisma.InputJsonValue;
       } else {
-        const single = await runSingleItem(job.type, item.website_id, params);
+        const single = await runSingleItem(jobType, item.website_id, params);
         itemStatus = single.status;
         itemError = single.error ?? null;
         itemResult = single.result;

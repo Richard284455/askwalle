@@ -377,6 +377,93 @@ export async function testProviderConnection(
     : { ok: false, message: errorSummary ?? "连接失败" };
 }
 
+// ---------------------------------------------------------------------------
+// 模型可用性预检
+//
+// 「连接测试」是人工点的，且只证明端点可达；模型是否还存在它不管。deepseek-chat
+// 下线那次就是这样：/models 通、任务照建，跑到第一条才拿到 model not found。
+// 这里在创建改写任务前做一次判定，把失效在**花钱之前**挡住。
+//
+// 判定只用 GET /models（零 token）：
+//   401/403          → key 失效，拦截
+//   200 且列表里没有 → 模型失效，拦截
+//   200 且列表里有   → 放行
+//   其它（5xx/超时/端点不支持）→ 放行，不因为探活端点自身不稳就挡住正常任务
+// ---------------------------------------------------------------------------
+
+export type ProviderHealth = { ok: true } | { ok: false; message: string };
+
+const HEALTH_CACHE_TTL_MS =
+  Number(process.env.PROVIDER_HEALTH_TTL_MS) || 5 * 60_000;
+const HEALTH_PROBE_TIMEOUT_MS = 10_000;
+
+// 进程内缓存：一个任务可能被拆成很多块、也可能连着建好几个任务，
+// 不能每次都去打一遍 /models
+type HealthCache = Map<string, { at: number; result: ProviderHealth }>;
+const HEALTH_CACHE_KEY = Symbol.for("askwalle.providerHealthCache");
+type HealthGlobal = typeof globalThis & { [HEALTH_CACHE_KEY]?: HealthCache };
+
+function healthCache(): HealthCache {
+  const scope = globalThis as HealthGlobal;
+  if (!scope[HEALTH_CACHE_KEY]) scope[HEALTH_CACHE_KEY] = new Map();
+  return scope[HEALTH_CACHE_KEY];
+}
+
+export async function checkProviderModelHealth(
+  providerKey: ProviderKey,
+  modelOverride?: string
+): Promise<ProviderHealth> {
+  const runtime = await resolveProviderRuntime(providerKey, modelOverride);
+  if (!runtime.ok) return { ok: false, message: runtime.message };
+  if (!runtime.enabled) {
+    return { ok: false, message: `${providerKey} 已在配置中心禁用` };
+  }
+
+  const cacheKey = `${providerKey}|${runtime.baseUrl}|${runtime.model}`;
+  const cache = healthCache();
+  const cached = cache.get(cacheKey);
+  if (cached && Date.now() - cached.at < HEALTH_CACHE_TTL_MS) {
+    return cached.result;
+  }
+
+  let result: ProviderHealth = { ok: true };
+  try {
+    const response = await fetch(`${runtime.baseUrl}/models`, {
+      headers: { Authorization: `Bearer ${runtime.apiKey}` },
+      signal: AbortSignal.timeout(HEALTH_PROBE_TIMEOUT_MS),
+    });
+    if (response.status === 401 || response.status === 403) {
+      result = {
+        ok: false,
+        message: `${providerKey} 鉴权失败（HTTP ${response.status}）：API key 可能已失效，请在 AI Provider 配置中心重新保存并测试`,
+      };
+    } else if (response.ok) {
+      const body = (await response.json().catch(() => null)) as
+        | { data?: { id?: string }[] }
+        | null;
+      const models = Array.isArray(body?.data)
+        ? body!.data!
+            .map((entry) => entry?.id)
+            .filter((id): id is string => typeof id === "string")
+        : [];
+      // 列表为空说明该端点不支持枚举，不据此判失效
+      if (models.length && !models.includes(runtime.model)) {
+        result = {
+          ok: false,
+          message: `模型 ${runtime.model} 在 ${providerKey} 上不可用（该端点当前提供：${models
+            .slice(0, 8)
+            .join(", ")}${models.length > 8 ? " …" : ""}），请在 AI Provider 配置中心更换模型`,
+        };
+      }
+    }
+  } catch {
+    // 探活失败不阻断：宁可让任务跑起来，也不因为探活端点抖动挡住正常改写
+  }
+
+  cache.set(cacheKey, { at: Date.now(), result });
+  return result;
+}
+
 export async function syncProviderModels(
   providerKey: ProviderKey
 ): Promise<{ ok: boolean; message: string; count?: number }> {

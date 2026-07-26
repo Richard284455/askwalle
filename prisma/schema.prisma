@@ -375,6 +375,9 @@ model BulkJob {
   error                   Json?
   related_import_batch_id  Int?
   related_rewrite_batch_id Int?
+  // 任务级租约：同一时刻只让一个 worker 推进该任务（多实例部署时收敛 provider 并发）
+  locked_by               String?
+  locked_until            DateTime?
   created_at              DateTime      @default(now())
   started_at              DateTime?
   finished_at             DateTime?

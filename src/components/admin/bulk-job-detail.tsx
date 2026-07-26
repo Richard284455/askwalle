@@ -49,9 +49,10 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
     return false;
   };
 
-  // 服务端 worker 已经在后台推进任务（关页面也继续）。页面这里的循环只是
-  // 「看着的时候更快 + worker 未启用时的兜底」：条目领取是原子的，不会重复执行。
-  // 暂停（熔断）状态不自动推进，必须人工点「继续执行」。
+  // 服务端 worker 已经在后台推进任务（关页面也继续）。页面这里的循环是
+  // 「进度轮询 + worker 未启用时的兜底」：任务级租约保证同一时刻只有一个驱动者
+  // 真正干活，抢不到租约的一方拿到的是当前进度快照，不会重复执行、也不会
+  // 额外增加 provider 并发。暂停（熔断）状态不自动推进，必须人工点「继续执行」。
   useEffect(() => {
     if (TERMINAL.includes(job.status) || job.status === PAUSED) return;
     let cancelled = false;
