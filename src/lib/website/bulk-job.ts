@@ -475,7 +475,7 @@ async function runChunkLocked(
     // 处理期间持续刷新 updated_at，让僵死回收只挑真正被中断的条目
     const stopHeartbeat = startItemHeartbeat(item.id, jobId);
 
-    let itemStatus: "success" | "skipped" | "failed";
+    let itemStatus: "success" | "skipped" | "failed" | "qc_failed";
     let itemError: string | null = null;
     let itemResult: Prisma.InputJsonValue | undefined;
     let itemWebsiteId: number | undefined;
@@ -509,11 +509,15 @@ async function runChunkLocked(
         itemError = "缺少 website_id";
       } else if (job.type === "rewrite_direct") {
         const outcome = await runDirectRewriteItem(rewriteContext!, item.website_id);
+        // qc_failed 单列一档：模型答了但内容不合格，重试同一个 prompt 没有意义，
+        // 和「请求失败」混在一起会误导排障，也会误触发熔断
         itemStatus =
           outcome.outcome === "saved"
             ? "success"
             : outcome.outcome === "skipped"
             ? "skipped"
+            : outcome.outcome === "qc_failed"
+            ? "qc_failed"
             : "failed";
         itemError = outcome.outcome === "saved" ? null : outcome.message ?? null;
         itemResult = { rewriteOutcome: outcome.outcome } as Prisma.InputJsonValue;
@@ -569,6 +573,7 @@ async function runChunkLocked(
   const success = count("success");
   const skipped = count("skipped");
   const failed = count("failed");
+  const qcFailed = count("qc_failed");
   const remaining = count("queued") + count("running");
   const done = remaining === 0;
 
@@ -623,13 +628,15 @@ async function runChunkLocked(
   await prisma.bulkJob.update({
     where: { id: jobId },
     data: {
-      processed_count: success + skipped + failed,
+      processed_count: success + skipped + failed + qcFailed,
       success_count: success,
       skipped_count: skipped,
       failed_count: failed,
+      qc_failed_count: qcFailed,
       ...(done
         ? {
-            status: skipped + failed > 0 ? "completed_with_errors" : "completed",
+            status:
+              skipped + failed + qcFailed > 0 ? "completed_with_errors" : "completed",
             finished_at: new Date(),
             ...(jobResult !== undefined ? { result: jobResult } : {}),
           }
@@ -722,6 +729,7 @@ export type BulkJobView = {
   successCount: number;
   skippedCount: number;
   failedCount: number;
+  qcFailedCount: number;
   result: unknown;
   error: unknown;
   relatedImportBatchId: number | null;
@@ -760,6 +768,7 @@ export async function getBulkJob(jobId: number): Promise<BulkJobView | null> {
     successCount: job.success_count,
     skippedCount: job.skipped_count,
     failedCount: job.failed_count,
+    qcFailedCount: job.qc_failed_count,
     result: job.result,
     error: job.error,
     relatedImportBatchId: job.related_import_batch_id,
@@ -789,6 +798,7 @@ export async function findNextDrivableJob(): Promise<{
   successCount: number;
   skippedCount: number;
   failedCount: number;
+  qcFailedCount: number;
 } | null> {
   const job = await prisma.bulkJob.findFirst({
     where: { status: { in: DRIVABLE_JOB_STATUSES } },
@@ -799,6 +809,7 @@ export async function findNextDrivableJob(): Promise<{
       success_count: true,
       skipped_count: true,
       failed_count: true,
+      qc_failed_count: true,
     },
   });
   if (!job) return null;
@@ -808,6 +819,7 @@ export async function findNextDrivableJob(): Promise<{
     successCount: job.success_count,
     skippedCount: job.skipped_count,
     failedCount: job.failed_count,
+    qcFailedCount: job.qc_failed_count,
   };
 }
 
@@ -861,6 +873,7 @@ export async function listBulkJobs(limit = 50): Promise<BulkJobSummary[]> {
     successCount: job.success_count,
     skippedCount: job.skipped_count,
     failedCount: job.failed_count,
+    qcFailedCount: job.qc_failed_count,
     result: job.result,
     error: job.error,
     relatedImportBatchId: job.related_import_batch_id,

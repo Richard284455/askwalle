@@ -23,6 +23,7 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils/utils";
 import type { AdminCategoryOption } from "@/lib/website/tool-admin";
+import { BATCH_LIMIT_MAX } from "@/lib/website/rewrite-limits";
 import type {
   RewriteProviderId,
   RewriteProviderInfo,
@@ -47,6 +48,7 @@ type EstimateView = {
   skippedHumanReviewed: number;
   skippedMissingRaw: number;
   skippedExistingDraft: number;
+  skippedInActiveBatch: number;
   retryableFailed: number;
   retryableQcFailed: number;
 };
@@ -246,7 +248,7 @@ export function RewriteWizard({
                 </SelectContent>
               </Select>
             </Field>
-            <Field label="Limit（最大 20）">
+            <Field label={`Limit（最大 ${BATCH_LIMIT_MAX}）`}>
               <Input value={limit} onChange={(e) => setLimit(e.target.value)} className="bg-background/40 border-border/40" />
             </Field>
             <Field label="重试范围">
@@ -290,7 +292,14 @@ export function RewriteWizard({
                   可重试：有失败记录 {estimate.retryableFailed} · QC 失败 {estimate.retryableQcFailed}
                   ｜范围内被排除：approved {estimate.skippedApproved} · human_reviewed {estimate.skippedHumanReviewed}
                   · 缺 raw 数据 {estimate.skippedMissingRaw} · 已有草稿 {estimate.skippedExistingDraft}
+                  · 已在其它未完成批次 {estimate.skippedInActiveBatch}
                 </p>
+                {estimate.skippedInActiveBatch > 0 && (
+                  <p className="text-xs text-orange-500">
+                    有 {estimate.skippedInActiveBatch} 条已被其它未完成批次占用，本次不会重复选中
+                    （避免同一条工具被改写两次、重复计费）。跑完或删除那些批次后即可再次选中。
+                  </p>
+                )}
                 {estimate.skippedMissingRaw > 0 && (
                   <p className="text-xs text-orange-500">
                     有 {estimate.skippedMissingRaw} 条缺 raw_imported_content，需先修复 raw 数据后才能改写。

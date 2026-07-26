@@ -14,6 +14,7 @@ import {
 //   （Submit 即同步逐条改写并完成 QC 入库；无需 Refresh/Import）
 // ---------------------------------------------------------------------------
 
+import { BATCH_LIMIT_MAX, SYNC_DIRECT_MAX } from "@/lib/website/rewrite-limits";
 import {
   checkProviderModelHealth,
   getProviderSetting,
@@ -72,7 +73,7 @@ export async function listRewriteProviders(): Promise<RewriteProviderInfo[]> {
     }));
 }
 
-const BATCH_LIMIT_MAX = 20;
+export { BATCH_LIMIT_MAX, SYNC_DIRECT_MAX } from "@/lib/website/rewrite-limits";
 
 // ---------------------------------------------------------------------------
 // Structured Outputs JSON Schema（strict）
@@ -180,17 +181,39 @@ function scopeWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
   };
 }
 
+// 已被其它未完成批次占住的工具。
+//
+// 没有这条排除时，连着创建两个批次（第一个还没跑）会选中同一批工具 —— 选取按
+// id 升序取前 N 条，而「已有草稿」这个唯一的排除条件此时还不成立。结果是同一条
+// 工具被改写两次、付两次钱，后面的工具一条也轮不到。
+const CLAIMED_ITEM_STATUSES = ["queued", "submitted"];
+// 批次收尾后（imported / failed）其残留条目不再占用工具
+const SETTLED_BATCH_STATUSES = ["imported", "failed"];
+
+function claimedByActiveBatch(): Prisma.WebsiteWhereInput {
+  return {
+    rewriteItems: {
+      some: {
+        status: { in: CLAIMED_ITEM_STATUSES },
+        batch: { status: { notIn: SETTLED_BATCH_STATUSES } },
+      },
+    },
+  };
+}
+
 // 统一改写资格判断（estimate / create / retry 共用，不信任前端）：
 // - Website.status = pending（排除 approved / archived / rejected）
 // - rewrite_status ∈ raw_imported / draft_generated（排除 human_reviewed）
 // - reviewed_at 为空（人工审过的不允许 AI 覆盖）
 // - raw_imported_content 存在（缺 raw 的先修数据）
 // - 已有草稿默认跳过，除非显式 overwriteExistingDraft
+// - 未被其它未完成批次占用（见 claimedByActiveBatch）
 // 历史 failed / qc_failed item 不构成排除条件——失败的工具必须可以重试。
 function eligibleWhere(filter: SelectionFilter): Prisma.WebsiteWhereInput {
   const allowed = allowedStatuses(filter);
   return {
     status: "pending",
+    NOT: claimedByActiveBatch(),
     ...scopeWhere(filter),
     toolDetail: {
       rewrite_status: { in: allowed },
@@ -267,6 +290,8 @@ export type RewriteEstimate = {
   skippedHumanReviewed: number;
   skippedMissingRaw: number;
   skippedExistingDraft: number;
+  // 已被其它未完成批次占用（避免同一条工具被重复改写、重复计费）
+  skippedInActiveBatch: number;
   // 符合条件工具中有历史失败记录的（可重试）
   retryableFailed: number;
   retryableQcFailed: number;
@@ -289,6 +314,7 @@ export async function estimateRewriteSelection(
     skippedHumanReviewed,
     skippedMissingRaw,
     skippedExistingDraft,
+    skippedInActiveBatch,
   ] = await Promise.all([
     prisma.website.count({ where: base }),
     prisma.website.count({
@@ -327,6 +353,14 @@ export async function estimateRewriteSelection(
             },
           },
         }),
+    prisma.website.count({
+      where: {
+        ...scope,
+        status: "pending",
+        toolDetail: { rewrite_status: { in: allowed }, reviewed_at: null },
+        ...claimedByActiveBatch(),
+      },
+    }),
   ]);
 
   const wouldProcess = Math.min(eligible, limit);
@@ -339,6 +373,7 @@ export async function estimateRewriteSelection(
     skippedHumanReviewed,
     skippedMissingRaw,
     skippedExistingDraft,
+    skippedInActiveBatch,
     retryableFailed,
     retryableQcFailed,
   };
@@ -684,22 +719,34 @@ export function buildBatchRewritePrompt(
 
   return `You are rewriting third-party reference notes about an AI tool called "${title}" into original directory content for a US-focused AI tools directory.
 
-Strict requirements:
-- Write completely original wording. Do NOT copy any full sentence or distinctive phrasing from the reference notes.
+Hard requirements — output violating any of these is rejected:
+- REWRITE, never copy. Every sentence must be your own wording. Reusing any full
+  sentence from the reference notes — even one — fails validation. Change sentence
+  structure, not just a few words. This applies to marketing lines and calls to
+  action ("Sign up for a 14-day free trial…") as much as to descriptions.
+- "features": AT LEAST 3 entries (up to 8), max ~15 words each.
+- "useCases": AT LEAST 2 entries (up to 8).
+- "faqs": AT LEAST 2 entries (up to 8), each with a non-empty question AND a
+  non-empty answer. If the notes cannot support a factual answer, still write the
+  entry and give a cautious answer telling the user to verify on the official site.
+  Never return fewer than 2 — thin notes are not an excuse.
+
+Other requirements:
 - Keep facts accurate. Do NOT invent pricing, integrations, APIs, or model support that the notes do not mention.
 - Never mention Toolify or any other directory site.
 - Professional, concise, trustworthy tone for US business users. No hype.
 - "description": 1-2 sentences for a directory card.
 - "what": 2-4 sentences on what the tool is and who it is for.
 - "how": 2-4 sentences on how a new user gets started.
-- "features": 3-8 short original feature statements (max ~15 words each).
-- "useCases": 2-8 short original use cases.
-- "faqs": 2-8 entries; every answer must be helpful and non-empty. If the notes cannot support a factual answer, write a cautious answer telling the user to verify on the official site.
 - No HTML, no Markdown.
 
 Output format:
 Respond with a single valid JSON object only (no prose, no code fences), with exactly these keys:
 {"description": string, "what": string, "how": string, "features": string[], "useCases": string[], "faqs": [{"question": string, "answer": string}]}
+
+Before responding, verify: features.length >= 3, useCases.length >= 2,
+faqs.length >= 2, every faq has a non-empty question and answer, and no sentence
+appears verbatim in the reference notes. Fix any violation before you answer.
 
 Reference notes (facts only, do not copy wording):
 ${reference}`;
@@ -884,6 +931,19 @@ export async function submitRewriteBatch(batchId: number): Promise<SubmitResult>
   // 直连模式：同步逐条改写并完成 QC 入库
   // （后台任务模式见 prepareDirectRewrite / runDirectRewriteItem）
   if (getProviderMode(provider) === "direct") {
+    const pendingCount = await prisma.toolRewriteItem.count({
+      where: {
+        batch_id: batchId,
+        status: { in: DIRECT_REWRITE_PENDING },
+        attempt_count: { lt: MAX_ITEM_ATTEMPTS },
+      },
+    });
+    if (pendingCount > SYNC_DIRECT_MAX) {
+      return {
+        ok: false,
+        message: `该批次有 ${pendingCount} 条待改写，超过同步提交上限 ${SYNC_DIRECT_MAX} 条，请改用后台任务（批次详情页的 Run now）`,
+      };
+    }
     return runDirectRewrite(batchId, { batchId, runtime, model: batch.model });
   }
 

@@ -24,6 +24,7 @@ const ITEM_STATUS_COLORS: Record<string, string> = {
   success: "text-green-600",
   skipped: "text-yellow-600",
   failed: "text-red-500",
+  qc_failed: "text-orange-500",
 };
 
 const TERMINAL = ["completed", "completed_with_errors", "failed", "canceled"];
@@ -99,7 +100,10 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
   const mediaStats = job.type === "publish" ? result : null;
   const rewriteStats = job.type === "rewrite_direct" ? result : null;
   const jobError = (job.error ?? null) as { message?: string } | null;
-  const failures = job.items.filter((item) => item.status === "failed" || item.status === "skipped");
+  const failures = job.items.filter(
+    (item) =>
+      item.status === "failed" || item.status === "skipped" || item.status === "qc_failed"
+  );
 
   return (
     <motion.div
@@ -141,8 +145,18 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
             <span className="text-green-600">成功 {job.successCount}</span>
             {" · "}
             <span className="text-yellow-600">跳过 {job.skippedCount}</span>
+            {job.qcFailedCount > 0 && (
+              <>
+                {" · "}
+                <span className="text-orange-500" title="模型正常应答，但内容未通过 QC">
+                  QC 未通过 {job.qcFailedCount}
+                </span>
+              </>
+            )}
             {" · "}
-            <span className="text-red-500">失败 {job.failedCount}</span>
+            <span className="text-red-500" title="AI 调用本身失败（超时 / 5xx / 鉴权等）">
+              调用失败 {job.failedCount}
+            </span>
           </span>
         </div>
         <div className="h-2 w-full overflow-hidden rounded-full bg-border/40">
@@ -151,7 +165,7 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
               "h-full transition-all",
               job.status === "completed"
                 ? "bg-green-500"
-                : job.failedCount + job.skippedCount > 0
+                : job.failedCount + job.skippedCount + job.qcFailedCount > 0
                 ? "bg-orange-500"
                 : "bg-primary"
             )}
@@ -237,7 +251,7 @@ export function BulkJobDetail({ initialJob }: { initialJob: BulkJobView }) {
       {/* 失败/跳过原因 */}
       {failures.length > 0 && (
         <div className="rounded-xl border border-orange-500/30 bg-orange-500/5 p-4 space-y-2">
-          <p className="text-sm font-medium">跳过 / 失败原因（{failures.length}）</p>
+          <p className="text-sm font-medium">跳过 / QC 未通过 / 失败原因（{failures.length}）</p>
           {failures.map((item) => (
             <p key={item.id} className="text-xs text-muted-foreground">
               <span className={ITEM_STATUS_COLORS[item.status]}>[{item.status}]</span>{" "}

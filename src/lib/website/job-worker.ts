@@ -67,14 +67,29 @@ function log(message: string): void {
   console.log(`[bulk-job-worker] ${message}`);
 }
 
-// 熔断判定：本块只产生了失败（没有成功也没有跳过）才累计
+/**
+ * 熔断判定：本块只产生了「调用失败」才累计。
+ *
+ * QC 未通过算「有进展」而不算失败 —— 模型正常应答了，只是内容没过质量闸门。
+ * 那是 prompt 的问题，停下来等人也不会变好；把它计入熔断只会让一次正常的
+ * 质量波动伪装成 provider 故障，把整批任务白白暂停。
+ */
+type ProgressCounts = {
+  successCount: number;
+  skippedCount: number;
+  failedCount: number;
+  qcFailedCount: number;
+};
+
 function trackFailures(
   jobId: number,
-  before: { successCount: number; skippedCount: number; failedCount: number },
-  after: { successCount: number; skippedCount: number; failedCount: number }
+  before: ProgressCounts,
+  after: ProgressCounts
 ): number {
   const progressed =
-    after.successCount - before.successCount + (after.skippedCount - before.skippedCount);
+    after.successCount - before.successCount +
+    (after.skippedCount - before.skippedCount) +
+    (after.qcFailedCount - before.qcFailedCount);
   const failedDelta = after.failedCount - before.failedCount;
   const counters = state().consecutiveFailures;
   const current = counters.get(jobId) ?? 0;

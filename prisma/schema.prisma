@@ -370,6 +370,8 @@ model BulkJob {
   success_count           Int           @default(0)
   skipped_count           Int           @default(0)
   failed_count            Int           @default(0)
+  // QC 未通过（模型答了但内容不合格）与 failed（请求本身失败）分开记账
+  qc_failed_count         Int           @default(0)
   params                  Json?
   result                  Json?
   error                   Json?
