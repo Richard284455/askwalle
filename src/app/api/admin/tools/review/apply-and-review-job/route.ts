@@ -29,7 +29,13 @@ export async function POST(request: Request) {
     if (!created.ok) {
       return NextResponse.json(AjaxResponse.fail(created.message), { status: 400 });
     }
-    return NextResponse.json(AjaxResponse.ok(created));
+    // skipped：当前 QC 复检未通过、未入队的工具（历史 qc_status 可能仍是 passed）
+    return NextResponse.json(
+      AjaxResponse.ok({
+        ...created,
+        skippedCount: created.skipped.length,
+      })
+    );
   } catch (error) {
     console.error("Failed to create apply-and-review job:", error);
     return NextResponse.json(AjaxResponse.fail("创建审核任务失败"), { status: 500 });

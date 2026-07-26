@@ -7,6 +7,10 @@ import {
   markToolReviewed,
 } from "@/lib/website/tool-admin";
 import { ensureMediaLocalizedBeforePublish } from "@/lib/website/tool-media-cache";
+import {
+  rawForWebsite,
+  validateRewriteDraft,
+} from "@/lib/website/tool-rewrite-batch";
 
 // 单次批量操作上限；超过需分页批处理（后续再做）
 export const BULK_LIMIT_MAX = 100;
@@ -396,6 +400,79 @@ async function latestQcPassed(websiteId: number): Promise<boolean> {
   return item ? item.qc_status === "passed" : true;
 }
 
+// ---------------------------------------------------------------------------
+// 当前 QC 实时复检
+//
+// 落库的 qc_status 记的是「跑那一批时的闸门怎么判的」。闸门后来收紧过，于是有
+// 一批草稿顶着 passed 的旧记录，实际已经不合格 —— 相似度口径从字段拼接改成逐单元
+// 之后，就有 12 条这样的草稿。历史状态、前端传来的 eligible、latest item 三者都
+// 不能单独作为放行依据，apply / mark reviewed 之前必须拿当前草稿重跑一次生产闸门。
+// ---------------------------------------------------------------------------
+
+// 复检需要的最小字段集
+const QC_RECHECK_SELECT = {
+  id: true,
+  title: true,
+  description: true,
+  toolDetail: {
+    select: {
+      rewrite_status: true,
+      ai_rewrite_draft: true,
+      raw_imported_content: true,
+      what: true,
+      how: true,
+      features_text: true,
+      use_cases: true,
+    },
+  },
+} satisfies Prisma.WebsiteSelect;
+
+type QcRecheckSubject = Prisma.WebsiteGetPayload<{
+  select: typeof QC_RECHECK_SELECT;
+}>;
+
+export type CurrentQcVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * 用当前生产闸门判定一条工具的草稿。
+ *
+ * 没有草稿时返回通过 —— 这条路径是「人工直接编辑公开字段后标记审核」，本来就
+ * 没有 AI 草稿可查，交给 applyRewriteDraft / markToolReviewed 的既有校验兜底。
+ */
+export function currentQcVerdictFor(
+  subject: QcRecheckSubject | null | undefined
+): CurrentQcVerdict {
+  if (!subject?.toolDetail) return { ok: false, reason: "无 ToolDetail" };
+  const draft = subject.toolDetail.ai_rewrite_draft;
+  if (!draft) return { ok: true };
+
+  const raw = rawForWebsite({
+    title: subject.title,
+    description: subject.description,
+    toolDetail: subject.toolDetail,
+  });
+  const verdict = validateRewriteDraft(draft, raw);
+  if (verdict.ok) return { ok: true };
+  return {
+    ok: false,
+    reason: `当前 QC 未通过: ${verdict.errors.join("；")}`,
+  };
+}
+
+/** 批量复检；一次查询取回全部所需字段，避免逐条往返 */
+export async function currentQcVerdicts(
+  websiteIds: number[]
+): Promise<Map<number, CurrentQcVerdict>> {
+  const subjects = await prisma.website.findMany({
+    where: { id: { in: websiteIds } },
+    select: QC_RECHECK_SELECT,
+  });
+  const byId = new Map(subjects.map((s) => [s.id, s]));
+  return new Map(
+    websiteIds.map((id) => [id, currentQcVerdictFor(byId.get(id))])
+  );
+}
+
 // A. 批量应用草稿到公开字段（复用单条 applyRewriteDraft；不改 status）
 export async function bulkApplyDrafts(
   websiteIds: number[]
@@ -404,14 +481,15 @@ export async function bulkApplyDrafts(
   if (!check.ok) return check;
 
   const result = emptyResult(websiteIds.length);
-  const details = await prisma.toolDetail.findMany({
-    where: { website_id: { in: websiteIds } },
-    select: { website_id: true, rewrite_status: true, ai_rewrite_draft: true },
+  const subjects = await prisma.website.findMany({
+    where: { id: { in: websiteIds } },
+    select: QC_RECHECK_SELECT,
   });
-  const detailByWebsite = new Map(details.map((d) => [d.website_id, d]));
+  const subjectByWebsite = new Map(subjects.map((s) => [s.id, s]));
 
   for (const websiteId of websiteIds) {
-    const detail = detailByWebsite.get(websiteId);
+    const subject = subjectByWebsite.get(websiteId);
+    const detail = subject?.toolDetail;
     if (!detail || !detail.ai_rewrite_draft) {
       result.skipped++;
       result.failedReasons.push({ websiteId, reason: "无 AI 改写草稿" });
@@ -428,6 +506,13 @@ export async function bulkApplyDrafts(
     if (!(await latestQcPassed(websiteId))) {
       result.skipped++;
       result.failedReasons.push({ websiteId, reason: "最近一次 QC 未通过" });
+      continue;
+    }
+    // 历史 qc_status 只说明「当时通过」；闸门改过之后必须拿当前草稿重判
+    const current = currentQcVerdictFor(subject);
+    if (!current.ok) {
+      result.skipped++;
+      result.failedReasons.push({ websiteId, reason: current.reason });
       continue;
     }
     const applied = await applyRewriteDraft(websiteId);
@@ -451,14 +536,15 @@ export async function bulkMarkReviewed(
   if (!check.ok) return check;
 
   const result = emptyResult(websiteIds.length);
-  const details = await prisma.toolDetail.findMany({
-    where: { website_id: { in: websiteIds } },
-    select: { website_id: true, rewrite_status: true, ai_rewrite_draft: true },
+  const subjects = await prisma.website.findMany({
+    where: { id: { in: websiteIds } },
+    select: QC_RECHECK_SELECT,
   });
-  const detailByWebsite = new Map(details.map((d) => [d.website_id, d]));
+  const subjectByWebsite = new Map(subjects.map((s) => [s.id, s]));
 
   for (const websiteId of websiteIds) {
-    const detail = detailByWebsite.get(websiteId);
+    const subject = subjectByWebsite.get(websiteId);
+    const detail = subject?.toolDetail;
     if (!detail) {
       result.skipped++;
       result.failedReasons.push({ websiteId, reason: "无 ToolDetail" });
@@ -481,6 +567,13 @@ export async function bulkMarkReviewed(
     if (!(await latestQcPassed(websiteId))) {
       result.skipped++;
       result.failedReasons.push({ websiteId, reason: "QC 未通过，不能标记审核" });
+      continue;
+    }
+    // 同 apply：不信历史 qc_status，用当前闸门重判当前草稿
+    const current = currentQcVerdictFor(subject);
+    if (!current.ok) {
+      result.skipped++;
+      result.failedReasons.push({ websiteId, reason: current.reason });
       continue;
     }
 

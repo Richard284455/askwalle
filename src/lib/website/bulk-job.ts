@@ -1,7 +1,12 @@
 import { Prisma, type BulkJob } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
-import { bulkMarkReviewed, bulkPublish, BULK_LIMIT_MAX } from "@/lib/website/tool-review";
+import {
+  bulkMarkReviewed,
+  bulkPublish,
+  currentQcVerdicts,
+  BULK_LIMIT_MAX,
+} from "@/lib/website/tool-review";
 import {
   buildImportPlan,
   importSingleRecord,
@@ -72,26 +77,54 @@ export async function createBulkJob(
   type: BulkJobType,
   websiteIds: number[],
   params: Record<string, unknown> = {}
-): Promise<{ ok: true; jobId: number; total: number } | { ok: false; message: string }> {
+): Promise<
+  | {
+      ok: true;
+      jobId: number;
+      total: number;
+      skipped: { websiteId: number; reason: string }[];
+    }
+  | { ok: false; message: string }
+> {
   const ids = [...new Set(websiteIds.filter((id) => Number.isInteger(id) && id > 0))];
   if (!ids.length) return { ok: false, message: "未选择任何工具" };
   if (ids.length > BULK_LIMIT_MAX) {
     return { ok: false, message: `单次最多 ${BULK_LIMIT_MAX} 条，请分批执行` };
   }
 
+  // 审核类任务在建任务时先用当前闸门筛一遍，不合格的不进队列。
+  // 执行时 bulkMarkReviewed 还会再判一次 —— 这里挡在前面只是让用户当场看到
+  // 「N 条因当前 QC 不通过未入队」，而不是等任务跑完才发现全被 skip。
+  const skipped: { websiteId: number; reason: string }[] = [];
+  let eligible = ids;
+  if (type === "apply_and_review") {
+    const verdicts = await currentQcVerdicts(ids);
+    eligible = ids.filter((id) => {
+      const verdict = verdicts.get(id);
+      if (verdict && !verdict.ok) {
+        skipped.push({ websiteId: id, reason: verdict.reason });
+        return false;
+      }
+      return true;
+    });
+    if (!eligible.length) {
+      return { ok: false, message: `选中的 ${ids.length} 条均未通过当前 QC 复检，任务未创建` };
+    }
+  }
+
   const job = await prisma.bulkJob.create({
     data: {
       type,
       status: "queued",
-      total_count: ids.length,
+      total_count: eligible.length,
       params: params as Prisma.InputJsonValue,
     },
   });
   await prisma.bulkJobItem.createMany({
-    data: ids.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
+    data: eligible.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
   });
   nudgeJobWorker();
-  return { ok: true, jobId: job.id, total: ids.length };
+  return { ok: true, jobId: job.id, total: eligible.length, skipped };
 }
 
 // ---------------------------------------------------------------------------
