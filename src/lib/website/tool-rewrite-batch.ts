@@ -650,7 +650,8 @@ export async function retryFailedBatch(
 // Prompt 与 JSONL
 // ---------------------------------------------------------------------------
 
-function rawForWebsite(website: {
+// 导出：相似度回溯审计要用与 QC 完全相同的 raw 归一化，复写一套必然漂移
+export function rawForWebsite(website: {
   title: string;
   description: string;
   toolDetail: {
