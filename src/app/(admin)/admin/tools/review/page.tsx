@@ -18,12 +18,16 @@ export default async function ToolReviewPage({
   // 默认 Tab「待审核」= draft_generated + qc passed
   const presetTab = tab ?? "review";
 
-  const [items, categories, batches, stats] = await Promise.all([
-    getReviewList({
-      rewriteStatus: "draft_generated",
-      qcStatus: "passed",
-      ...(presetBatchId ? { rewriteBatchId: presetBatchId } : {}),
-    }).catch(() => []),
+  const emptyPage = { items: [], total: 0, page: 1, pageSize: 100 };
+  const [firstPage, categories, batches, stats] = await Promise.all([
+    getReviewList(
+      {
+        rewriteStatus: "draft_generated",
+        qcStatus: "passed",
+        ...(presetBatchId ? { rewriteBatchId: presetBatchId } : {}),
+      },
+      { page: 1 }
+    ).catch(() => emptyPage),
     getAdminCategoryOptions(),
     listRewriteBatches().catch(() => []),
     getReviewStats().catch(() => null),
@@ -32,7 +36,7 @@ export default async function ToolReviewPage({
   return (
     <div>
       <ToolReviewClient
-        initialItems={items}
+        initialPage={firstPage}
         initialStats={stats}
         categories={categories}
         presetBatchId={presetBatchId}

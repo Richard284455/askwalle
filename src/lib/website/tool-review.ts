@@ -48,17 +48,75 @@ async function websiteIdsForBatch(batchId: number): Promise<number[]> {
   return [...new Set(items.map((item) => item.website_id))];
 }
 
-export async function getReviewList(
+/**
+ * provider / model / qcStatus 三个筛选看的是「最近一次」改写条目，不是「任意一次」
+ * ——一个工具可能第一批 QC 失败、第二批通过，用 `some` 会把它同时算进两边。
+ *
+ * 以前这三个是在取回前 300 条之后做内存过滤，于是筛选结果在数据量超过 300 时
+ * 直接是错的（第 301 名之后的工具永远出不来）。这里改成先用 DISTINCT ON 把每个
+ * 工具的最近一次条目算出来，拿到 id 集合再交给主查询，分页才是准的。
+ *
+ * 返回 null 表示这三个筛选都没启用，不需要限制 id。
+ */
+async function websiteIdsByLatestRewriteItem(
   filter: ReviewListFilter
-): Promise<ReviewListItem[]> {
+): Promise<number[] | null> {
+  if (!filter.provider && !filter.model && !filter.qcStatus) return null;
+
+  const rows = await prisma.$queryRaw<{ website_id: number }[]>`
+    SELECT website_id FROM (
+      SELECT DISTINCT ON (i.website_id)
+             i.website_id, i.qc_status, b.provider, b.model
+        FROM tool_rewrite_items i
+        JOIN tool_rewrite_batches b ON b.id = i.batch_id
+       ORDER BY i.website_id, i.id DESC
+    ) latest
+     WHERE (${filter.qcStatus ?? null}::text IS NULL OR latest.qc_status = ${filter.qcStatus ?? null}::text)
+       AND (${filter.provider ?? null}::text IS NULL OR latest.provider = ${filter.provider ?? null}::text)
+       AND (${filter.model ?? null}::text IS NULL OR latest.model = ${filter.model ?? null}::text)
+  `;
+  return rows.map((row) => row.website_id);
+}
+
+export type ReviewListPage = {
+  items: ReviewListItem[];
+  total: number;
+  page: number;
+  pageSize: number;
+};
+
+export const REVIEW_PAGE_SIZE_MAX = 200;
+
+export async function getReviewList(
+  filter: ReviewListFilter,
+  pagination?: { page?: number; pageSize?: number }
+): Promise<ReviewListPage> {
+  const pageSize = Math.min(
+    Math.max(pagination?.pageSize ?? 100, 1),
+    REVIEW_PAGE_SIZE_MAX
+  );
+  const page = Math.max(pagination?.page ?? 1, 1);
+
   const where: Prisma.WebsiteWhereInput = {
     toolDetail: { isNot: null },
   };
 
+  // 多个 id 来源（批次筛选 / 最近一次条目筛选）取交集
+  const idSets: number[][] = [];
   if (filter.rewriteBatchId) {
-    const ids = await websiteIdsForBatch(filter.rewriteBatchId);
-    where.id = { in: ids.length ? ids : [-1] };
+    idSets.push(await websiteIdsForBatch(filter.rewriteBatchId));
   }
+  const latestIds = await websiteIdsByLatestRewriteItem(filter);
+  if (latestIds !== null) idSets.push(latestIds);
+
+  if (idSets.length) {
+    const intersection = idSets.reduce((acc, ids) => {
+      const set = new Set(ids);
+      return acc.filter((id) => set.has(id));
+    });
+    where.id = { in: intersection.length ? intersection : [-1] };
+  }
+
   if (filter.categoryId) where.category_id = filter.categoryId;
   if (filter.websiteStatus) where.status = filter.websiteStatus;
   if (filter.rewriteStatus) {
@@ -74,10 +132,12 @@ export async function getReviewList(
     ];
   }
 
+  const total = await prisma.website.count({ where });
   const websites = await prisma.website.findMany({
     where,
     orderBy: { updated_at: "desc" },
-    take: 300,
+    skip: (page - 1) * pageSize,
+    take: pageSize,
     select: {
       id: true,
       title: true,
@@ -97,7 +157,7 @@ export async function getReviewList(
     },
   });
 
-  let items = websites.map((website) => {
+  const items = websites.map((website) => {
     const latestItem = website.rewriteItems[0];
     return {
       websiteId: website.id,
@@ -113,18 +173,29 @@ export async function getReviewList(
     };
   });
 
-  // provider / model / qcStatus 依赖最近一次 rewrite item，做内存过滤
-  if (filter.provider) {
-    items = items.filter((item) => item.provider === filter.provider);
-  }
-  if (filter.model) {
-    items = items.filter((item) => item.model === filter.model);
-  }
-  if (filter.qcStatus) {
-    items = items.filter((item) => item.qcStatus === filter.qcStatus);
-  }
+  return { items, total, page, pageSize };
+}
 
-  return items;
+/**
+ * 当前筛选命中的全部 website id（不分页）。
+ * 供「选中全部 N 条」使用：批量操作有 100 条上限，客户端拿到完整 id 集合后
+ * 自行分批提交，用户不必手工翻页勾选。
+ */
+export async function getReviewFilterIds(
+  filter: ReviewListFilter
+): Promise<number[]> {
+  const page = await getReviewList(filter, { page: 1, pageSize: 1 });
+  if (page.total === 0) return [];
+
+  // 复用同一套筛选：按页取完，保证与列表口径完全一致
+  const ids: number[] = [];
+  const pageSize = REVIEW_PAGE_SIZE_MAX;
+  const pages = Math.ceil(page.total / pageSize);
+  for (let p = 1; p <= pages; p++) {
+    const chunk = await getReviewList(filter, { page: p, pageSize });
+    ids.push(...chunk.items.map((item) => item.websiteId));
+  }
+  return ids;
 }
 
 // ---------------------------------------------------------------------------

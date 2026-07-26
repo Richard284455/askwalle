@@ -1410,6 +1410,54 @@ function splitSentences(text: string): string[] {
     .filter((sentence) => sentence.length >= 40);
 }
 
+// ---------------------------------------------------------------------------
+// 与原文的相似度闸门
+//
+// 整句比对只能抓「原样搬运一整句」。实测 313 条草稿发现真正的漏网之鱼是
+// **特性/用例列表**：模型把 featuresText 和 useCases 几乎逐词复述成数组，最长
+// 一处连续 39 个词完全相同，却因为不构成 description/what/how 里的完整句子而
+// 顺利通过。所以这里补两件事：
+//   1. 比对范围加上 featuresText / useCases / faq 答案；
+//   2. 增加「最长连续相同词串」判定，不依赖句子边界。
+//
+// 阈值取 15 词：实测中位数 9 词、90 分位 14 词（同领域词汇天然重合，属正常），
+// 15 词以上的连续雷同已无法用巧合解释。313 条历史草稿里 6.7% 会被这条挡下。
+// ---------------------------------------------------------------------------
+
+const MAX_COPIED_RUN_WORDS = Number(process.env.REWRITE_MAX_COPIED_RUN) || 15;
+
+function normalizeWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+// 最长公共连续子串（词级），滚动数组避免 O(n*m) 的内存
+function longestCommonWordRun(
+  a: string[],
+  b: string[]
+): { length: number; text: string } {
+  let best = 0;
+  let bestEnd = 0;
+  let prev = new Array<number>(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = new Array<number>(b.length + 1).fill(0);
+    for (let j = 1; j <= b.length; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        cur[j] = prev[j - 1] + 1;
+        if (cur[j] > best) {
+          best = cur[j];
+          bestEnd = i;
+        }
+      }
+    }
+    prev = cur;
+  }
+  return { length: best, text: a.slice(bestEnd - best, bestEnd).join(" ") };
+}
+
 export function validateRewriteDraft(
   draft: unknown,
   raw: RawImportedContent & { description: string }
@@ -1468,17 +1516,38 @@ export function validateRewriteDraft(
   if (allText.includes("```")) errors.push("包含 Markdown 代码块");
   if (/toolify/i.test(allText)) errors.push("包含 Toolify 字样");
 
-  // 不允许复制原文完整句子（>=40 字符的句子逐一比对）
-  const rawSentences = [
-    ...splitSentences(raw.description),
-    ...splitSentences(raw.what),
-    ...splitSentences(raw.how),
-  ];
+  // 用于查重的原文范围：在 description/what/how 之外补上 featuresText / useCases /
+  // FAQ 答案 —— 实测最严重的照抄就发生在这些列表里（最长一处 39 个词逐词相同）。
+  //
+  // 刻意排除 FAQ 的**问句**：「Does X support multiple languages?」这种问题本来就
+  // 只有一种自然问法，把它算作抄袭会让 313 条历史草稿里 60% 被误杀，且逼着模型
+  // 把问句改得更别扭。答案是散文，仍然要查。
+  const rawFull = [
+    raw.description,
+    raw.what,
+    raw.how,
+    raw.featuresText,
+    ...raw.useCases,
+    ...raw.faqs.map((faq) => faq.answer ?? ""),
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  // 1) 原样搬运整句
+  const rawSentences = splitSentences(rawFull);
   for (const sentence of rawSentences) {
     if (allText.includes(sentence)) {
       errors.push(`复制了原文句子: "${sentence.slice(0, 50)}…"`);
       break;
     }
+  }
+
+  // 2) 长段连续雷同（不依赖句子边界，能抓住列表被逐词复述的情况）
+  const run = longestCommonWordRun(normalizeWords(allText), normalizeWords(rawFull));
+  if (run.length >= MAX_COPIED_RUN_WORDS) {
+    errors.push(
+      `与原文连续雷同 ${run.length} 个词（上限 ${MAX_COPIED_RUN_WORDS}）: "${run.text.slice(0, 60)}…"`
+    );
   }
 
   // 编造检测启发式：原文没有具体价格时，草稿不应出现 $ 金额

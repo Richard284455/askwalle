@@ -137,15 +137,25 @@ const BULK_OPS: BulkOp[] = [
   },
 ];
 
+// 服务端单次批量上限。选中超过这个数时客户端自动切成多批提交 ——
+// 313 条草稿的量级下，「全选后点一下」必须能跑完，而不是弹一句「最多 100 条」。
+const BULK_CHUNK = 100;
+
+function chunk<T>(list: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < list.length; i += size) out.push(list.slice(i, i + size));
+  return out;
+}
+
 export function ToolReviewClient({
-  initialItems,
+  initialPage,
   initialStats,
   categories,
   batches,
   presetBatchId,
   presetTab,
 }: {
-  initialItems: ReviewListItem[];
+  initialPage: { items: ReviewListItem[]; total: number; page: number; pageSize: number };
   initialStats: ReviewStats | null;
   categories: AdminCategoryOption[];
   batches: { id: number; label: string }[];
@@ -154,10 +164,15 @@ export function ToolReviewClient({
 }) {
   const { toast } = useToast();
   const router = useRouter();
-  const [items, setItems] = useState(initialItems);
+  const [items, setItems] = useState(initialPage.items);
+  const [total, setTotal] = useState(initialPage.total);
+  const [page, setPage] = useState(initialPage.page);
+  const [pageSize] = useState(initialPage.pageSize);
   const [stats, setStats] = useState<ReviewStats | null>(initialStats);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [selectingAll, setSelectingAll] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<string | null>(null);
 
   const [tab, setTab] = useState(
     TABS.some((t) => t.key === presetTab) ? presetTab! : "review"
@@ -202,14 +217,21 @@ export function ToolReviewClient({
     return params;
   };
 
-  const reload = async (tabKey = tab) => {
+  const reload = async (tabKey = tab, targetPage = 1) => {
     setLoading(true);
     try {
+      const params = buildParams(tabKey);
+      params.set("page", String(targetPage));
+      params.set("pageSize", String(pageSize));
       const [listRes, statsRes] = await Promise.all([
-        fetch(`/api/admin/tools/review?${buildParams(tabKey)}`).then((r) => r.json()),
+        fetch(`/api/admin/tools/review?${params}`).then((r) => r.json()),
         fetch(`/api/admin/tools/review/stats`).then((r) => r.json()),
       ]);
-      if (listRes?.code === 200) setItems(listRes.data);
+      if (listRes?.code === 200) {
+        setItems(listRes.data.items);
+        setTotal(listRes.data.total);
+        setPage(listRes.data.page);
+      }
       if (statsRes?.code === 200) setStats(statsRes.data);
       setSelected(new Set());
     } finally {
@@ -220,7 +242,26 @@ export function ToolReviewClient({
   const switchTab = (key: string) => {
     setTab(key);
     setResult(null);
-    reload(key);
+    reload(key, 1);
+  };
+
+  // 选中当前筛选命中的全部条目（跨页），交给下面的自动分批提交
+  const selectAllMatching = async () => {
+    if (selectingAll) return;
+    setSelectingAll(true);
+    try {
+      const params = buildParams();
+      params.set("idsOnly", "1");
+      const data = await fetch(`/api/admin/tools/review?${params}`).then((r) => r.json());
+      if (data?.code === 200) {
+        setSelected(new Set(data.data.ids as number[]));
+        toast({ title: `已选中全部 ${data.data.total} 条` });
+      } else {
+        toast({ title: "全选失败", description: data?.message, variant: "destructive" });
+      }
+    } finally {
+      setSelectingAll(false);
+    }
   };
 
   const toggle = (id: number) =>
@@ -241,35 +282,83 @@ export function ToolReviewClient({
     else toast({ title: "预览失败", description: data?.message, variant: "destructive" });
   };
 
+  const postChunk = (op: BulkOp, websiteIds: number[]) =>
+    fetch(`/api/admin/tools/review/${op.endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        websiteIds,
+        ...(op.needsNotes ? { reviewNotes } : {}),
+        ...(op.extra ?? {}),
+      }),
+    }).then((r) => r.json());
+
   const runOp = async () => {
     if (!pendingOp || busy) return;
     setBusy(true);
+    const op = pendingOp;
+    const batches = chunk([...selected], BULK_CHUNK);
     try {
-      const data = await fetch(`/api/admin/tools/review/${pendingOp.endpoint}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          websiteIds: [...selected],
-          ...(pendingOp.needsNotes ? { reviewNotes } : {}),
-          ...(pendingOp.extra ?? {}),
-        }),
-      }).then((r) => r.json());
-      if (data?.code === 200) {
-        if (pendingOp.asJob) {
-          // 异步任务：立即跳转任务详情页看进度，不等待同步完成
-          const jobId = (data.data as { jobId: number }).jobId;
-          toast({ title: "后台任务已创建", description: `任务 #${jobId}，正在跳转进度页` });
-          router.push(`/admin/jobs/${jobId}`);
-          return;
+      // 异步任务：每批建一个 job。全部建完后跳第一个进度页 ——
+      // worker 会按 id 升序把这些 job 依次跑完，不需要人守着。
+      if (op.asJob) {
+        const jobIds: number[] = [];
+        for (const [index, ids] of batches.entries()) {
+          setBatchProgress(`正在创建后台任务 ${index + 1}/${batches.length}…`);
+          const data = await postChunk(op, ids);
+          if (data?.code !== 200) {
+            toast({
+              title: `第 ${index + 1} 批创建失败`,
+              description: `${data?.message || "请重试"}${jobIds.length ? `（前 ${jobIds.length} 批已创建，会继续执行）` : ""}`,
+              variant: "destructive",
+            });
+            break;
+          }
+          jobIds.push((data.data as { jobId: number }).jobId);
         }
-        setResult(data.data as BulkResult);
-        setPendingOp(null);
-        toast({ title: "操作完成", description: pendingOp.label });
-        await reload();
-      } else {
-        toast({ title: "操作失败", description: data?.message || "请重试", variant: "destructive" });
+        if (jobIds.length) {
+          toast({
+            title: `已创建 ${jobIds.length} 个后台任务`,
+            description: `共 ${selected.size} 条，任务 #${jobIds.join(" #")}，将依次自动执行`,
+          });
+          router.push(`/admin/jobs/${jobIds[0]}`);
+        }
+        return;
       }
+
+      // 同步操作：逐批提交并把结果合并成一份，避免只看到最后一批
+      const merged: BulkResult = {
+        selected: 0, succeeded: 0, skipped: 0, failed: 0,
+        failedReasons: [], affectedIds: [],
+      };
+      for (const [index, ids] of batches.entries()) {
+        setBatchProgress(`正在处理第 ${index + 1}/${batches.length} 批…`);
+        const data = await postChunk(op, ids);
+        if (data?.code !== 200) {
+          toast({
+            title: `第 ${index + 1} 批失败`,
+            description: data?.message || "请重试",
+            variant: "destructive",
+          });
+          break;
+        }
+        const part = data.data as BulkResult;
+        merged.selected += part.selected;
+        merged.succeeded += part.succeeded;
+        merged.skipped += part.skipped;
+        merged.failed += part.failed;
+        merged.failedReasons.push(...part.failedReasons);
+        merged.affectedIds.push(...part.affectedIds);
+      }
+      setResult(merged);
+      setPendingOp(null);
+      toast({
+        title: "操作完成",
+        description: `${op.label}：${batches.length} 批共 ${merged.selected} 条`,
+      });
+      await reload(tab, page);
     } finally {
+      setBatchProgress(null);
       setBusy(false);
     }
   };
@@ -387,7 +476,21 @@ export function ToolReviewClient({
 
       {/* 批量操作栏 */}
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-border/40 bg-background/30 backdrop-blur-sm p-4">
-        <span className="text-sm text-muted-foreground">已选 {selectedCount} 条：</span>
+        <span className="text-sm text-muted-foreground">
+          已选 {selectedCount} 条
+          {selectedCount > BULK_CHUNK && (
+            <span className="text-xs">（将自动分 {Math.ceil(selectedCount / BULK_CHUNK)} 批提交）</span>
+          )}
+          ：
+        </span>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={selectingAll || total === 0 || selectedCount === total}
+          onClick={selectAllMatching}
+        >
+          {selectingAll ? "选中中…" : `选中全部 ${total} 条`}
+        </Button>
         {BULK_OPS.map((op) => (
           <Button
             key={op.key}
@@ -518,6 +621,37 @@ export function ToolReviewClient({
             </TableBody>
           </Table>
         </div>
+
+        {/* 分页：列表以前硬截断在 300 条且没有任何提示，超出的工具在界面上够不着 */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border/40 px-4 py-3 text-sm">
+          <span className="text-muted-foreground">
+            共 <strong>{total}</strong> 条
+            {total > 0 && (
+              <>
+                ，当前第 {page}/{Math.max(Math.ceil(total / pageSize), 1)} 页
+                （本页 {items.length} 条）
+              </>
+            )}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loading || page <= 1}
+              onClick={() => reload(tab, page - 1)}
+            >
+              上一页
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loading || page >= Math.ceil(total / pageSize)}
+              onClick={() => reload(tab, page + 1)}
+            >
+              下一页
+            </Button>
+          </div>
+        </div>
       </div>
 
       {/* 预览对话框 */}
@@ -605,7 +739,7 @@ export function ToolReviewClient({
           <DialogFooter>
             <Button variant="outline" onClick={() => setPendingOp(null)}>取消</Button>
             <Button onClick={runOp} disabled={busy}>
-              {busy ? "执行中..." : "确认执行"}
+              {busy ? batchProgress ?? "执行中..." : "确认执行"}
             </Button>
           </DialogFooter>
         </DialogContent>
