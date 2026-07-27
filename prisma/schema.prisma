@@ -438,6 +438,13 @@ model ToolLifecycleState {
   fail_family         String? // network / server / gone
   last_error_kind     String?
 
+  // ── 深度内容检查（正文分类）──
+  // HEAD 2xx 短路会跳过取正文，正常体积的 soft-404 / 停放页就永远进不了
+  // 内容分类。这两个字段驱动「按 tier 周期性强制 GET」，保证每个工具都会
+  // 定期被完整看一遍正文。
+  last_content_checked_at DateTime?
+  next_content_check_at   DateTime?
+
   // ── 观测线索 ──
   final_url         String? // 跟随重定向后的落地 URL（换域名线索）
   archive_url       String? // 死链时给用户的历史快照入口（P0b 用）

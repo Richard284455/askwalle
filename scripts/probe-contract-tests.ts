@@ -1,18 +1,28 @@
 /**
- * Reachability Probe 判定契约 v1.0 —— 测试矩阵 T01–T80。
+ * Reachability Probe 判定契约 —— 测试矩阵。
  *
- *   npx ts-node --project tsconfig.script.json scripts/probe-contract-tests.ts
+ *   npm run test:probe
  *
- * 全部走本地 mock，**不访问任何真实工具站点**，不连数据库，不调 AI。
+ * 全部走**内存 fixture transport**：不起 HTTP 服务、不建 TCP 连接、不访问任何
+ * 真实站点、不连数据库、不调 AI。
+ *
+ * 重要：测试跑的是**完整的生产 SSRF 校验** —— resolver 返回真实公网地址，
+ * assertSafeUrl 按生产规则一字不改地跑一遍，transport 才把请求映射到 fixture。
+ * 不存在任何「放行私网」的开关。
  */
-import { startMockServer, MockServer } from "./probe-mock-server";
+import { createMockTransport, MOCK_ORIGIN, MockControl } from "./probe-mock-transport";
 import { probeReachability } from "../src/lib/website/probe/reachability-probe";
 import { clearRobotsCache } from "../src/lib/website/probe/robots";
 import { assertSafeUrl, isBlockedAddress } from "../src/lib/website/probe/ssrf";
 import { extractText } from "../src/lib/website/probe/text-blocks";
 import { sameRegistrableDomain } from "../src/lib/website/probe/registrable-domain";
 import { applyRound, INITIAL_STATE, replay, DebounceState } from "../src/lib/website/probe/classifier";
-import { PROBE_VERSION, ProbeOutcome, countsTowardBreaker } from "../src/lib/website/probe/types";
+import {
+  PROBE_VERSION,
+  ProbeOutcome,
+  countsTowardBreaker,
+  isContentCheckDue,
+} from "../src/lib/website/probe/types";
 
 let pass = 0;
 let fail = 0;
@@ -27,23 +37,16 @@ function check(id: string, name: string, ok: boolean, detail = "") {
   console.log(`  ${ok ? "PASS" : "FAIL"}  ${id}  ${name}${detail ? `  — ${detail}` : ""}`);
 }
 
-// 本地 mock 跑在 127.0.0.1 上，SSRF 会（正确地）拒绝私网地址。
-// 探针类用例显式传 safety.allowPrivateAddresses —— 这是**仅测试**的注入点，
-// 生产调用方一律不传。T52 专门断言默认参数下 127.0.0.1 仍被拒。
-const testResolve = async () => ["127.0.0.1"];
-const TEST_SAFETY = { allowPrivateAddresses: true };
-
-// 「公网」测试地址：不能用 203.0.113.x / 192.0.2.x / 198.51.100.x —— 那些是
-// 文档保留段，本来就在禁止列表里，拿来当公网会让 SSRF 用例自相矛盾。
+// 真实公网地址（不能用 203.0.113.x / 192.0.2.x / 198.51.100.x —— 文档保留段本就在禁止列表里）
 const PUBLIC_IP = "93.184.216.34";
 const PUBLIC_IP_2 = "8.8.8.8";
 
-async function probeUrl(mock: MockServer, path: string, extra: Record<string, unknown> = {}) {
+async function probeUrl(mock: MockControl, path: string, extra: Record<string, unknown> = {}) {
   clearRobotsCache();
   return probeReachability({
-    url: `${mock.origin}${path}`,
-    resolve: testResolve,
-    safety: TEST_SAFETY,
+    url: `${MOCK_ORIGIN}${path}`,
+    resolve: mock.resolve,
+    transport: mock.transport,
     lookupNs: async () => {
       throw new Error("ns unavailable");
     },
@@ -53,7 +56,7 @@ async function probeUrl(mock: MockServer, path: string, extra: Record<string, un
 
 // ---------------------------------------------------------------------------
 
-async function stateMachineTests(mock: MockServer) {
+async function stateMachineTests(mock: MockControl) {
   console.log("\n8.1 状态机与网络层\n");
 
   const t01 = await probeUrl(mock, "/ok");
@@ -74,13 +77,12 @@ async function stateMachineTests(mock: MockServer) {
   check("T05", "HEAD 200 但 Content-Length<512 → GET 复核", t05.outcome === "ok", t05.outcome);
 
   const t06 = await probeReachability({
-    url: "http://does-not-exist.invalid/",
+    url: "https://does-not-exist.example/",
     resolve: async () => {
       throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
     },
+    transport: mock.transport,
   });
-  // 解析失败在 SSRF 阶段就会被判 dns_error → unsafe_target；
-  // 契约上这属于「我方无法确认」，不该计入死链消抖
   check("T06", "DNS 解析失败不产生生命周期失败",
     t06.outcome === "unsafe_target" || t06.outcome === "dns", t06.outcome);
 
@@ -94,39 +96,72 @@ async function stateMachineTests(mock: MockServer) {
   check("T11", "410 → http_410", t11.outcome === "http_410", t11.outcome);
 
   const t12 = await probeUrl(mock, "/redir/0");
-  check(
-    "T12",
-    "超过 5 跳 → timeout/redirect_loop",
-    t12.outcome === "timeout" && t12.errorKind === "redirect_loop",
-    `${t12.outcome}/${t12.errorKind}`
-  );
+  check("T12", "超过 5 跳 → timeout/redirect_loop",
+    t12.outcome === "timeout" && t12.errorKind === "redirect_loop", `${t12.outcome}/${t12.errorKind}`);
 
   const t13 = await probeUrl(mock, "/loop-a");
-  check(
-    "T13",
-    "循环重定向 → timeout/redirect_loop",
-    t13.outcome === "timeout" && t13.errorKind === "redirect_loop",
-    `${t13.outcome}/${t13.errorKind}`
-  );
+  check("T13", "循环重定向 → timeout/redirect_loop",
+    t13.outcome === "timeout" && t13.errorKind === "redirect_loop", `${t13.outcome}/${t13.errorKind}`);
 
   const t14 = await probeUrl(mock, "/pdf");
-  check(
-    "T14",
-    "PDF 200 → ok（内容检查跳过）",
-    t14.outcome === "ok" && t14.contentVerdict === "non_html",
-    `${t14.outcome}/${t14.contentVerdict}`
-  );
+  check("T14", "PDF 200 → ok（内容检查跳过，记 non_html）",
+    t14.outcome === "ok" && t14.contentVerdict === "non_html", `${t14.outcome}/${t14.contentVerdict}`);
+  check("T14b", "  └ non_html 仍算完成内容检查（否则每轮白 GET）", t14.contentChecked);
 
   const t15 = await probeUrl(mock, "/huge");
-  check(
-    "T15",
-    "服务器忽略 Range → truncated 且仍 ok",
-    t15.outcome === "ok" && t15.evidence.truncated,
-    `${t15.outcome} truncated=${t15.evidence.truncated}`
-  );
+  check("T15", "服务器忽略 Range → truncated 且仍 ok",
+    t15.outcome === "ok" && t15.evidence.truncated, `${t15.outcome} truncated=${t15.evidence.truncated}`);
 }
 
-async function soft404Tests(mock: MockServer) {
+async function contentCheckTests(mock: MockControl) {
+  console.log("\n8.1b 深度内容检查（v2 新增）\n");
+
+  // ★ 核心回归：正常体积（>512B）的软 404
+  const big = await probeUrl(mock, "/big-soft404", { forceContentCheck: false });
+  check("V01", "未到期时正常体积软 404 被 HEAD 短路掩盖（v1 的老问题）",
+    big.outcome === "ok" && big.evidence.methodSequence.join() === "HEAD",
+    `${big.outcome} ${big.evidence.methodSequence.join(",")}`);
+
+  const bigForced = await probeUrl(mock, "/big-soft404", { forceContentCheck: true });
+  check("V02", "首次/到期强制 GET → 命中 soft_404",
+    bigForced.outcome === "soft_404" && bigForced.evidence.methodSequence.join() === "HEAD,GET",
+    `${bigForced.outcome} ${bigForced.evidence.methodSequence.join(",")}`);
+  check("V03", "  └ 标记 contentChecked", bigForced.contentChecked);
+
+  const bigParked = await probeUrl(mock, "/big-parked-excluded", { forceContentCheck: true });
+  check("V04", "正常体积页面含 parked 关键词 → GET 后被 E1 排除，判 ok",
+    bigParked.outcome === "ok" && bigParked.evidence.exclusionsHit.includes("E1"),
+    `${bigParked.outcome} exclusions=[${bigParked.evidence.exclusionsHit.join(",")}]`);
+
+  const okForced = await probeUrl(mock, "/ok", { forceContentCheck: true });
+  check("V05", "强制内容检查下正常页仍判 ok 且完成正文分类",
+    okForced.outcome === "ok" && okForced.contentChecked &&
+      okForced.evidence.methodSequence.join() === "HEAD,GET",
+    `${okForced.outcome} checked=${okForced.contentChecked}`);
+
+  // 排期纯函数
+  const now = new Date("2026-07-27T00:00:00Z");
+  const daysAgo = (n: number) => new Date(now.getTime() - n * 86_400_000);
+  check("V06", "从未检查过 → 必须 GET", isContentCheckDue(null, "standard", now));
+  check("V07", "featured_candidate 6 天 → 不强制", !isContentCheckDue(daysAgo(6), "featured_candidate", now));
+  check("V08", "featured_candidate 7 天 → 强制", isContentCheckDue(daysAgo(7), "featured_candidate", now));
+  check("V09", "featured 8 天 → 强制", isContentCheckDue(daysAgo(8), "featured", now));
+  check("V10", "standard 29 天 → 不强制", !isContentCheckDue(daysAgo(29), "standard", now));
+  check("V11", "standard 31 天 → 强制", isContentCheckDue(daysAgo(31), "standard", now));
+  check("V12", "longtail 89 天 → 不强制（HEAD 可短路）", !isContentCheckDue(daysAgo(89), "longtail", now));
+  check("V13", "longtail 91 天 → 强制 GET", isContentCheckDue(daysAgo(91), "longtail", now));
+  check("V14", "未知 tier 回落 standard", isContentCheckDue(daysAgo(31), "weird", now));
+
+  // 未完成正文分类的轮次不得推进排期
+  const blocked = await probeUrl(mock, "/cf-challenge", { forceContentCheck: true });
+  check("V15", "blocked 轮次不算完成内容检查",
+    blocked.outcome === "blocked" && !blocked.contentChecked, `${blocked.outcome}/${blocked.contentChecked}`);
+  const err = await probeUrl(mock, "/500", { forceContentCheck: true });
+  check("V16", "http_5xx 轮次不算完成内容检查",
+    err.outcome === "http_5xx" && !err.contentChecked, `${err.outcome}/${err.contentChecked}`);
+}
+
+async function soft404Tests(mock: MockControl) {
   console.log("\n8.2 soft_404\n");
 
   const t16 = await probeUrl(mock, "/soft404-title");
@@ -138,139 +173,86 @@ async function soft404Tests(mock: MockServer) {
   const t18 = await probeUrl(mock, "/soft404-body");
   check("T18", "正文块含中文 404 语", t18.outcome === "soft_404", t18.outcome);
 
-  const t19 = await probeUrl(mock, "/soft404-long");
+  const t19 = await probeUrl(mock, "/soft404-long", { forceContentCheck: true });
   check("T19", "title 含 404 但正文很长 → ok", t19.outcome === "ok", t19.outcome);
 
   const t21 = await probeUrl(mock, "/spa");
-  check(
-    "T21",
-    "SPA 壳 → ok / low / spa_shell",
+  check("T21", "SPA 壳 → ok / low / spa_shell",
     t21.outcome === "ok" && t21.confidence === "low" && t21.contentVerdict === "spa_shell",
-    `${t21.outcome}/${t21.confidence}/${t21.contentVerdict}`
-  );
+    `${t21.outcome}/${t21.confidence}/${t21.contentVerdict}`);
 
-  const t22 = await probeUrl(mock, "/notfound-in-script");
+  const t22 = await probeUrl(mock, "/notfound-in-script", { forceContentCheck: true });
   check("T22", "<script> 内的 not found 不算", t22.outcome === "ok", t22.outcome);
 
-  const t23 = await probeUrl(mock, "/notfound-in-comment");
+  const t23 = await probeUrl(mock, "/notfound-in-comment", { forceContentCheck: true });
   check("T23", "HTML 注释内的不算", t23.outcome === "ok", t23.outcome);
 
-  const t24 = await probeUrl(mock, "/notfound-in-alt");
+  const t24 = await probeUrl(mock, "/notfound-in-alt", { forceContentCheck: true });
   check("T24", "alt 属性内的不算", t24.outcome === "ok", t24.outcome);
 }
 
-async function parkedTests(mock: MockServer) {
+async function parkedTests(mock: MockControl) {
   console.log("\n8.3 parked\n");
 
   const t25 = await probeUrl(mock, "/parked-en");
-  check(
-    "T25",
-    "英文 for sale + 结构条件 → parked/weak",
-    t25.outcome === "parked" && t25.evidenceStrength === "weak",
-    `${t25.outcome}/${t25.evidenceStrength}`
-  );
+  check("T25", "英文 for sale + 结构条件 → parked/weak",
+    t25.outcome === "parked" && t25.evidenceStrength === "weak", `${t25.outcome}/${t25.evidenceStrength}`);
 
   const t26 = await probeUrl(mock, "/parked-cn");
-  check(
-    "T26",
-    "中文该域名待售 → parked/weak",
-    t26.outcome === "parked" && t26.evidenceStrength === "weak",
-    `${t26.outcome}/${t26.evidenceStrength}`
-  );
-
-  // 内容丰富的页面 Content-Length > 512，HEAD 就短路了，根本走不到内容分类。
-  // 结果仍然正确（ok），只是 E1 没机会记录 —— 这是契约 §1.1 的既定代价。
-  const t30 = await probeUrl(mock, "/parked-long");
-  check("T30", "正文 >1500 的页面 HEAD 短路 → ok（不取正文）", t30.outcome === "ok", t30.outcome);
-  check(
-    "T30a",
-    "  └ 确实没走 GET（methodSequence 只有 HEAD）",
-    t30.evidence.methodSequence.length === 1 && t30.evidence.methodSequence[0] === "HEAD",
-    t30.evidence.methodSequence.join(",")
-  );
-
-  // 同样的页面但 HEAD 不可用 → 强制 GET，此时 E1 必须真的挡住
-  const t30b = await probeUrl(mock, "/parked-long-nohead");
-  check(
-    "T30b",
-    "HEAD 不可用时走 GET，正文 >1500 → E1 否决",
-    t30b.outcome === "ok" && t30b.evidence.exclusionsHit.includes("E1"),
-    `${t30b.outcome} exclusions=[${t30b.evidence.exclusionsHit.join(",")}]`
-  );
+  check("T26", "中文该域名待售 → parked/weak",
+    t26.outcome === "parked" && t26.evidenceStrength === "weak", `${t26.outcome}/${t26.evidenceStrength}`);
 
   const t31 = await probeUrl(mock, "/parked-manylinks");
-  check(
-    "T31",
-    "内链 >5 → ok（E2 否决）",
+  check("T31", "内链 >5 → ok（E2 否决）",
     t31.outcome === "ok" && t31.evidence.exclusionsHit.includes("E2"),
-    `${t31.outcome} ${t31.evidence.exclusionsHit.join(",")}`
-  );
+    `${t31.outcome} ${t31.evidence.exclusionsHit.join(",")}`);
 
   const t32 = await probeUrl(mock, "/parked-en", { isDomainCategory: true });
-  check(
-    "T32",
-    "域名类目工具 → ok（E5 否决）",
+  check("T32", "域名类目工具 → ok（E5 否决）",
     t32.outcome === "ok" && t32.evidence.exclusionsHit.includes("E5"),
-    `${t32.outcome} ${t32.evidence.exclusionsHit.join(",")}`
-  );
+    `${t32.outcome} ${t32.evidence.exclusionsHit.join(",")}`);
 
   const t33 = await probeUrl(mock, "/coming-soon");
   check("T33", "仅 coming soon（L3）→ ok", t33.outcome === "ok", t33.outcome);
 
   const t34 = await probeUrl(mock, "/parked-brand", { title: "Acme Writer" });
-  check(
-    "T34",
-    "品牌名仍在 title → ok（E3 否决）",
+  check("T34", "品牌名仍在 title → ok（E3 否决）",
     t34.outcome === "ok" && t34.evidence.exclusionsHit.includes("E3"),
-    `${t34.outcome} ${t34.evidence.exclusionsHit.join(",")}`
-  );
+    `${t34.outcome} ${t34.evidence.exclusionsHit.join(",")}`);
+
+  const t29 = await probeUrl(mock, "/redir-cross-brand", { forceContentCheck: true });
+  check("T29", "跨域跳到正常新站 → ok + domain_migrated，不判 parked",
+    t29.outcome === "ok" && t29.domainMigrated, `${t29.outcome} migrated=${t29.domainMigrated}`);
 }
 
-async function antiConcatTests(mock: MockServer) {
+async function antiConcatTests(mock: MockControl) {
   console.log("\n8.4 反拼接边界（★ 8 词 + 8 词 ≠ 16 词的同源问题）\n");
 
   const t35 = await probeUrl(mock, "/split-buy-domain");
-  check(
-    "T35",
-    "<div>Buy</div><div>this domain now</div> 不得拼成 buy this domain",
-    t35.outcome !== "parked",
-    t35.outcome
-  );
+  check("T35", "<div>Buy</div><div>this domain now</div> 不得拼成 buy this domain",
+    t35.outcome !== "parked", t35.outcome);
 
   const t36 = await probeUrl(mock, "/split-not-found");
-  check("T36", "<li>Not</li><li>found here</li> 不得拼成 not found", t36.outcome !== "soft_404", t36.outcome);
+  check("T36", "<li>Not</li><li>found here</li> 不得拼成 not found",
+    t36.outcome !== "soft_404", t36.outcome);
 
   const t37 = await probeUrl(mock, "/split-cn");
   check("T37", "中文跨块「此域|名待售」不得拼接", t37.outcome !== "parked", t37.outcome);
 
   const t38 = await probeUrl(mock, "/inblock-buy-domain");
-  check(
-    "T38",
-    "块内完整命中仍要拦（确认没矫枉过正）",
-    t38.outcome === "parked",
-    t38.outcome
-  );
+  check("T38", "块内完整命中仍要拦（确认没矫枉过正）", t38.outcome === "parked", t38.outcome);
 
   const t39 = await probeUrl(mock, "/mixed-split-and-inblock");
   const spanning = t39.evidence.matchedSignatures.filter((s) => s.matchedText.includes("\x00"));
-  check(
-    "T39",
-    "跨块与块内并存时只记块内命中",
-    t39.outcome === "parked" && spanning.length === 0,
-    `${t39.outcome} 跨界命中 ${spanning.length}`
-  );
+  check("T39", "跨块与块内并存时只记块内命中",
+    t39.outcome === "parked" && spanning.length === 0, `${t39.outcome} 跨界命中 ${spanning.length}`);
 
-  // 直接测分块器本身
   const blocks = extractText("<div>Buy</div><div>this domain</div>").blocks;
-  check(
-    "T39b",
-    "分块器把两段分开",
-    blocks.length === 2 && blocks[0] === "Buy" && blocks[1] === "this domain",
-    JSON.stringify(blocks)
-  );
+  check("T39b", "分块器把两段分开",
+    blocks.length === 2 && blocks[0] === "Buy" && blocks[1] === "this domain", JSON.stringify(blocks));
 }
 
-async function blockedDeferredTests(mock: MockServer) {
+async function blockedDeferredTests(mock: MockControl) {
   console.log("\n8.5 blocked / deferred\n");
 
   const t40 = await probeUrl(mock, "/cf-challenge");
@@ -282,56 +264,35 @@ async function blockedDeferredTests(mock: MockServer) {
   const t42 = await probeUrl(mock, "/451");
   check("T42", "451 → blocked", t42.outcome === "blocked", t42.outcome);
 
-  // robots
-  await fetch(`${mock.origin}/__robots?mode=disallow`);
+  mock.setRobots("disallow");
   mock.reset();
   const t43 = await probeUrl(mock, "/robots-disallowed/page");
   const mainRequests = mock.log.filter((l) => l.path === "/robots-disallowed/page");
-  check(
-    "T43",
-    "robots Disallow → blocked 且零主请求",
+  check("T43", "robots Disallow → blocked 且零主请求",
     t43.outcome === "blocked" && mainRequests.length === 0,
-    `${t43.outcome} 主请求 ${mainRequests.length}`
-  );
+    `${t43.outcome} 主请求 ${mainRequests.length}`);
 
-  await fetch(`${mock.origin}/__robots?mode=500`);
+  mock.setRobots("500");
   const t44 = await probeUrl(mock, "/ok");
-  check(
-    "T44",
-    "robots 500 → deferred（不当允许也不当失败）",
-    t44.outcome === "deferred",
-    t44.outcome
-  );
+  check("T44", "robots 500 → deferred（不当允许也不当失败）", t44.outcome === "deferred", t44.outcome);
 
-  await fetch(`${mock.origin}/__robots?mode=delay`);
+  mock.setRobots("delay");
   const t45 = await probeUrl(mock, "/robots-delay/page");
   check("T45", "Crawl-delay 60s → deferred", t45.outcome === "deferred", t45.outcome);
 
-  await fetch(`${mock.origin}/__robots?mode=allow`);
+  mock.setRobots("allow");
 
   const t46 = await probeUrl(mock, "/429");
-  check(
-    "T46",
-    "429 + Retry-After → deferred",
-    t46.outcome === "deferred" && t46.retryAfterMs === 3600_000,
-    `${t46.outcome} retry=${t46.retryAfterMs}`
-  );
+  check("T46", "429 + Retry-After → deferred",
+    t46.outcome === "deferred" && t46.retryAfterMs === 3600_000, `${t46.outcome} retry=${t46.retryAfterMs}`);
 
   const t47 = await probeUrl(mock, "/429-bare");
-  check(
-    "T47",
-    "429 无 Retry-After → deferred +6h",
-    t47.outcome === "deferred" && t47.retryAfterMs === 6 * 3600_000,
-    `${t47.outcome} retry=${t47.retryAfterMs}`
-  );
+  check("T47", "429 无 Retry-After → deferred +6h",
+    t47.outcome === "deferred" && t47.retryAfterMs === 6 * 3600_000, `${t47.outcome} retry=${t47.retryAfterMs}`);
 
   const t48 = await probeUrl(mock, "/503-retry");
-  check(
-    "T48",
-    "503 + Retry-After → deferred（下限钳到 1h）",
-    t48.outcome === "deferred" && t48.retryAfterMs === 3600_000,
-    `${t48.outcome} retry=${t48.retryAfterMs}`
-  );
+  check("T48", "503 + Retry-After → deferred（下限钳到 1h）",
+    t48.outcome === "deferred" && t48.retryAfterMs === 3600_000, `${t48.outcome} retry=${t48.retryAfterMs}`);
 
   const t49 = await probeUrl(mock, "/503-plain");
   check("T49", "503 无 Retry-After → http_5xx", t49.outcome === "http_5xx", t49.outcome);
@@ -342,8 +303,8 @@ async function blockedDeferredTests(mock: MockServer) {
   check("T50", "blocked/deferred/unsafe/unknown 均不计熔断", t50);
 }
 
-async function ssrfTests() {
-  console.log("\n8.6 SSRF\n");
+async function ssrfTests(mock: MockControl) {
+  console.log("\n8.6 SSRF（全部走生产默认参数，代码里已无任何绕过开关）\n");
 
   const cases: [string, string, string][] = [
     ["T51", "file:///etc/passwd", "protocol_not_allowed"],
@@ -353,43 +314,30 @@ async function ssrfTests() {
     ["T55", "http://100.100.100.200/", "metadata_endpoint"],
     ["T59", "http://[::ffff:127.0.0.1]/", "private_ip"],
     ["T60", "http://example.com:22/", "port_not_allowed"],
+    ["T60c", "http://example.com:8080/", "port_not_allowed"],
     ["T61", "http://evil.com@127.0.0.1/", "userinfo_in_url"],
     ["T62", "http://foo.internal/", "hostname_not_allowed"],
+    ["T62b", "http://localhost/", "hostname_not_allowed"],
   ];
   for (const [id, url, expected] of cases) {
     const verdict = await assertSafeUrl(url, async () => [PUBLIC_IP]);
-    check(
-      id,
-      `${url} → ${expected}`,
-      !verdict.safe && verdict.reason === expected,
-      verdict.safe ? "safe!" : verdict.reason
-    );
+    check(id, `${url} → ${expected}`,
+      !verdict.safe && verdict.reason === expected, verdict.safe ? "safe!" : verdict.reason);
   }
 
-  // T57：多 A 记录，任一命中即拒
-  const t57 = await assertSafeUrl("http://multi.example.com/", async () => [
-    PUBLIC_IP,
-    "127.0.0.1",
-  ]);
-  check("T57", "多 A 记录任一私网即拒", !t57.safe && t57.reason === "private_ip", t57.safe ? "safe!" : t57.reason);
+  const t57 = await assertSafeUrl("http://multi.example.com/", async () => [PUBLIC_IP, "127.0.0.1"]);
+  check("T57", "多 A 记录任一私网即拒",
+    !t57.safe && t57.reason === "private_ip", t57.safe ? "safe!" : t57.reason);
 
-  // T58：DNS rebinding —— 校验时公网，第二次解析给内网
   let calls = 0;
   const rebinding = async () => {
     calls++;
     return calls === 1 ? [PUBLIC_IP] : ["127.0.0.1"];
   };
   const t58 = await assertSafeUrl("http://rebind.example.com/", rebinding);
-  check(
-    "T58",
-    "rebinding：校验通过时 pinnedIp 已固定为首解析地址",
-    t58.safe && t58.pinnedIp === PUBLIC_IP,
-    t58.safe ? t58.pinnedIp : t58.reason
-  );
-
-  // T56：重定向到私网 —— 在 http-client 层每跳重校验
-  const t56 = await assertSafeUrl("http://192.168.1.1/", async () => ["192.168.1.1"]);
-  check("T56", "重定向目标 192.168.1.1 会被拒", !t56.safe && t56.reason === "private_ip");
+  check("T58", "rebinding：pinnedIp 固定为已校验的首解析地址",
+    t58.safe && t58.pinnedIp === PUBLIC_IP, t58.safe ? t58.pinnedIp : t58.reason);
+  check("T58b", "  └ 只解析一次，连接不会再解析第二遍", calls === 1, `resolve 调用 ${calls} 次`);
 
   const ranges = [
     "0.0.0.0", "10.255.255.255", "100.64.0.1", "127.0.0.1", "169.254.1.1",
@@ -404,32 +352,22 @@ async function ssrfTests() {
     v6.filter((r) => !isBlockedAddress(r)).join(","));
 
   const publicOk = [PUBLIC_IP, PUBLIC_IP_2, "2606:4700::1"];
-  check("T51c", "真实公网地址不被误拒",
-    publicOk.every((ip) => !isBlockedAddress(ip)),
+  check("T51c", "真实公网地址不被误拒", publicOk.every((ip) => !isBlockedAddress(ip)),
     publicOk.filter((ip) => isBlockedAddress(ip)).join(","));
 
-  // 文档保留段确实在黑名单里（确认上面换 IP 的理由成立）
   const docRanges = ["203.0.113.1", "192.0.2.1", "198.51.100.1"];
   check("T51d", "文档保留段仍被拒", docRanges.every(isBlockedAddress));
 
-  // ★ 默认参数（不传 safety）下 loopback 必须被拒 —— 证明测试注入点没有放松生产规则
-  const prodDefault = await assertSafeUrl("http://127.0.0.1:8080/", async () => ["127.0.0.1"]);
-  check("T52b", "生产默认参数下 loopback 仍被拒（测试开关未放松规则）",
-    !prodDefault.safe, prodDefault.safe ? "safe!" : prodDefault.reason);
-  const prodPort = await assertSafeUrl("http://example.com:8080/", async () => [PUBLIC_IP]);
-  check("T60b", "生产默认参数下非 80/443 端口仍被拒",
-    !prodPort.safe && prodPort.reason === "port_not_allowed",
-    prodPort.safe ? "safe!" : prodPort.reason);
-}
+  // 逐跳重校验：跳到私网 / 元数据都必须中止
+  const t56 = await probeUrl(mock, "/redir-private");
+  check("T56", "重定向到私网 IP → unsafe_target",
+    t56.outcome === "unsafe_target" && t56.unsafeReason === "private_ip",
+    `${t56.outcome}/${t56.unsafeReason}`);
 
-async function redirectSsrfTest(mock: MockServer) {
-  const r = await probeUrl(mock, "/redir-private");
-  check(
-    "T56b",
-    "探针跟随重定向到私网 → unsafe_target",
-    r.outcome === "unsafe_target",
-    `${r.outcome}/${r.unsafeReason}`
-  );
+  const t56b = await probeUrl(mock, "/redir-metadata");
+  check("T56b", "重定向到元数据端点 → unsafe_target",
+    t56b.outcome === "unsafe_target" && t56b.unsafeReason === "metadata_endpoint",
+    `${t56b.outcome}/${t56b.unsafeReason}`);
 }
 
 function debounceTests() {
@@ -437,210 +375,123 @@ function debounceTests() {
 
   const day = (n: number) => new Date(Date.UTC(2026, 0, n, 4, 0, 0));
   const failRound = (kind: string, at: Date, outcome: ProbeOutcome = "timeout") => ({
-    outcome,
-    errorKind: kind,
-    evidenceStrength: null,
-    confidence: "high" as const,
-    domainMigrated: false,
-    finalUrl: null,
-    probeVersion: PROBE_VERSION,
-    at,
+    outcome, errorKind: kind, evidenceStrength: null, confidence: "high" as const,
+    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at,
   });
   const okRound = (at: Date) => ({
-    outcome: "ok" as ProbeOutcome,
-    errorKind: null,
-    evidenceStrength: null,
-    confidence: "high" as const,
-    domainMigrated: false,
-    finalUrl: null,
-    probeVersion: PROBE_VERSION,
-    at,
+    outcome: "ok" as ProbeOutcome, errorKind: null, evidenceStrength: null,
+    confidence: "high" as const, domainMigrated: false, finalUrl: null,
+    probeVersion: PROBE_VERSION, at,
   });
 
-  // T64：同日 3 次失败只计一轮
   let s: DebounceState = INITIAL_STATE;
   for (let i = 0; i < 3; i++) {
     const d = applyRound(s, failRound("timeout", day(1)));
     if (d.ok) s = d.next;
   }
-  check(
-    "T64",
-    "同日 3 次失败 → streak=1, distinct=1",
+  check("T64", "同日 3 次失败 → streak=1, distinct=1",
     s.consecutiveFails === 1 && s.distinctFailDates === 1,
-    `streak=${s.consecutiveFails} distinct=${s.distinctFailDates}`
-  );
+    `streak=${s.consecutiveFails} distinct=${s.distinctFailDates}`);
 
-  // T66：第 1/8/15 天各失败一次 → dead
   const r66 = replay([failRound("timeout", day(1)), failRound("timeout", day(8)), failRound("timeout", day(15))]);
-  check(
-    "T66",
-    "1/8/15 天各一次 timeout → dead",
+  check("T66", "1/8/15 天各一次 timeout → dead",
     r66.state.reach === "dead" && r66.state.distinctFailDates === 3,
-    `${r66.state.reach} distinct=${r66.state.distinctFailDates}`
-  );
+    `${r66.state.reach} distinct=${r66.state.distinctFailDates}`);
 
-  // T67：跨度仅 13 天
   const r67 = replay([failRound("timeout", day(1)), failRound("timeout", day(7)), failRound("timeout", day(14))]);
   check("T67", "跨度 13 天 → 不判 dead", r67.state.reach !== "dead", r67.state.reach);
 
-  // T68：连续 3 天
   const r68 = replay([failRound("timeout", day(1)), failRound("timeout", day(2)), failRound("timeout", day(3))]);
   check("T68", "连续 3 天（跨度 2 天）→ 不判 dead", r68.state.reach !== "dead", r68.state.reach);
 
-  // T69：族变更重置
-  const r69 = replay([
-    failRound("timeout", day(1)),
-    failRound("timeout", day(8)),
-    failRound("http_404", day(15), "http_404"),
-  ]);
-  check(
-    "T69",
-    "network → gone 族变更后重新计数",
+  const r69 = replay([failRound("timeout", day(1)), failRound("timeout", day(8)), failRound("http_404", day(15), "http_404")]);
+  check("T69", "network → gone 族变更后重新计数",
     r69.state.consecutiveFails === 2 && r69.state.distinctFailDates === 1 && r69.state.reach !== "dead",
-    `streak=${r69.state.consecutiveFails} distinct=${r69.state.distinctFailDates} reach=${r69.state.reach}`
-  );
+    `streak=${r69.state.consecutiveFails} distinct=${r69.state.distinctFailDates}`);
 
-  // T70：同族不同 kind 累加
-  const r70 = replay([
-    failRound("timeout", day(1)),
-    failRound("dns", day(8), "dns"),
-    failRound("tls", day(15), "tls"),
-  ]);
-  check(
-    "T70",
-    "timeout/dns/tls 同属 network → 累加至 dead",
-    r70.state.reach === "dead" && r70.state.distinctFailDates === 3,
-    `${r70.state.reach} distinct=${r70.state.distinctFailDates}`
-  );
+  const r70 = replay([failRound("timeout", day(1)), failRound("dns", day(8), "dns"), failRound("tls", day(15), "tls")]);
+  check("T70", "timeout/dns/tls 同属 network → 累加至 dead",
+    r70.state.reach === "dead" && r70.state.distinctFailDates === 3, r70.state.reach);
 
-  // T71：404 权重 2，两轮 streak=4 但 distinct=2
   const r71 = replay([failRound("http_404", day(1), "http_404"), failRound("http_404", day(20), "http_404")]);
-  check(
-    "T71",
-    "404 权重 ×2：streak=4 但 distinct=2 → 不判 dead",
+  check("T71", "404 权重×2：streak=4 但 distinct=2 → 不判 dead",
     r71.state.consecutiveFails === 4 && r71.state.distinctFailDates === 2 && r71.state.reach !== "dead",
-    `streak=${r71.state.consecutiveFails} distinct=${r71.state.distinctFailDates} reach=${r71.state.reach}`
-  );
+    `streak=${r71.state.consecutiveFails} distinct=${r71.state.distinctFailDates}`);
 
-  // T72：失败后恢复
   const r72 = replay([
-    failRound("timeout", day(1)),
-    failRound("timeout", day(8)),
-    failRound("timeout", day(15)),
-    okRound(day(16)),
+    failRound("timeout", day(1)), failRound("timeout", day(8)),
+    failRound("timeout", day(15)), okRound(day(16)),
   ]);
   const lastFlags = r72.steps[3].ok ? r72.steps[3].changeFlags : [];
-  check(
-    "T72",
-    "dead 后一次 ok → 清零 + recovered",
+  check("T72", "dead 后一次 ok → 清零 + recovered",
     r72.state.reach === "ok" && r72.state.consecutiveFails === 0 && lastFlags.includes("recovered"),
-    `${r72.state.reach} flags=${lastFlags.join(",")}`
-  );
+    `${r72.state.reach} flags=${lastFlags.join(",")}`);
 
-  // T74：dead 状态下 blocked 保持 dead
   const deadState = replay([failRound("timeout", day(1)), failRound("timeout", day(8)), failRound("timeout", day(15))]).state;
   const afterBlocked = applyRound(deadState, {
-    outcome: "blocked", errorKind: "blocked", evidenceStrength: null,
-    confidence: "high", domainMigrated: false, finalUrl: null,
-    probeVersion: PROBE_VERSION, at: day(20),
+    outcome: "blocked", errorKind: "blocked", evidenceStrength: null, confidence: "high",
+    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(20),
   });
-  check(
-    "T74",
-    "已 dead 遇 blocked → 保持 dead（不退回 unverifiable）",
-    afterBlocked.ok && afterBlocked.next.reach === "dead",
-    afterBlocked.ok ? afterBlocked.next.reach : "?"
-  );
+  check("T74", "已 dead 遇 blocked → 保持 dead",
+    afterBlocked.ok && afterBlocked.next.reach === "dead", afterBlocked.ok ? afterBlocked.next.reach : "?");
 
-  // 非 dead 遇 blocked → unverifiable
   const afterBlockedFresh = applyRound(INITIAL_STATE, {
-    outcome: "blocked", errorKind: "blocked", evidenceStrength: null,
-    confidence: "high", domainMigrated: false, finalUrl: null,
-    probeVersion: PROBE_VERSION, at: day(1),
+    outcome: "blocked", errorKind: "blocked", evidenceStrength: null, confidence: "high",
+    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(1),
   });
-  check(
-    "T74b",
-    "非 dead 遇 blocked → unverifiable",
+  check("T74b", "非 dead 遇 blocked → unverifiable",
     afterBlockedFresh.ok && afterBlockedFresh.next.reach === "unverifiable",
-    afterBlockedFresh.ok ? afterBlockedFresh.next.reach : "?"
-  );
+    afterBlockedFresh.ok ? afterBlockedFresh.next.reach : "?");
 
-  // T75：parked 强证据单次即 dead
   const t75 = applyRound(INITIAL_STATE, {
-    outcome: "parked", errorKind: "parked", evidenceStrength: "strong",
-    confidence: "high", domainMigrated: false, finalUrl: null,
-    probeVersion: PROBE_VERSION, at: day(1),
+    outcome: "parked", errorKind: "parked", evidenceStrength: "strong", confidence: "high",
+    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(1),
   });
   check("T75", "parked 强证据 → 单次 dead", t75.ok && t75.next.reach === "dead", t75.ok ? t75.next.reach : "?");
 
   const t75b = applyRound(INITIAL_STATE, {
-    outcome: "parked", errorKind: "parked", evidenceStrength: "weak",
-    confidence: "high", domainMigrated: false, finalUrl: null,
-    probeVersion: PROBE_VERSION, at: day(1),
+    outcome: "parked", errorKind: "parked", evidenceStrength: "weak", confidence: "high",
+    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(1),
   });
-  check("T75b", "parked 弱证据 → 走消抖，不立即 dead", t75b.ok && t75b.next.reach !== "dead", t75b.ok ? t75b.next.reach : "?");
+  check("T75b", "parked 弱证据 → 走消抖", t75b.ok && t75b.next.reach !== "dead", t75b.ok ? t75b.next.reach : "?");
 
-  // unsafe_target 永不 dead
-  const r63 = replay([
-    { outcome: "unsafe_target", errorKind: "unsafe_target", evidenceStrength: null, confidence: "high", domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(1) },
-    { outcome: "unsafe_target", errorKind: "unsafe_target", evidenceStrength: null, confidence: "high", domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(20) },
-    { outcome: "unsafe_target", errorKind: "unsafe_target", evidenceStrength: null, confidence: "high", domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(40) },
-  ]);
-  check(
-    "T63",
-    "unsafe_target 三轮 → 始终 unverifiable，绝不 dead",
+  const unsafeRound = (at: Date) => ({
+    outcome: "unsafe_target" as ProbeOutcome, errorKind: "unsafe_target", evidenceStrength: null,
+    confidence: "high" as const, domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at,
+  });
+  const r63 = replay([unsafeRound(day(1)), unsafeRound(day(20)), unsafeRound(day(40))]);
+  check("T63", "unsafe_target 三轮 → 始终 unverifiable，绝不 dead",
     r63.state.reach === "unverifiable" && r63.state.needsManualCheck,
-    `${r63.state.reach} manual=${r63.state.needsManualCheck}`
-  );
+    `${r63.state.reach} manual=${r63.state.needsManualCheck}`);
 
-  // deferred 不改任何字段
   const beforeDeferred = { ...INITIAL_STATE, consecutiveFails: 2, distinctFailDates: 2 };
   const afterDeferred = applyRound(beforeDeferred, {
-    outcome: "deferred", errorKind: null, evidenceStrength: null,
-    confidence: "high", domainMigrated: false, finalUrl: null,
-    probeVersion: PROBE_VERSION, at: day(9),
+    outcome: "deferred", errorKind: null, evidenceStrength: null, confidence: "high",
+    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION, at: day(9),
   });
-  check(
-    "T46b",
-    "deferred 不改消抖字段",
-    afterDeferred.ok &&
-      afterDeferred.next.consecutiveFails === 2 &&
-      afterDeferred.next.distinctFailDates === 2,
-    afterDeferred.ok ? `streak=${afterDeferred.next.consecutiveFails}` : "?"
-  );
+  check("T46b", "deferred 不改消抖字段",
+    afterDeferred.ok && afterDeferred.next.consecutiveFails === 2 && afterDeferred.next.distinctFailDates === 2,
+    afterDeferred.ok ? `streak=${afterDeferred.next.consecutiveFails}` : "?");
 
-  // 版本不匹配
-  const mismatch = applyRound(INITIAL_STATE, {
-    outcome: "ok", errorKind: null, evidenceStrength: null, confidence: "high",
-    domainMigrated: false, finalUrl: null, probeVersion: PROBE_VERSION + 99, at: day(1),
-  });
-  check(
-    "T79",
-    "probe_version 不匹配 → version_mismatch，不静默混算",
+  // ★ v1 证据不得被 v2 判定层静默接受
+  const v1Round = { ...okRound(day(1)), probeVersion: 1 };
+  const mismatch = applyRound(INITIAL_STATE, v1Round);
+  check("T79", "v1 证据喂给 v2 → version_mismatch，不静默混算",
     !mismatch.ok && mismatch.reason === "version_mismatch",
-    mismatch.ok ? "被静默接受了！" : mismatch.reason
-  );
+    mismatch.ok ? "被静默接受了！" : `expected=${mismatch.expected} got=${mismatch.got}`);
 
-  const mixedReplay = replay([
-    okRound(day(1)),
-    { ...okRound(day(2)), probeVersion: PROBE_VERSION + 99 },
-    failRound("timeout", day(3)),
-  ]);
-  check("T79b", "replay 计数版本不匹配轮次", mixedReplay.versionMismatches === 1, String(mixedReplay.versionMismatches));
+  const mixedReplay = replay([okRound(day(1)), v1Round, failRound("timeout", day(3))]);
+  check("T79b", "replay 计数版本不匹配轮次并跳过",
+    mixedReplay.versionMismatches === 1, String(mixedReplay.versionMismatches));
 
-  // domain_migrated
   const migrated = applyRound(INITIAL_STATE, {
     outcome: "ok", errorKind: null, evidenceStrength: null, confidence: "high",
     domainMigrated: true, finalUrl: "https://new-brand.com/", probeVersion: PROBE_VERSION, at: day(1),
   });
-  check(
-    "T29b",
-    "domain_migrated → 标 flag + needs_manual_check，不自动改 URL",
-    migrated.ok &&
-      migrated.changeFlags.includes("domain_migrated") &&
-      migrated.next.needsManualCheck &&
-      migrated.next.reach === "ok",
-    migrated.ok ? migrated.changeFlags.join(",") : "?"
-  );
+  check("T29b", "domain_migrated → 标 flag + needs_manual_check，不自动改 URL",
+    migrated.ok && migrated.changeFlags.includes("domain_migrated") &&
+      migrated.next.needsManualCheck && migrated.next.reach === "ok",
+    migrated.ok ? migrated.changeFlags.join(",") : "?");
 }
 
 function pslTests() {
@@ -654,21 +505,18 @@ function pslTests() {
 }
 
 async function main() {
-  const mock = await startMockServer();
-  console.log(`mock server: ${mock.origin}\n（不访问任何真实站点）`);
-  try {
-    await stateMachineTests(mock);
-    await soft404Tests(mock);
-    await parkedTests(mock);
-    await antiConcatTests(mock);
-    await blockedDeferredTests(mock);
-    await ssrfTests();
-    await redirectSsrfTest(mock);
-    debounceTests();
-    pslTests();
-  } finally {
-    await mock.close();
-  }
+  const mock = createMockTransport();
+  console.log(`fixture transport（内存，无网络）· PROBE_VERSION=${PROBE_VERSION}`);
+
+  await stateMachineTests(mock);
+  await contentCheckTests(mock);
+  await soft404Tests(mock);
+  await parkedTests(mock);
+  await antiConcatTests(mock);
+  await blockedDeferredTests(mock);
+  await ssrfTests(mock);
+  debounceTests();
+  pslTests();
 
   console.log(`\n合计 ${pass} 通过 / ${fail} 失败`);
   if (failures.length) {

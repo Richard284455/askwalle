@@ -5,7 +5,40 @@
  *   证据里存着它；判定层重放时版本不匹配会返回 version_mismatch 而不是静默混算。
  *   相似度闸门改口径那次，正是因为没有版本号，12 条草稿的状态悄悄漂移了。
  */
-export const PROBE_VERSION = 1;
+export const PROBE_VERSION = 2;
+
+/**
+ * 深度内容检查周期（天）。
+ *
+ * v1 的问题：HEAD 2xx 短路时不取正文，正常体积的 soft-404 / 停放页永远进不了
+ * 内容分类 —— 只有小页面、HEAD 不可用、跨域跳转这三条路会取正文。
+ * v2 增加「按 tier 周期性强制 GET」，保证每个工具都会被完整看一遍。
+ */
+export const CONTENT_CHECK_INTERVAL_DAYS: Record<string, number> = {
+  featured: 7,
+  featured_candidate: 7,
+  standard: 30,
+  longtail: 90,
+};
+
+export function contentCheckIntervalDays(tier: string): number {
+  return CONTENT_CHECK_INTERVAL_DAYS[tier] ?? CONTENT_CHECK_INTERVAL_DAYS.standard;
+}
+
+/**
+ * 是否到期做深度内容检查。纯函数，可单测。
+ * 从未做过（null）一律返回 true —— A8 首轮基线因此会对每个 HTML 工具至少 GET 一次。
+ */
+export function isContentCheckDue(
+  lastContentCheckedAt: Date | null,
+  tier: string,
+  now: Date = new Date()
+): boolean {
+  if (!lastContentCheckedAt) return true;
+  const elapsedDays =
+    (now.getTime() - lastContentCheckedAt.getTime()) / 86_400_000;
+  return elapsedDays >= contentCheckIntervalDays(tier);
+}
 
 export type ProbeOutcome =
   | "ok"
@@ -112,6 +145,8 @@ export type ProbeResult = {
   retryAfterMs: number | null;
   domainMigrated: boolean;
   unsafeReason: string | null;
+  /** 本轮是否真的完成了正文分类（决定要不要推进 last_content_checked_at） */
+  contentChecked: boolean;
   evidence: ProbeEvidence;
 };
 

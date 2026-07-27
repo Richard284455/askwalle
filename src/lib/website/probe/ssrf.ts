@@ -190,25 +190,10 @@ export const defaultResolve: ResolveFn = async (hostname) => {
  *
  * 每一跳重定向都必须重跑本函数（契约 §5.4），包括同域跳转。
  */
-export type SafetyOptions = {
-  /**
-   * **仅供契约测试**：放行私网/回环地址，让测试能连本地 mock。
-   *
-   * 生产路径从不传这个参数 —— probeReachability / runHealthCheckRound 都没有
-   * 对应入口，只有 scripts/probe-contract-tests.ts 显式传 true。契约测试里有一条
-   * 专门断言「默认参数下 127.0.0.1 会被拒」（T52），确保这个开关没有把规则改松。
-   *
-   * 刻意不做成环境变量：环境变量会在生产里被意外设上，函数参数不会。
-   */
-  allowPrivateAddresses?: boolean;
-};
-
 export async function assertSafeUrl(
   rawUrl: string,
-  resolve: ResolveFn = defaultResolve,
-  options: SafetyOptions = {}
+  resolve: ResolveFn = defaultResolve
 ): Promise<SafetyVerdict> {
-  const allowPrivate = options.allowPrivateAddresses === true;
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -224,14 +209,13 @@ export async function assertSafeUrl(
   }
 
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
-  // 测试模式下 mock 跑在随机高位端口，一并放开；生产仍只允许 80/443
-  if (!allowPrivate && !ALLOWED_PORTS.includes(port)) {
+  if (!ALLOWED_PORTS.includes(port)) {
     return { safe: false, reason: "port_not_allowed", detail: String(port) };
   }
 
   // URL 会把 IPv6 主机包在方括号里
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
-  if (!allowPrivate && hostnameBlocked(hostname)) {
+  if (hostnameBlocked(hostname)) {
     return { safe: false, reason: "hostname_not_allowed", detail: hostname };
   }
 
@@ -239,11 +223,10 @@ export async function assertSafeUrl(
   const info = hostInfo(hostname);
 
   if (info.isIp || isIP(hostname) !== 0) {
-    // 元数据端点即使在测试模式下也绝不放行
     if (isMetadataAddress(hostname)) {
       return { safe: false, reason: "metadata_endpoint", detail: hostname };
     }
-    if (!allowPrivate && isBlockedAddress(hostname)) {
+    if (isBlockedAddress(hostname)) {
       return { safe: false, reason: "private_ip", detail: hostname };
     }
     return { safe: true, hostname, port, addresses: [hostname], pinnedIp: hostname };
@@ -269,7 +252,7 @@ export async function assertSafeUrl(
     if (isMetadataAddress(address)) {
       return { safe: false, reason: "metadata_endpoint", detail: address };
     }
-    if (!allowPrivate && isBlockedAddress(address)) {
+    if (isBlockedAddress(address)) {
       return { safe: false, reason: "private_ip", detail: address };
     }
   }

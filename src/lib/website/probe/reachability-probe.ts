@@ -1,9 +1,9 @@
 import { promises as dns } from "dns";
 
-import { safeFetch, FetchResult } from "./http-client";
+import { safeFetch, FetchResult, Transport } from "./http-client";
 import { checkRobots } from "./robots";
 import { hostInfo, registrableDomainOf, sameRegistrableDomain } from "./registrable-domain";
-import { ResolveFn, SafetyOptions } from "./ssrf";
+import { ResolveFn } from "./ssrf";
 import { extractText, ExtractedText } from "./text-blocks";
 import {
   SignatureHit,
@@ -43,8 +43,13 @@ export type ProbeInput = {
   /** 注入点，测试用 */
   resolve?: ResolveFn;
   lookupNs?: (domain: string) => Promise<string[]>;
-  /** 仅契约测试传：放行本地 mock。生产调用方一律不传 */
-  safety?: SafetyOptions;
+  /** 契约测试注入内存 fixture；生产走默认 nodeTransport。SSRF 校验两边完全一致 */
+  transport?: Transport;
+  /**
+   * 本轮强制做深度内容检查：禁用 HEAD 短路，一定取正文。
+   * 由服务层按 last_content_checked_at + tier 算出（types.isContentCheckDue）。
+   */
+  forceContentCheck?: boolean;
 };
 
 const defaultLookupNs = async (domain: string): Promise<string[]> => dns.resolveNs(domain);
@@ -114,6 +119,7 @@ function result(
     retryAfterMs: null,
     domainMigrated: false,
     unsafeReason: evidence.unsafeReason,
+    contentChecked: false,
     evidence,
     ...extra,
   };
@@ -182,7 +188,7 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
   };
 
   // ── S0 PREFLIGHT: robots ──────────────────────────────────────────────
-  const robots = await checkRobots(input.url, input.resolve, input.safety);
+  const robots = await checkRobots(input.url, input.resolve, input.transport);
   evidence.robotsDecision = robots.decision;
   if (robots.decision === "disallow") {
     evidence.robotsRule = robots.rule;
@@ -211,7 +217,7 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
 
   evidence.methodSequence.push("HEAD");
   const headStart = Date.now();
-  const head = await safeFetch(input.url, { method: "HEAD", resolve: input.resolve, safety: input.safety });
+  const head = await safeFetch(input.url, { method: "HEAD", resolve: input.resolve, transport: input.transport });
   evidence.latency.headMs = Date.now() - headStart;
 
   // 内联判别而非提取成 helper：TS 的联合收窄穿不过函数调用
@@ -228,7 +234,9 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
     evidence.finalStatus = head.status;
     evidence.finalUrl = head.finalUrl;
     evidence.headersSubset = head.headers;
-    if (headCanShortCircuit(head, requestedHost)) {
+    // 深度内容检查到期时不许短路：必须取正文，否则正常体积的 soft-404 /
+    // 停放页会一直被 HEAD 的 200 掩盖过去
+    if (!input.forceContentCheck && headCanShortCircuit(head, requestedHost)) {
       evidence.finalRegistrableDomain = registrableDomainOf(new URL(head.finalUrl).hostname);
       return finish(result("ok", evidence));
     }
@@ -237,7 +245,7 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
   // ── S2 GET（契约 §1.2：除 §1.1 全满足外的所有情况都要复核）─────────────
   evidence.methodSequence.push("GET");
   const getStart = Date.now();
-  const get = await safeFetch(input.url, { method: "GET", resolve: input.resolve, safety: input.safety });
+  const get = await safeFetch(input.url, { method: "GET", resolve: input.resolve, transport: input.transport });
   evidence.latency.getMs = Date.now() - getStart;
 
   if (get.kind === "unsafe") {
@@ -340,7 +348,15 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
   // ── 2xx：内容分类 ────────────────────────────────────────────────────
   // 契约 R3：内容检查只做减分。拿不到正文就退回状态码结论（2xx → ok）。
   if (!text || !contentUsable) {
-    return finish(result("ok", evidence, { confidence: "low", domainMigrated: crossDomain }));
+    // 非 HTML / 截断 / 解不开：正文分类做不了，但 GET 已经完成，
+    // 再来一轮也是同样结果 —— 记为已检查，避免每轮都白 GET
+    return finish(
+      result("ok", evidence, {
+        confidence: "low",
+        domainMigrated: crossDomain,
+        contentChecked: contentVerdict !== null,
+      })
+    );
   }
 
   // parked
@@ -361,6 +377,7 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
         errorKind: "parked",
         evidenceStrength: parkedVerdict,
         domainMigrated: false,
+        contentChecked: true,
       })
     );
   }
@@ -370,7 +387,7 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
   const titleOrH1 = soft.titleHit ?? soft.h1Hit;
   if (titleOrH1 && text.textLength < SOFT_404_LIMITS.titleOrH1MaxText) {
     evidence.matchedSignatures.push(titleOrH1);
-    return finish(result("soft_404", evidence));
+    return finish(result("soft_404", evidence, { contentChecked: true }));
   }
   if (
     soft.bodyHits.length &&
@@ -378,13 +395,14 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
     evidence.internalLinkCount <= SOFT_404_LIMITS.bodyMaxInternalLinks
   ) {
     evidence.matchedSignatures.push(soft.bodyHits[0]);
-    return finish(result("soft_404", evidence));
+    return finish(result("soft_404", evidence, { contentChecked: true }));
   }
 
   return finish(
     result("ok", evidence, {
       domainMigrated: crossDomain,
       confidence: "high",
+      contentChecked: true,
     })
   );
 }

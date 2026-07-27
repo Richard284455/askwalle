@@ -2,7 +2,7 @@ import http from "http";
 import https from "https";
 import { gunzipSync, inflateSync } from "zlib";
 
-import { assertSafeUrl, ResolveFn, SafetyOptions, SafetyVerdict } from "./ssrf";
+import { assertSafeUrl, ResolveFn, SafetyVerdict } from "./ssrf";
 
 /**
  * 探针专用 HTTP 客户端。
@@ -152,20 +152,30 @@ function decodeBody(
   return raw.toString("utf8");
 }
 
-type SingleRequestArgs = {
+export type TransportArgs = {
   method: "HEAD" | "GET";
   url: URL;
+  /** 已通过 SSRF 校验、连接必须钉死的地址 */
   pinnedIp: string;
   wantBody: boolean;
   signalDeadline: number;
 };
 
-function singleRequest(args: SingleRequestArgs): Promise<{
+export type TransportResponse = {
   status: number;
   headers: http.IncomingHttpHeaders;
   buffer: Buffer;
   truncated: boolean;
-}> {
+};
+
+/**
+ * 网络传输层。抽成接口是为了让契约测试能注入内存 fixture ——
+ * 测试因此可以跑**完整的生产 SSRF 校验**（解析器返回真实公网 IP），
+ * 而不需要任何「放行私网」的开关，也不需要真的建 TCP 连接。
+ */
+export type Transport = (args: TransportArgs) => Promise<TransportResponse>;
+
+export const nodeTransport: Transport = (args) => {
   const { method, url, pinnedIp, wantBody, signalDeadline } = args;
   const transport = url.protocol === "https:" ? https : http;
 
@@ -247,14 +257,14 @@ function singleRequest(args: SingleRequestArgs): Promise<{
     request.on("error", reject);
     request.end();
   });
-}
+};
 
 /**
  * 带 SSRF 校验与连接固定的取回。每一跳重定向都重新校验 + 重新固定。
  */
 export async function safeFetch(
   startUrl: string,
-  options: { method: "HEAD" | "GET"; resolve?: ResolveFn; safety?: SafetyOptions }
+  options: { method: "HEAD" | "GET"; resolve?: ResolveFn; transport?: Transport }
 ): Promise<FetchResult> {
   const started = Date.now();
   const deadline = started + LIMITS.totalTimeoutMs;
@@ -267,7 +277,7 @@ export async function safeFetch(
 
   for (let hop = 0; hop <= LIMITS.maxRedirects; hop++) {
     // ★ 每一跳都重跑安全校验，同域跳转也不例外
-    const verdict = await assertSafeUrl(currentUrl, options.resolve, options.safety);
+    const verdict = await assertSafeUrl(currentUrl, options.resolve);
     if (!verdict.safe) {
       return { kind: "unsafe", verdict, atHop: hop, redirectChain };
     }
@@ -281,9 +291,9 @@ export async function safeFetch(
     }
     seen.add(dedupeKey);
 
-    let response: Awaited<ReturnType<typeof singleRequest>>;
+    let response: TransportResponse;
     try {
-      response = await singleRequest({
+      response = await (options.transport ?? nodeTransport)({
         method: options.method,
         url,
         pinnedIp: verdict.pinnedIp,

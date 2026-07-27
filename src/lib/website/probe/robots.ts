@@ -1,5 +1,5 @@
-import { safeFetch } from "./http-client";
-import { ResolveFn, SafetyOptions } from "./ssrf";
+import { safeFetch, Transport } from "./http-client";
+import { ResolveFn } from "./ssrf";
 
 /**
  * robots.txt（契约 §1.4）。
@@ -112,7 +112,7 @@ export function evaluateRobots(groups: Group[], path: string): {
 export async function checkRobots(
   targetUrl: string,
   resolve?: ResolveFn,
-  safety?: SafetyOptions
+  transport?: Transport
 ): Promise<RobotsDecision> {
   let url: URL;
   try {
@@ -125,7 +125,7 @@ export async function checkRobots(
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.value;
 
   const robotsUrl = `${key}/robots.txt`;
-  const result = await safeFetch(robotsUrl, { method: "GET", resolve, safety });
+  const result = await safeFetch(robotsUrl, { method: "GET", resolve, transport });
 
   let decision: RobotsDecision;
   if (result.kind === "network_error") {

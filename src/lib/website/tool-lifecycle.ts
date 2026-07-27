@@ -14,6 +14,8 @@ import {
   ProbeResult,
   PROBE_VERSION,
   Reach,
+  contentCheckIntervalDays,
+  isContentCheckDue,
 } from "@/lib/website/probe/types";
 import { registrableDomainOf } from "@/lib/website/probe/registrable-domain";
 
@@ -143,6 +145,12 @@ export async function runHealthCheckRound(
   const state = toDebounceState(site.lifecycleState);
   const tier = site.lifecycleState?.tier ?? "standard";
 
+  // 深度内容检查是否到期：从未做过一律为真，A8 首轮基线因此每个工具都会 GET 一次
+  const forceContentCheck = isContentCheckDue(
+    site.lifecycleState?.last_content_checked_at ?? null,
+    tier
+  );
+
   await throttleSameDomain(site.url);
 
   const isDomainCategory = /domain|建站|域名/i.test(
@@ -155,6 +163,7 @@ export async function runHealthCheckRound(
       url: site.url,
       title: site.title,
       isDomainCategory,
+      forceContentCheck,
       ...overrides,
     });
   } catch (error) {
@@ -173,6 +182,7 @@ export async function runHealthCheckRound(
       retryAfterMs: null,
       domainMigrated: false,
       unsafeReason: null,
+      contentChecked: false,
       evidence: {
         probeVersion: PROBE_VERSION,
         requestedUrl: site.url,
@@ -238,6 +248,17 @@ export async function runHealthCheckRound(
   const next = decision.next;
   const anomaly = probe.outcome !== "ok" || decision.stateChanged || decision.changeFlags.length > 0;
 
+  // 只有真的完成了正文分类才推进内容检查排期；
+  // blocked / deferred / 网络失败都不算，否则会把「没看过」记成「看过了」
+  const contentFields = probe.contentChecked
+    ? {
+        last_content_checked_at: at,
+        next_content_check_at: new Date(
+          at.getTime() + contentCheckIntervalDays(tier) * 86_400_000
+        ),
+      }
+    : {};
+
   const [event] = await prisma.$transaction([
     prisma.toolHealthEvent.create({
       data: {
@@ -286,6 +307,7 @@ export async function runHealthCheckRound(
         final_url: next.finalUrl,
         needs_manual_check: next.needsManualCheck,
         probe_version: probe.probeVersion,
+        ...contentFields,
       },
       update: {
         reach: next.reach,
@@ -304,6 +326,7 @@ export async function runHealthCheckRound(
         final_url: next.finalUrl,
         needs_manual_check: next.needsManualCheck,
         probe_version: probe.probeVersion,
+        ...contentFields,
       },
     }),
   ]);
