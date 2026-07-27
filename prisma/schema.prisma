@@ -97,6 +97,8 @@ model Website {
   toolMedia   ToolMedia[]
   toolFaqs    ToolFAQ[]
   rewriteItems ToolRewriteItem[]
+  lifecycleState ToolLifecycleState?
+  healthEvents   ToolHealthEvent[]
 
   @@map("websites")
   @@index([category_id])
@@ -404,4 +406,101 @@ model BulkJobItem {
   @@map("bulk_job_items")
   @@index([job_id, status])
   @@index([website_id])
+}
+
+// ---------------------------------------------------------------------------
+// 工具生命周期（P0a：只做可达性，不影响公开页）
+//
+// 与 Website.status / ToolDetail.rewrite_status 正交：那两个记「编辑流程走到哪」，
+// 这里记「站点还活着吗、内容还新吗」。混在一起会让状态空间爆炸并破坏现有 guard。
+// ---------------------------------------------------------------------------
+
+model ToolLifecycleState {
+  website_id Int     @id
+  website    Website @relation(fields: [website_id], references: [id])
+
+  // ── 分层 ──
+  tier        String  @default("standard") // featured / standard / longtail
+  tier_locked Boolean @default(false) // 人工锁定，不被自动分层覆盖
+
+  // ── 可达性 ──
+  reach        String    @default("unknown") // ok / dead / unverifiable / unknown
+  reach_since  DateTime?
+  last_ok_at   DateTime?
+  last_checked_at DateTime?
+  next_check_at   DateTime?
+
+  // ── 消抖输入（契约 §6）──
+  consecutive_fails   Int       @default(0)
+  distinct_fail_dates Int       @default(0)
+  first_fail_at       DateTime?
+  last_fail_date      String? // Asia/Shanghai 日期 YYYY-MM-DD，与 cron 时区一致
+  fail_family         String? // network / server / gone
+  last_error_kind     String?
+
+  // ── 观测线索 ──
+  final_url         String? // 跟随重定向后的落地 URL（换域名线索）
+  archive_url       String? // 死链时给用户的历史快照入口（P0b 用）
+  needs_manual_check Boolean  @default(false)
+  probe_version     Int? // 最近一次判定所用的分类器版本
+
+  // ── 内容新鲜度（轨道 B 预留，P0a 不写）──
+  freshness        String?
+  last_snapshot_id Int?
+  drift_score      Float?
+  drift_fields     Json?
+  refresh_batch_id Int?
+
+  human_decision String? // confirmed_dead / url_updated / false_positive
+  decided_at     DateTime?
+  notes          String?
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  @@map("tool_lifecycle_states")
+  @@index([reach])
+  @@index([next_check_at])
+  @@index([tier, freshness])
+  @@index([needs_manual_check])
+}
+
+// 每个 scheduled check round 一条。ok 存轻量证据，异常存完整证据。
+// 全部字段的存在意义是「离线可重放」——判定层必须能拿历史证据重跑出同样结论。
+model ToolHealthEvent {
+  id         Int     @id @default(autoincrement())
+  website_id Int
+  website    Website @relation(fields: [website_id], references: [id])
+
+  // ── 溯源 ──
+  round_id      String // {job_id}:{website_id}:{YYYY-MM-DD}
+  probe_version Int
+  job_id        Int?
+  round_date    String // Asia/Shanghai 日期
+
+  // ── 判定 ──
+  outcome           String // ok / dns / timeout / tls / http_5xx / http_404 / http_410 / soft_404 / parked / blocked / deferred / unsafe_target / unknown
+  error_kind        String?
+  error_family      String? // network / server / gone
+  evidence_strength String? // strong / weak
+  confidence        String  @default("high") // high / low
+  change_flags      String[] // domain_migrated / recovered / state_changed / needs_manual_check / archive_found
+  reach_from        String?
+  reach_to          String?
+
+  // ── 轻量证据（每轮都存）──
+  final_status   Int?
+  final_url      String?
+  latency_ms     Int?
+  content_verdict String? // normal / spa_shell / non_html / truncated / undecodable
+
+  // ── 完整证据（仅异常/状态变化）──
+  evidence Json?
+
+  created_at DateTime @default(now())
+
+  @@map("tool_health_events")
+  @@index([website_id, created_at])
+  @@index([created_at])
+  @@index([outcome])
+  @@index([round_id])
 }

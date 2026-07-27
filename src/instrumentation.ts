@@ -5,4 +5,11 @@ export async function register() {
 
   const { startJobWorker } = await import("@/lib/website/job-worker");
   startJobWorker();
+
+  // 定时任务在这里注册（以前在 app/layout.tsx 的渲染路径里，不可靠）。
+  // 生产才启：开发热重载会反复触发 register，定时任务没有意义还会干扰。
+  if (process.env.NODE_ENV === "production") {
+    const { startCronJobs } = await import("@/lib/tasks/cron");
+    startCronJobs();
+  }
 }

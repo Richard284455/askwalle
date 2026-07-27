@@ -8,7 +8,6 @@ import Footer from "@/components/footer/index";
 import SWRProvider from "@/components/providers/swr-provider";
 import { Analytics as VercelAnalytics } from "@vercel/analytics/react";
 import { Analytics as OtherAnalytics } from "@/components/analytics";
-import { thumbnailUpdateJob } from "@/lib/tasks/cron";
 
 export const metadata: Metadata = {
   title: "AskWalle AI Hub - Discover the Best AI Tools",
@@ -38,11 +37,6 @@ export const metadata: Metadata = {
       "Explore AI tools for writing, image generation, coding, productivity, marketing, business, and more.",
   },
 };
-
-// 启动定时任务
-if (process.env.NODE_ENV === "production") {
-  thumbnailUpdateJob.start();
-}
 
 export default function RootLayout({
   children,

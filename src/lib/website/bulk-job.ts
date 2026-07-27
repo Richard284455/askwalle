@@ -14,6 +14,10 @@ import {
 } from "@/lib/website/tool-import";
 import { clearClaimedUpload } from "@/lib/website/import-upload";
 import {
+  runHealthCheckRound,
+  selectDueWebsites,
+} from "@/lib/website/tool-lifecycle";
+import {
   finalizeDirectRewriteBatch,
   markDirectRewriteStarted,
   prepareDirectRewrite,
@@ -49,19 +53,26 @@ export const CHUNK_SIZE = 5;
 export const REWRITE_CHUNK_SIZE = 1;
 
 export type BulkJobType =
+  | "health_check"
   | "apply_and_review"
   | "publish"
   | "import_excel"
   | "rewrite_direct";
 
 const JOB_TYPES: BulkJobType[] = [
+  "health_check",
   "apply_and_review",
   "publish",
   "import_excel",
   "rewrite_direct",
 ];
 
+// 可达性探测：每块 20 条。单条约 1–3 秒（HEAD 短路居多），一块 ~1 分钟，
+// 既不会让 run-next 请求超时，也能让进度条稳定推进。
+export const HEALTH_CHECK_CHUNK_SIZE = 20;
+
 function chunkSizeFor(type: BulkJobType): number {
+  if (type === "health_check") return HEALTH_CHECK_CHUNK_SIZE;
   return type === "rewrite_direct" ? REWRITE_CHUNK_SIZE : CHUNK_SIZE;
 }
 
@@ -215,6 +226,55 @@ export async function createImportJob(
 }
 
 // ---------------------------------------------------------------------------
+// 可达性探测任务：创建
+// ---------------------------------------------------------------------------
+
+// 一次任务最多取多少条到期工具。日均到期量远小于此，上限只是防止一次建出巨型任务。
+export const HEALTH_CHECK_JOB_MAX = 800;
+
+/**
+ * 建可达性探测任务。
+ *
+ * **全局同时只允许一个未终结的 health_check 任务**：多个任务并行会让全局并发
+ * 失控（每个任务各自按块跑），也会让同一批到期工具被重复探测。想加大吞吐应该
+ * 调 chunk size，不是开多个任务。
+ */
+export async function createHealthCheckJob(
+  limit = HEALTH_CHECK_JOB_MAX
+): Promise<
+  { ok: true; jobId: number; total: number } | { ok: false; message: string }
+> {
+  const running = await prisma.bulkJob.findFirst({
+    where: { type: "health_check", status: { notIn: TERMINAL_JOB_STATUSES } },
+    select: { id: true, status: true },
+  });
+  if (running) {
+    return {
+      ok: false,
+      message: `已有未终结的探测任务 #${running.id}（${running.status}），同时只允许一个`,
+    };
+  }
+
+  const capped = Math.min(Math.max(1, limit), HEALTH_CHECK_JOB_MAX);
+  const websiteIds = await selectDueWebsites(capped);
+  if (!websiteIds.length) return { ok: false, message: "当前没有到期需要探测的工具" };
+
+  const job = await prisma.bulkJob.create({
+    data: {
+      type: "health_check",
+      status: "queued",
+      total_count: websiteIds.length,
+      params: { limit: capped, selectedAt: new Date().toISOString() } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.bulkJobItem.createMany({
+    data: websiteIds.map((websiteId) => ({ job_id: job.id, website_id: websiteId })),
+  });
+  nudgeJobWorker();
+  return { ok: true, jobId: job.id, total: websiteIds.length };
+}
+
+// ---------------------------------------------------------------------------
 // 直连 AI 改写任务：创建
 // ---------------------------------------------------------------------------
 
@@ -349,6 +409,11 @@ async function runSingleItem(
   const reviewNotes = typeof params.reviewNotes === "string" ? params.reviewNotes : "";
   // 复检开关随任务参数走：建任务时勾了，执行每一条时也照样复检
   const recheckQc = params.recheckQc === true;
+  // 显式白名单：以前是 apply_and_review ? ... : publish，任何新 job 类型只要漏接
+  // 分支就会掉进 publish 把工具发布出去。宁可报错也不能默认发布。
+  if (type !== "apply_and_review" && type !== "publish") {
+    return { status: "failed", error: `任务类型 ${type} 不该走 runSingleItem` };
+  }
   const outcome =
     type === "apply_and_review"
       ? await bulkMarkReviewed([websiteId], reviewNotes, { recheckQc })
@@ -542,6 +607,24 @@ async function runChunkLocked(
       } else if (!item.website_id) {
         itemStatus = "failed";
         itemError = "缺少 website_id";
+      } else if (job.type === "health_check") {
+        // 一个 item = 一轮 scheduled round，恰好产出一个 outcome。
+        //
+        // item 状态的语义是「探针跑没跑成」，不是「站点活没活着」：
+        // 探针成功判定出 dead 也是 success。否则一批真死链会把熔断器打爆。
+        // deferred 记 skipped —— 本轮什么都没结论，等下次。
+        const round = await runHealthCheckRound(item.website_id, jobId);
+        itemStatus = round.outcome === "deferred" ? "skipped" : "success";
+        itemError =
+          round.outcome === "ok" ? null : `outcome=${round.outcome}`;
+        itemResult = {
+          outcome: round.outcome,
+          reachFrom: round.reachFrom,
+          reachTo: round.reachTo,
+          changeFlags: round.changeFlags,
+          eventId: round.eventId,
+          ...(round.versionMismatch ? { versionMismatch: true } : {}),
+        } as Prisma.InputJsonValue;
       } else if (job.type === "rewrite_direct") {
         const outcome = await runDirectRewriteItem(rewriteContext!, item.website_id);
         // qc_failed 单列一档：模型答了但内容不合格，重试同一个 prompt 没有意义，

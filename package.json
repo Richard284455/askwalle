@@ -14,7 +14,9 @@
     "backfill:slugs": "ts-node --project tsconfig.script.json scripts/backfill-website-slugs.ts",
     "backfill:raw-description": "ts-node --project tsconfig.script.json scripts/backfill-raw-imported-description.ts",
     "backfill:approved-raw-description": "ts-node --project tsconfig.script.json scripts/backfill-approved-raw-description.ts",
-    "cache:tool-media": "ts-node --project tsconfig.script.json scripts/cache-tool-media.ts"
+    "cache:tool-media": "ts-node --project tsconfig.script.json scripts/cache-tool-media.ts",
+    "test:probe": "ts-node --project tsconfig.script.json scripts/probe-contract-tests.ts",
+    "init:lifecycle": "ts-node --project tsconfig.script.json scripts/init-lifecycle-states.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
@@ -68,6 +70,7 @@
     "sonner": "^1.7.1",
     "swr": "^2.2.5",
     "tailwind-merge": "^2.5.5",
+    "tldts": "6.1.58",
     "zod": "^3.24.1"
   },
   "devDependencies": {
