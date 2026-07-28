@@ -21,7 +21,8 @@
     "test:round": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/round-idempotency-tests.ts",
     "test:lease": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/lease-heartbeat-tests.ts",
     "test:schedule": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/schedule-tests.ts",
-    "reschedule:failures": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/reschedule-failure-candidates.ts"
+    "reschedule:failures": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/reschedule-failure-candidates.ts",
+    "check:lifecycle": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/lifecycle-daily-check.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
