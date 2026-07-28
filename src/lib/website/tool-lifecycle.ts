@@ -246,7 +246,11 @@ export async function runHealthCheckRound(
   }
 
   const next = decision.next;
-  const anomaly = probe.outcome !== "ok" || decision.stateChanged || decision.changeFlags.length > 0;
+  const anomaly =
+    probe.outcome !== "ok" ||
+    decision.stateChanged ||
+    decision.changeFlags.length > 0 ||
+    probe.evidence.clientInternalError === true;
 
   // 只有真的完成了正文分类才推进内容检查排期；
   // blocked / deferred / 网络失败都不算，否则会把「没看过」记成「看过了」
@@ -272,7 +276,9 @@ export async function runHealthCheckRound(
         error_family: probe.errorFamily,
         evidence_strength: probe.evidenceStrength,
         confidence: probe.confidence,
-        change_flags: decision.changeFlags,
+        change_flags: probe.evidence.clientInternalError
+          ? [...decision.changeFlags, "client_internal_error"]
+          : decision.changeFlags,
         reach_from: decision.reachFrom,
         reach_to: decision.reachTo,
         final_status: probe.finalStatus,

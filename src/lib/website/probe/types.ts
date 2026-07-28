@@ -5,7 +5,7 @@
  *   证据里存着它；判定层重放时版本不匹配会返回 version_mismatch 而不是静默混算。
  *   相似度闸门改口径那次，正是因为没有版本号，12 条草稿的状态悄悄漂移了。
  */
-export const PROBE_VERSION = 2;
+export const PROBE_VERSION = 3;
 
 /**
  * 深度内容检查周期（天）。
@@ -60,6 +60,7 @@ export type ErrorFamily = "network" | "server" | "gone";
 export type Reach = "ok" | "dead" | "unverifiable" | "unknown";
 
 export type ChangeFlag =
+  | "client_internal_error"
   | "domain_migrated"
   | "recovered"
   | "state_changed"
@@ -198,5 +199,7 @@ export type ProbeEvidence = {
   unsafeReason: string | null;
   nsRecords: string[] | null;
   nsLookupFailed: boolean;
+  /** 探针客户端自身出错（非站点问题）；置位时 outcome 必为 unknown */
+  clientInternalError?: boolean;
   latency: { dnsMs: number | null; headMs: number | null; getMs: number | null; totalMs: number };
 };

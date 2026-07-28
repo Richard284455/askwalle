@@ -263,6 +263,17 @@ export async function probeReachability(input: ProbeInput): Promise<ProbeResult>
     evidence.redirectChain = get.redirectChain;
     evidence.networkError = `${get.code}: ${get.message}`;
     if (get.errorKind === "tls") evidence.tlsError = get.code;
+
+    // ★ 客户端内部错误：我们自己的 bug，不能算在站点头上。
+    // 记 unknown（探测结果而非生命周期失败），不进消抖、不触发熔断，
+    // 但在证据里留下明确标记，便于事后一眼看出是探针坏了。
+    if (get.errorKind === "internal") {
+      evidence.clientInternalError = true;
+      return finish(
+        result("unknown", evidence, { errorKind: null, confidence: "low" })
+      );
+    }
+
     const outcome: ProbeOutcome =
       get.errorKind === "dns" ? "dns" : get.errorKind === "tls" ? "tls" : "timeout";
     // connection 类归入 timeout 族：对判定而言两者都是 network，且不需要再分

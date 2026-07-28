@@ -473,10 +473,10 @@ function debounceTests() {
     afterDeferred.ok && afterDeferred.next.consecutiveFails === 2 && afterDeferred.next.distinctFailDates === 2,
     afterDeferred.ok ? `streak=${afterDeferred.next.consecutiveFails}` : "?");
 
-  // ★ v1 证据不得被 v2 判定层静默接受
-  const v1Round = { ...okRound(day(1)), probeVersion: 1 };
+  // ★ 旧版本证据不得被当前判定层静默接受（A8 那 20 条就是 v2 的）
+  const v1Round = { ...okRound(day(1)), probeVersion: PROBE_VERSION - 1 };
   const mismatch = applyRound(INITIAL_STATE, v1Round);
-  check("T79", "v1 证据喂给 v2 → version_mismatch，不静默混算",
+  check("T79", `v${PROBE_VERSION - 1} 证据喂给 v${PROBE_VERSION} → version_mismatch，不静默混算`,
     !mismatch.ok && mismatch.reason === "version_mismatch",
     mismatch.ok ? "被静默接受了！" : `expected=${mismatch.expected} got=${mismatch.got}`);
 

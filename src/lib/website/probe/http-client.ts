@@ -34,7 +34,12 @@ export type RedirectHop = {
   ssrfOk: boolean;
 };
 
-export type NetworkErrorKind = "dns" | "timeout" | "tls" | "connection";
+/**
+ * `internal` 是探针**客户端自身**的缺陷（参数错、不变量被破坏），
+ * 与站点无关，绝不能记成生命周期失败。A8 Canary 的教训：
+ * ERR_INVALID_IP_ADDRESS 被归成 connection→timeout，20 个活站全被记了一次假失败。
+ */
+export type NetworkErrorKind = "dns" | "timeout" | "tls" | "connection" | "internal";
 
 export type FetchResult =
   | {
@@ -95,11 +100,33 @@ function pickHeaders(raw: http.IncomingHttpHeaders): Record<string, string> {
   return out;
 }
 
+// 客户端内部错误：我们自己写错了，不是对方站点的问题
+const INTERNAL_ERROR_CODES = new Set([
+  "ERR_INVALID_IP_ADDRESS",
+  "ERR_INVALID_ARG_TYPE",
+  "ERR_INVALID_ARG_VALUE",
+  "ERR_INVALID_URL",
+  "ERR_INVALID_HTTP_TOKEN",
+  "ERR_HTTP_INVALID_HEADER_VALUE",
+  "ERR_INVALID_CHAR",
+  "ERR_ASSERTION",
+]);
+
 function classifyNetworkError(error: NodeJS.ErrnoException): {
   errorKind: NetworkErrorKind;
   code: string;
 } {
   const code = error.code ?? error.name ?? "UNKNOWN";
+  // 先判内部错误：这类必须与「站点不可达」彻底分开
+  if (
+    INTERNAL_ERROR_CODES.has(code) ||
+    error instanceof TypeError ||
+    error instanceof RangeError ||
+    code === "TypeError" ||
+    code === "RangeError"
+  ) {
+    return { errorKind: "internal", code };
+  }
   if (
     code === "ENOTFOUND" ||
     code === "EAI_AGAIN" ||
@@ -178,6 +205,7 @@ export type Transport = (args: TransportArgs) => Promise<TransportResponse>;
 export const nodeTransport: Transport = (args) => {
   const { method, url, pinnedIp, wantBody, signalDeadline } = args;
   const transport = url.protocol === "https:" ? https : http;
+  const family = pinnedIp.includes(":") ? 6 : 4;
 
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {
@@ -189,67 +217,83 @@ export const nodeTransport: Transport = (args) => {
     };
     if (wantBody) headers.range = `bytes=0-${LIMITS.rangeBytes - 1}`;
 
-    const request = transport.request(
-      {
-        method,
-        protocol: url.protocol,
-        hostname: url.hostname.replace(/^\[|\]$/g, ""),
-        port: url.port || (url.protocol === "https:" ? 443 : 80),
-        path: `${url.pathname}${url.search}`,
-        headers,
-        // ★ 连接固定：强制把解析结果替换成已校验的 IP，
-        //   运行时不会再发生第二次 DNS 解析
-        lookup: (_hostname, _options, callback) => {
-          const family = pinnedIp.includes(":") ? 6 : 4;
-          (callback as (e: Error | null, a: string, f: number) => void)(
+    // autoSelectFamily / family / lookup 会透传给 net.connect，
+    // 但 @types/node 没把它们放进 RequestOptions，只能显式断言
+    const requestOptions = {
+      method,
+      protocol: url.protocol,
+      hostname: url.hostname.replace(/^\[|\]$/g, ""),
+      port: url.port || (url.protocol === "https:" ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      headers,
+      // ★ 连接固定：把解析结果强制换成已校验的 IP，运行时不再发生第二次 DNS 解析。
+      //
+      // 回调形态必须按 options.all 分支。Node 20 起 autoSelectFamily 默认开启，
+      // net.connect 会以 { all: true } 调用自定义 lookup 并期望**地址数组**；
+      // 只回三元组会让 Node 读到 addresses[0].address = undefined，
+      // 报 ERR_INVALID_IP_ADDRESS —— A8 Canary 20/20 全废就是栽在这里。
+      lookup: (_hostname: string, options: unknown, callback: unknown) => {
+        if ((options as { all?: boolean } | undefined)?.all) {
+          (callback as unknown as (
+            e: Error | null,
+            a: { address: string; family: number }[]
+          ) => void)(null, [{ address: pinnedIp, family }]);
+        } else {
+          (callback as unknown as (e: Error | null, a: string, f: number) => void)(
             null,
             pinnedIp,
             family
           );
-        },
-        // SNI 用原主机名，否则 TLS 握手会失败
-        servername: url.hostname.replace(/^\[|\]$/g, ""),
-        setHost: false,
-      },
-      (response) => {
-        const chunks: Buffer[] = [];
-        let bytes = 0;
-        let truncated = false;
-
-        if (!wantBody) {
-          response.resume();
-          response.on("end", () =>
-            resolve({
-              status: response.statusCode ?? 0,
-              headers: response.headers,
-              buffer: Buffer.alloc(0),
-              truncated: false,
-            })
-          );
-          return;
         }
+      },
+      // 关掉 Happy Eyeballs：它会并行尝试多个地址，与「只连已校验的那一个」冲突。
+      // 我们只给一个地址，关掉它是为了让语义确定，而不是依赖「碰巧只有一个」。
+      autoSelectFamily: false,
+      // 只允许连我们钉死的那一族，避免 Node 因 family 不符再去解析
+      family,
+      // SNI 用原主机名，否则 TLS 握手会失败
+      servername: url.hostname.replace(/^\[|\]$/g, ""),
+      setHost: false,
+    } as unknown as https.RequestOptions;
 
-        response.on("data", (chunk: Buffer) => {
-          bytes += chunk.length;
-          if (bytes > LIMITS.hardAbortBytes) {
-            truncated = true;
-            chunks.push(chunk.subarray(0, chunk.length - (bytes - LIMITS.hardAbortBytes)));
-            response.destroy();
-            return;
-          }
-          chunks.push(chunk);
-        });
-        response.on("close", () =>
+    const request = transport.request(requestOptions, (response) => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let truncated = false;
+
+      if (!wantBody) {
+        response.resume();
+        response.on("end", () =>
           resolve({
             status: response.statusCode ?? 0,
             headers: response.headers,
-            buffer: Buffer.concat(chunks),
-            truncated: truncated || bytes >= LIMITS.rangeBytes,
+            buffer: Buffer.alloc(0),
+            truncated: false,
           })
         );
-        response.on("error", reject);
+        return;
       }
-    );
+
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > LIMITS.hardAbortBytes) {
+          truncated = true;
+          chunks.push(chunk.subarray(0, chunk.length - (bytes - LIMITS.hardAbortBytes)));
+          response.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("close", () =>
+        resolve({
+          status: response.statusCode ?? 0,
+          headers: response.headers,
+          buffer: Buffer.concat(chunks),
+          truncated: truncated || bytes >= LIMITS.rangeBytes,
+        })
+      );
+      response.on("error", reject);
+    });
 
     request.setTimeout(Math.max(1_000, signalDeadline - Date.now()), () => {
       request.destroy(Object.assign(new Error("request timeout"), { code: "ETIMEDOUT" }));
