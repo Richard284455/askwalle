@@ -5,7 +5,7 @@
  *   证据里存着它；判定层重放时版本不匹配会返回 version_mismatch 而不是静默混算。
  *   相似度闸门改口径那次，正是因为没有版本号，12 条草稿的状态悄悄漂移了。
  */
-export const PROBE_VERSION = 3;
+export const PROBE_VERSION = 4;
 
 /**
  * 深度内容检查周期（天）。

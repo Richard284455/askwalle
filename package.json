@@ -17,7 +17,8 @@
     "cache:tool-media": "ts-node --project tsconfig.script.json scripts/cache-tool-media.ts",
     "test:probe": "ts-node --project tsconfig.script.json scripts/probe-contract-tests.ts",
     "init:lifecycle": "ts-node --project tsconfig.script.json scripts/init-lifecycle-states.ts",
-    "test:transport": "ts-node --project tsconfig.script.json scripts/transport-integration-tests.ts"
+    "test:transport": "ts-node --project tsconfig.script.json scripts/transport-integration-tests.ts",
+    "test:round": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/round-idempotency-tests.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

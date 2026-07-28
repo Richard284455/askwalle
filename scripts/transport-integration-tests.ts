@@ -13,7 +13,7 @@
 import http from "http";
 import { AddressInfo } from "net";
 
-import { nodeTransport, LIMITS } from "../src/lib/website/probe/http-client";
+import { nodeTransport, LIMITS, classifyNetworkError } from "../src/lib/website/probe/http-client";
 import { assertSafeUrl } from "../src/lib/website/probe/ssrf";
 
 let pass = 0;
@@ -256,6 +256,74 @@ async function main() {
       const code = (e as NodeJS.ErrnoException).code;
       check("X15", "已关闭端口抛 ECONNREFUSED（真实网络错误）",
         code === "ECONNREFUSED", code ?? "?");
+    }
+  }
+
+  // ── 7b. D2：超大响应头 ─────────────────────────────────────────────
+  // Gemini 的响应头约 24KB，超过 Node 默认的 16KB。v3 抛 HPE_HEADER_OVERFLOW
+  // 并把它归成 timeout —— 活站被推向 dead，且每轮必现，消抖根本挡不住。
+  {
+    const bigHeaders = (totalBytes: number) => {
+      const headers: Record<string, string> = { "content-type": "text/html" };
+      const perHeader = 2_000;
+      for (let i = 0; i * perHeader < totalBytes; i++) {
+        headers[`x-pad-${i}`] = "p".repeat(perHeader);
+      }
+      return headers;
+    };
+
+    const srv = await withServer((_req, res) => {
+      res.writeHead(200, bigHeaders(24 * 1024));
+      res.end("<html>big headers</html>");
+    });
+    try {
+      const res = await nodeTransport({
+        method: "GET", url: new URL(`http://tools.example:${srv.port}/`),
+        pinnedIp: "127.0.0.1", wantBody: true, signalDeadline: Date.now() + 10_000,
+      });
+      check("X20", "24KB 响应头请求成功（Node 默认 16KB 会失败）",
+        res.status === 200, String(res.status));
+    } catch (e) {
+      check("X20", "24KB 响应头请求成功（Node 默认 16KB 会失败）", false,
+        (e as NodeJS.ErrnoException).code ?? String(e));
+    } finally {
+      await srv.close();
+    }
+
+    // 超过我们配置的 64KB 上限：仍然会 HPE_HEADER_OVERFLOW，
+    // 但必须归 internal（探针自身上限），不能算站点不可达
+    const srv2 = await withServer((_req, res) => {
+      res.writeHead(200, bigHeaders(96 * 1024));
+      res.end("<html>too big</html>");
+    });
+    try {
+      await nodeTransport({
+        method: "GET", url: new URL(`http://tools.example:${srv2.port}/`),
+        pinnedIp: "127.0.0.1", wantBody: true, signalDeadline: Date.now() + 10_000,
+      });
+      check("X21", "超过 64KB 上限应抛错", false, "居然成功了");
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      const { errorKind, code } = classifyNetworkError(err);
+      check("X21", "超上限 → HPE_HEADER_OVERFLOW", code === "HPE_HEADER_OVERFLOW", code);
+      check("X21b", "  └ 归为 internal，不是 timeout/network",
+        errorKind === "internal", errorKind);
+    } finally {
+      await srv2.close();
+    }
+
+    // 分类函数本身：HPE_* 一律 internal
+    for (const code of ["HPE_HEADER_OVERFLOW", "HPE_INVALID_CHUNK_SIZE", "HPE_INVALID_HEADER_TOKEN"]) {
+      const { errorKind } = classifyNetworkError(Object.assign(new Error(code), { code }));
+      check(`X22.${code}`, `  └ ${code} → internal`, errorKind === "internal", errorKind);
+    }
+    // 真实网络错误不受影响
+    for (const [code, expected] of [
+      ["ETIMEDOUT", "timeout"], ["ENOTFOUND", "dns"],
+      ["ECONNREFUSED", "connection"], ["CERT_HAS_EXPIRED", "tls"],
+    ] as [string, string][]) {
+      const { errorKind } = classifyNetworkError(Object.assign(new Error(code), { code }));
+      check(`X23.${code}`, `  └ ${code} 仍归 ${expected}`, errorKind === expected, errorKind);
     }
   }
 

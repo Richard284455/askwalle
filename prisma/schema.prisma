@@ -506,8 +506,10 @@ model ToolHealthEvent {
   created_at DateTime @default(now())
 
   @@map("tool_health_events")
+  // round_id 是确定性幂等键：worker 回收后重跑同一轮，必须被数据库挡下来，
+  // 而不是写第二条事件、再把消抖计数加一次。
+  @@unique([round_id])
   @@index([website_id, created_at])
   @@index([created_at])
   @@index([outcome])
-  @@index([round_id])
 }

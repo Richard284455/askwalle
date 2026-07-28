@@ -9,6 +9,7 @@
  * transport 再把请求映射到内存 fixture。测的就是生产代码本身。
  */
 import http from "http";
+import { deflateRawSync, deflateSync, gzipSync } from "zlib";
 
 import type { Transport, TransportArgs } from "../src/lib/website/probe/http-client";
 import type { ResolveFn } from "../src/lib/website/probe/ssrf";
@@ -26,6 +27,13 @@ export type Fixture = {
   head?: { status?: number; headers?: Record<string, string> };
   /** 服务器无视 Range，返回超大响应 */
   ignoresRange?: boolean;
+  /**
+   * 按真实服务器的方式压缩响应，并在 64KB 处截断 ——
+   * 这正是 v3 把 Grammarly / Cursor 判成 undecodable 的现场。
+   */
+  compress?: "gzip" | "deflate" | "deflate-raw";
+  /** content-encoding 声明了压缩，实际是垃圾字节 */
+  corruptCompressed?: "gzip" | "deflate";
 };
 
 const HTML_OK = `<!doctype html><html><head><title>Acme Writer</title></head><body>
@@ -41,6 +49,28 @@ their publishing pipeline moving without extra overhead or manual formatting wor
 
 const SPA_SHELL = `<!doctype html><html><head><title>App</title></head><body>
 <div id="root"></div><script src="/static/app.js"></script></body></html>`;
+
+/**
+ * Grammarly 量级的首页：**gzip 之后**仍远超 64KB，客户端只能拿到压缩流的前缀。
+ *
+ * 每段都掺入确定性伪随机 token —— 纯重复文本会被 gzip 压到几 KB，那样根本
+ * 触发不了截断，这条用例也就白写了（第一版就栽在这里）。
+ */
+const BIG_HTML = (() => {
+  let seed = 0x2f6e2b1;
+  const token = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed.toString(36);
+  };
+  const paragraphs = Array.from({ length: 4000 }, (_, i) => {
+    const noise = Array.from({ length: 12 }, token).join(" ");
+    return `<p>Section ${i}: Bigwriter helps teams draft and publish long form content. ${noise}</p>`;
+  });
+  return `<!doctype html><html><head><title>Bigwriter: Free AI Writing Assistance</title></head><body>
+<h1>Bigwriter</h1>
+${paragraphs.join("\n")}
+</body></html>`;
+})();
 
 // 正常体积（>512B）但实为软 404 —— v1 会被 HEAD 短路掩盖，v2 必须抓到
 const BIG_SOFT_404 = `<!doctype html><html><head><title>404 Not Found</title></head><body>
@@ -95,6 +125,18 @@ export const FIXTURES: Record<string, Fixture> = {
   // ★ v2 的核心用例：正常体积的软 404
   "/big-soft404": { body: BIG_SOFT_404 },
   "/big-parked-excluded": { body: BIG_PARKED_EXCLUDED },
+
+  // ── D3：压缩 + 截断 ────────────────────────────────────────────────
+  // GET 只取前 64KB，压缩流因此总是不完整。v3 直接放弃解压 → undecodable。
+  "/gzip-big": { body: BIG_HTML, compress: "gzip" },
+  "/deflate-big": { body: BIG_HTML, compress: "deflate" },
+  "/deflate-raw-big": { body: BIG_HTML, compress: "deflate-raw" },
+  // 压缩后仍解出 >1MB：必须安全截断，不能撑爆内存也不能抛任务级异常
+  "/gzip-bomb": { body: "A".repeat(4_000_000), compress: "gzip" },
+  // 声明了 gzip 但流是坏的：退回状态码结论，判 undecodable，不判死
+  "/gzip-corrupt": { body: HTML_OK, corruptCompressed: "gzip" },
+  // 压缩过的软 404：解压修好之后，soft_404 分类必须照常触发
+  "/gzip-soft404": { body: BIG_SOFT_404, compress: "gzip" },
 
   "/notfound-in-script": {
     body: `<!doctype html><html><head><title>Acme</title></head><body>
@@ -184,23 +226,45 @@ export function createMockTransport(): MockControl {
     headers: Record<string, string>,
     body: string,
     wantBody: boolean,
-    ignoresRange = false
+    ignoresRange = false,
+    fixture?: Fixture
   ) => {
     const payload = ignoresRange && wantBody ? body.repeat(4000) : body;
-    const buffer = wantBody ? Buffer.from(payload, "utf8") : Buffer.alloc(0);
     // 服务器无视 Range 时，客户端会在 hardAbortBytes 处截断
     const HARD_ABORT = 262_144;
     const RANGE = 65_536;
-    const truncated = wantBody && buffer.length >= RANGE;
+
+    const encoding = fixture?.compress ?? fixture?.corruptCompressed;
+    let buffer: Buffer;
+    if (!wantBody) {
+      buffer = Buffer.alloc(0);
+    } else if (fixture?.corruptCompressed) {
+      // 声明压缩但给垃圾字节
+      buffer = Buffer.from("not actually a valid compressed stream".repeat(40), "utf8");
+    } else if (fixture?.compress === "gzip") {
+      buffer = gzipSync(Buffer.from(payload, "utf8"));
+    } else if (fixture?.compress === "deflate") {
+      buffer = deflateSync(Buffer.from(payload, "utf8"));
+    } else if (fixture?.compress === "deflate-raw") {
+      buffer = deflateRawSync(Buffer.from(payload, "utf8"));
+    } else {
+      buffer = Buffer.from(payload, "utf8");
+    }
+
+    // 客户端只请求前 64KB —— 压缩流被切断的现场就在这里
+    const limit = Math.min(HARD_ABORT, encoding ? RANGE : HARD_ABORT);
+    const truncated = wantBody && buffer.length > limit;
+
     return {
       status,
       headers: {
         "content-type": "text/html; charset=utf-8",
-        "content-length": String(Buffer.byteLength(payload)),
+        "content-length": String(buffer.length || Buffer.byteLength(payload)),
+        ...(encoding ? { "content-encoding": encoding.replace("-raw", "") } : {}),
         ...headers,
       } as http.IncomingHttpHeaders,
-      buffer: buffer.subarray(0, HARD_ABORT),
-      truncated,
+      buffer: buffer.subarray(0, limit),
+      truncated: truncated || (wantBody && !encoding && buffer.length >= RANGE),
     };
   };
 
@@ -254,7 +318,8 @@ export function createMockTransport(): MockControl {
       fixture.headers ?? {},
       fixture.body ?? "",
       wantBody,
-      fixture.ignoresRange
+      fixture.ignoresRange,
+      fixture
     );
   };
 

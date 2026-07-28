@@ -76,15 +76,95 @@ async function stateMachineTests(mock: MockControl) {
   const t05 = await probeUrl(mock, "/head-tiny");
   check("T05", "HEAD 200 但 Content-Length<512 → GET 复核", t05.outcome === "ok", t05.outcome);
 
-  const t06 = await probeReachability({
-    url: "https://does-not-exist.example/",
-    resolve: async () => {
-      throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
-    },
+  // ── D1：DNS 失败必须与 unsafe_target 彻底分开 ─────────────────────────
+  // v3 把解析失败折进安全通道，43 个 NXDOMAIN 域名判成 unsafe_target →
+  // unverifiable，而 unverifiable 永不计入 dead 消抖，真死链一条都抓不到。
+  const dnsFail = (code: string) =>
+    probeReachability({
+      url: "https://does-not-exist.example/",
+      resolve: async () => {
+        throw Object.assign(new Error(code), { code });
+      },
+      transport: mock.transport,
+    });
+
+  const t06 = await dnsFail("ENOTFOUND");
+  check("T06", "NXDOMAIN → dns（不是 unsafe_target）",
+    t06.outcome === "dns" && t06.unsafeReason === null, `${t06.outcome}/${t06.unsafeReason}`);
+  check("T06b", "  └ error_family=network，计入消抖",
+    t06.errorFamily === "network", String(t06.errorFamily));
+
+  const t06c = await dnsFail("EAI_AGAIN");
+  check("T06c", "EAI_AGAIN（临时解析失败）→ dns",
+    t06c.outcome === "dns" && t06c.unsafeReason === null, `${t06c.outcome}/${t06c.unsafeReason}`);
+
+  const t06d = await probeReachability({
+    url: "https://empty-answer.example/",
+    resolve: async () => [],
     transport: mock.transport,
   });
-  check("T06", "DNS 解析失败不产生生命周期失败",
-    t06.outcome === "unsafe_target" || t06.outcome === "dns", t06.outcome);
+  check("T06d", "解析结果为空 → dns",
+    t06d.outcome === "dns" && t06d.unsafeReason === null, `${t06d.outcome}/${t06d.unsafeReason}`);
+
+  const t06e = await probeReachability({
+    url: "https://rebind.example/",
+    resolve: async () => ["10.0.0.5"],
+    transport: mock.transport,
+  });
+  check("T06e", "解析成功但落在私网 → 仍是 unsafe_target",
+    t06e.outcome === "unsafe_target" && t06e.unsafeReason === "private_ip",
+    `${t06e.outcome}/${t06e.unsafeReason}`);
+
+  const t06f = await probeReachability({
+    url: "https://metadata-rebind.example/",
+    resolve: async () => ["169.254.169.254"],
+    transport: mock.transport,
+  });
+  check("T06f", "解析到元数据端点 → 仍是 unsafe_target",
+    t06f.outcome === "unsafe_target" && t06f.unsafeReason === "metadata_endpoint",
+    `${t06f.outcome}/${t06f.unsafeReason}`);
+
+  // 安全告警队列只认 unsafe_target；DNS 失败混进来会把告警淹掉
+  check("T06g", "DNS 失败不进安全告警队列",
+    [t06, t06c, t06d].every((r) => r.outcome !== "unsafe_target" && r.unsafeReason === null));
+  check("T06h", "  └ 真安全拒绝仍在队列里",
+    [t06e, t06f].every((r) => r.outcome === "unsafe_target" && r.unsafeReason !== null));
+
+  // ── D3：截断压缩流必须仍能提取正文 ───────────────────────────────────
+  // v3 里 gunzipSync 对不完整的流抛 Z_BUF_ERROR，直接判 undecodable ——
+  // Grammarly / Cursor / ElevenLabs 等 37 个重点工具的内容分类整体空转。
+  const t07 = await probeUrl(mock, "/gzip-big", { forceContentCheck: true });
+  check("T07", "截断的 gzip 仍能解出正文",
+    t07.outcome === "ok" && t07.contentVerdict !== "undecodable" && t07.evidence.visibleTextLen > 500,
+    `${t07.outcome}/${t07.contentVerdict}/${t07.evidence.visibleTextLen}字`);
+  check("T07b", "  └ 标题解析正确",
+    (t07.evidence.titleExcerpt ?? "").includes("Bigwriter"), String(t07.evidence.titleExcerpt));
+  check("T07c", "  └ truncated 仍如实记录在证据里",
+    t07.evidence.truncated === true, String(t07.evidence.truncated));
+
+  const t07d = await probeUrl(mock, "/deflate-big", { forceContentCheck: true });
+  check("T07d", "截断的 deflate 仍能解出正文",
+    t07d.outcome === "ok" && t07d.contentVerdict !== "undecodable" && t07d.evidence.visibleTextLen > 500,
+    `${t07d.outcome}/${t07d.contentVerdict}/${t07d.evidence.visibleTextLen}字`);
+
+  const t07e = await probeUrl(mock, "/deflate-raw-big", { forceContentCheck: true });
+  check("T07e", "裸 deflate（无 zlib 头）同样能解",
+    t07e.outcome === "ok" && t07e.evidence.visibleTextLen > 500,
+    `${t07e.outcome}/${t07e.evidence.visibleTextLen}字`);
+
+  const t07f = await probeUrl(mock, "/gzip-bomb", { forceContentCheck: true });
+  check("T07f", "解压后超 1MB → 安全截断，不抛异常",
+    t07f.outcome === "ok" && t07f.evidence.visibleTextLen <= 1_048_576,
+    `${t07f.outcome}/${t07f.evidence.visibleTextLen}字`);
+
+  const t07g = await probeUrl(mock, "/gzip-corrupt", { forceContentCheck: true });
+  check("T07g", "损坏的压缩流 → undecodable，退回状态码结论且不判死",
+    t07g.outcome === "ok" && t07g.contentVerdict === "undecodable",
+    `${t07g.outcome}/${t07g.contentVerdict}`);
+
+  const t07h = await probeUrl(mock, "/gzip-soft404", { forceContentCheck: true });
+  check("T07h", "压缩过的软 404，解压修好后仍能判 soft_404",
+    t07h.outcome === "soft_404", t07h.outcome);
 
   const t09 = await probeUrl(mock, "/500");
   check("T09", "500 → http_5xx", t09.outcome === "http_5xx", t09.outcome);
@@ -483,6 +563,15 @@ function debounceTests() {
   const mixedReplay = replay([okRound(day(1)), v1Round, failRound("timeout", day(3))]);
   check("T79b", "replay 计数版本不匹配轮次并跳过",
     mixedReplay.versionMismatches === 1, String(mixedReplay.versionMismatches));
+
+  // D1/D2/D3 改了 DNS、内容与内部错误三类判定口径，v3 基线不能与 v4 混算。
+  // 这里把版本号写死，避免将来再升版本时这条断言跟着漂走。
+  check("T79c", "当前 PROBE_VERSION 为 4", PROBE_VERSION === 4, String(PROBE_VERSION));
+  for (const old of [1, 2, 3]) {
+    const r = applyRound(INITIAL_STATE, { ...okRound(day(1)), probeVersion: old });
+    check(`T79d.v${old}`, `  └ v${old} 证据 → version_mismatch`,
+      !r.ok && r.reason === "version_mismatch", r.ok ? "被接受了！" : "version_mismatch");
+  }
 
   const migrated = applyRound(INITIAL_STATE, {
     outcome: "ok", errorKind: null, evidenceStrength: null, confidence: "high",

@@ -166,7 +166,6 @@ function classifyContentVerdict(
   const type = response.headers["content-type"] ?? "";
   if (type && !/text\/html|application\/xhtml\+xml|text\/plain/i.test(type)) return "non_html";
   if (response.body === null) return "undecodable";
-  if (response.truncated) return "truncated";
   if (
     text &&
     text.textLength < 50 &&
@@ -175,6 +174,10 @@ function classifyContentVerdict(
   ) {
     return "spa_shell";
   }
+  // 截断本身不是「读不懂」。64KB 上限让大站几乎必然截断，若在这里短路，
+  // soft-404 / parked 分类永远轮不到 —— v3 就有 101 轮卡在 truncated。
+  // 只有连一个字都没解出来时，truncated 才是比 normal 更准确的结论。
+  if (response.truncated && (!text || text.textLength === 0)) return "truncated";
   return "normal";
 }
 

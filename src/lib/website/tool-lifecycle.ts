@@ -77,7 +77,18 @@ export type RoundOutcome = {
   changeFlags: ChangeFlag[];
   eventId: number;
   versionMismatch?: boolean;
+  /** 本轮已被别的执行者写过：返回既有事件，未再次应用状态转移 */
+  duplicateRound?: boolean;
 };
+
+/** round_id 唯一约束冲突（Prisma P2002） */
+function isRoundIdConflict(error: unknown): boolean {
+  if (!(error instanceof Prisma.PrismaClientKnownRequestError)) return false;
+  if (error.code !== "P2002") return false;
+  const target = error.meta?.target;
+  const fields = Array.isArray(target) ? target.map(String) : [String(target ?? "")];
+  return fields.some((f) => f.includes("round_id"));
+}
 
 /** 取到期的工作集；无 state 的（新工具）视为立即到期 */
 export async function selectDueWebsites(limit: number): Promise<number[]> {
@@ -263,7 +274,10 @@ export async function runHealthCheckRound(
       }
     : {};
 
-  const [event] = await prisma.$transaction([
+  // 事件与状态在同一事务里落库：round_id 唯一约束一旦拦下重复插入，
+  // 状态转移也随之回滚 —— 同一轮重跑绝不会把消抖计数加第二次。
+  const persist = () =>
+    prisma.$transaction([
     prisma.toolHealthEvent.create({
       data: {
         website_id: websiteId,
@@ -337,13 +351,38 @@ export async function runHealthCheckRound(
     }),
   ]);
 
+  let eventId: number;
+  try {
+    const [event] = await persist();
+    eventId = event.id;
+  } catch (error) {
+    if (!isRoundIdConflict(error)) throw error;
+    // 同一轮已经被别的执行者写过了（worker 回收、并发驱动）。
+    // 返回既有事件，绝不重复应用状态转移。
+    const existing = await prisma.toolHealthEvent.findUnique({
+      where: { round_id: roundId },
+      select: { id: true, reach_from: true, reach_to: true, change_flags: true, outcome: true },
+    });
+    if (!existing) throw error; // 约束冲突却查不到，说明是别的唯一键，别吞
+    return {
+      websiteId,
+      outcome: existing.outcome,
+      // 既有事件里存的是当时那一轮的转移，直接照搬，不重算
+      reachFrom: (existing.reach_from ?? state.reach) as Reach,
+      reachTo: (existing.reach_to ?? state.reach) as Reach,
+      changeFlags: existing.change_flags as ChangeFlag[],
+      eventId: existing.id,
+      duplicateRound: true,
+    };
+  }
+
   return {
     websiteId,
     outcome: probe.outcome,
     reachFrom: decision.reachFrom,
     reachTo: decision.reachTo,
     changeFlags: decision.changeFlags,
-    eventId: event.id,
+    eventId,
   };
 }
 

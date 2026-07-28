@@ -133,12 +133,12 @@ export async function checkRobots(
     // 这里放行，让主请求去产出真正的 error_kind。
     decision = { decision: "allow", crawlDelayMs: 0, cachedAt: Date.now() };
   } else if (result.kind === "unsafe") {
-    // DNS 解析不出来不是 robots 的问题：放行，让主请求去产出真正的 dns 分类。
-    // 其余安全拒绝（私网、端口等）才 deferred —— 主请求同样会被拒，不必重复探。
-    decision =
-      result.verdict.reason === "dns_error" || result.verdict.reason === "dns_no_address"
-        ? { decision: "allow", crawlDelayMs: 0, cachedAt: Date.now() }
-        : { decision: "deferred", reason: `robots_unsafe:${result.verdict.reason}`, retryAfterMs: 24 * 3600_000 };
+    // 安全拒绝也放行到主请求：同一主机的主 URL 会被同一条规则拒掉，
+    // 由它产出权威的 unsafe_target。两者都在建连之前就被拦下，不多一个包。
+    //
+    // 这里若 deferred，一个解析到私网的主机就只会得到「稍后重试」，
+    // 安全告警队列反而看不到它 —— 分类必须由主请求统一给出。
+    decision = { decision: "allow", crawlDelayMs: 0, cachedAt: Date.now() };
   } else if (result.kind === "redirect_loop") {
     decision = { decision: "allow", crawlDelayMs: 0, cachedAt: Date.now() };
   } else if (result.status >= 500) {

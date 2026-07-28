@@ -14,6 +14,13 @@ import { hostInfo } from "./registrable-domain";
 export const ALLOWED_PROTOCOLS = ["http:", "https:"];
 export const ALLOWED_PORTS = [80, 443];
 
+/**
+ * 安全拒绝的理由。**只有这些**才算 unsafe_target。
+ *
+ * DNS 解析失败刻意不在此列：那是「站点还在不在」的信号，不是「这个地址危险」。
+ * v3 把两者混在一个通道里，43 个 NXDOMAIN 域名被判成 unsafe_target →
+ * unverifiable，而 unverifiable 永不计入 dead 消抖，真死链一个都抓不到。
+ */
 export type UnsafeReason =
   | "protocol_not_allowed"
   | "port_not_allowed"
@@ -21,13 +28,24 @@ export type UnsafeReason =
   | "userinfo_in_url"
   | "hostname_not_allowed"
   | "private_ip"
-  | "metadata_endpoint"
-  | "dns_no_address"
-  | "dns_error";
+  | "metadata_endpoint";
+
+/** 解析失败：站点侧信号，走 network 族并计入消抖 */
+export type DnsFailureReason = "dns_no_address" | "dns_error";
 
 export type SafetyVerdict =
   | { safe: true; hostname: string; port: number; addresses: string[]; pinnedIp: string }
-  | { safe: false; reason: UnsafeReason; detail: string };
+  | { safe: false; kind: "unsafe"; reason: UnsafeReason; detail: string }
+  | { safe: false; kind: "dns"; reason: DnsFailureReason; code: string; detail: string };
+
+export type UnsafeVerdict = Extract<SafetyVerdict, { safe: false; kind: "unsafe" }>;
+export type DnsVerdict = Extract<SafetyVerdict, { safe: false; kind: "dns" }>;
+
+/** DNS 层错误码；解析器没给 code 时兜底成 EAI_FAIL */
+function dnsCodeOf(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && code ? code : "EAI_FAIL";
+}
 
 // 云元数据端点：显式硬拒，不依赖网段推导。
 // 169.254/16 本就在禁止段内，这里重复列出是为了让证据里的 reason 更准确。
@@ -198,25 +216,25 @@ export async function assertSafeUrl(
   try {
     url = new URL(rawUrl);
   } catch {
-    return { safe: false, reason: "url_unparsable", detail: rawUrl.slice(0, 200) };
+    return { safe: false, kind: "unsafe", reason: "url_unparsable", detail: rawUrl.slice(0, 200) };
   }
 
   if (!ALLOWED_PROTOCOLS.includes(url.protocol)) {
-    return { safe: false, reason: "protocol_not_allowed", detail: url.protocol };
+    return { safe: false, kind: "unsafe", reason: "protocol_not_allowed", detail: url.protocol };
   }
   if (url.username || url.password) {
-    return { safe: false, reason: "userinfo_in_url", detail: "URL 含 user:pass@" };
+    return { safe: false, kind: "unsafe", reason: "userinfo_in_url", detail: "URL 含 user:pass@" };
   }
 
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
   if (!ALLOWED_PORTS.includes(port)) {
-    return { safe: false, reason: "port_not_allowed", detail: String(port) };
+    return { safe: false, kind: "unsafe", reason: "port_not_allowed", detail: String(port) };
   }
 
   // URL 会把 IPv6 主机包在方括号里
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
   if (hostnameBlocked(hostname)) {
-    return { safe: false, reason: "hostname_not_allowed", detail: hostname };
+    return { safe: false, kind: "unsafe", reason: "hostname_not_allowed", detail: hostname };
   }
 
   // punycode 归一化后再看一次（URL 构造时已做，这里防御 tldts 解析异常）
@@ -224,36 +242,45 @@ export async function assertSafeUrl(
 
   if (info.isIp || isIP(hostname) !== 0) {
     if (isMetadataAddress(hostname)) {
-      return { safe: false, reason: "metadata_endpoint", detail: hostname };
+      return { safe: false, kind: "unsafe", reason: "metadata_endpoint", detail: hostname };
     }
     if (isBlockedAddress(hostname)) {
-      return { safe: false, reason: "private_ip", detail: hostname };
+      return { safe: false, kind: "unsafe", reason: "private_ip", detail: hostname };
     }
     return { safe: true, hostname, port, addresses: [hostname], pinnedIp: hostname };
   }
 
+  // ★ 解析失败走 dns 通道，不是安全拒绝。解析**成功**之后的地址校验才是安全判断。
   let addresses: string[];
   try {
     addresses = await resolve(hostname);
   } catch (error) {
     return {
       safe: false,
+      kind: "dns",
       reason: "dns_error",
+      code: dnsCodeOf(error),
       detail: error instanceof Error ? error.message.slice(0, 200) : "resolve failed",
     };
   }
   if (!addresses.length) {
-    return { safe: false, reason: "dns_no_address", detail: hostname };
+    return {
+      safe: false,
+      kind: "dns",
+      reason: "dns_no_address",
+      code: "ENODATA",
+      detail: hostname,
+    };
   }
 
   // 契约 §5.4 第 2 步：任意一个地址落在禁止段即整体拒绝。
   // 不能只看第一个 —— 轮询 DNS 可能先给公网 IP，再给内网 IP。
   for (const address of addresses) {
     if (isMetadataAddress(address)) {
-      return { safe: false, reason: "metadata_endpoint", detail: address };
+      return { safe: false, kind: "unsafe", reason: "metadata_endpoint", detail: address };
     }
     if (isBlockedAddress(address)) {
-      return { safe: false, reason: "private_ip", detail: address };
+      return { safe: false, kind: "unsafe", reason: "private_ip", detail: address };
     }
   }
 

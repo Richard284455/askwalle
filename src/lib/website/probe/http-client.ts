@@ -1,8 +1,8 @@
 import http from "http";
 import https from "https";
-import { gunzipSync, inflateSync } from "zlib";
+import { constants, gunzipSync, inflateSync, inflateRawSync } from "zlib";
 
-import { assertSafeUrl, ResolveFn, SafetyVerdict } from "./ssrf";
+import { assertSafeUrl, ResolveFn, UnsafeVerdict } from "./ssrf";
 
 /**
  * 探针专用 HTTP 客户端。
@@ -23,6 +23,9 @@ export const LIMITS = {
   headerTimeoutMs: 8_000,
   totalTimeoutMs: 15_000,
   maxRedirects: 5,
+  // Node 默认 16KB。Gemini 的响应头就有 24KB，超限时抛 HPE_HEADER_OVERFLOW，
+  // v3 把它记成 timeout —— 活站被推向 dead，且每轮必现，消抖挡不住。
+  maxHeaderSize: 65_536,
 } as const;
 
 export type RedirectHop = {
@@ -65,7 +68,7 @@ export type FetchResult =
     }
   | {
       kind: "unsafe";
-      verdict: Extract<SafetyVerdict, { safe: false }>;
+      verdict: UnsafeVerdict;
       atHop: number;
       redirectChain: RedirectHop[];
     }
@@ -112,14 +115,17 @@ const INTERNAL_ERROR_CODES = new Set([
   "ERR_ASSERTION",
 ]);
 
-function classifyNetworkError(error: NodeJS.ErrnoException): {
+export function classifyNetworkError(error: NodeJS.ErrnoException): {
   errorKind: NetworkErrorKind;
   code: string;
 } {
   const code = error.code ?? error.name ?? "UNKNOWN";
-  // 先判内部错误：这类必须与「站点不可达」彻底分开
+  // 先判内部错误：这类必须与「站点不可达」彻底分开。
+  // HPE_* 是 Node HTTP 解析器的自身上限（头过大、块过大…），
+  // 站点可能完全健康，绝不能算成 network 失败。
   if (
     INTERNAL_ERROR_CODES.has(code) ||
+    code.startsWith("HPE_") ||
     error instanceof TypeError ||
     error instanceof RangeError ||
     code === "TypeError" ||
@@ -158,23 +164,51 @@ function classifyNetworkError(error: NodeJS.ErrnoException): {
   return { errorKind: "connection", code };
 }
 
-function decodeBody(
-  buffer: Buffer,
-  encoding: string | undefined,
-  truncated: boolean
-): string | null {
+/**
+ * 容忍截断的解压。
+ *
+ * GET 只取前 64KB，压缩流因此几乎总是不完整的。默认 finishFlush 遇到不完整的流
+ * 会抛 Z_BUF_ERROR —— v3 里 Grammarly / Cursor / ElevenLabs 这类重点工具的正文
+ * 全部因此判成 undecodable，内容分类整体空转。Z_SYNC_FLUSH 的语义正是
+ * 「解出多少算多少」，这才是我们要的。
+ *
+ * maxOutputLength 把单次分配钉在 1MB，压缩炸弹撑不爆内存；真超限时折半重试 ——
+ * 压缩流的前缀解出来就是正文的前缀，而分类只需要前缀。
+ */
+function inflateTruncated(buffer: Buffer, gzip: boolean): Buffer | null {
+  const options = {
+    finishFlush: constants.Z_SYNC_FLUSH,
+    maxOutputLength: LIMITS.decompressedMax,
+  } as const;
+
+  let input = buffer;
+  for (let attempt = 0; attempt < 6 && input.length > 0; attempt++) {
+    try {
+      if (gzip) return gunzipSync(input, options);
+      // deflate 有带 zlib 头和裸流两种发法，标准没规定清楚，两种都试
+      try {
+        return inflateSync(input, options);
+      } catch {
+        return inflateRawSync(input, options);
+      }
+    } catch (error) {
+      // 只有「输出超过 1MB」值得折半重试；流本身坏了再试也没用
+      if ((error as NodeJS.ErrnoException).code !== "ERR_BUFFER_TOO_LARGE") return null;
+      input = input.subarray(0, Math.floor(input.length / 2));
+    }
+  }
+  return null;
+}
+
+function decodeBody(buffer: Buffer, encoding: string | undefined): string | null {
   let raw = buffer;
   if (encoding && /gzip|deflate/i.test(encoding)) {
-    // 截断的压缩流解不开，这属于正常情况，不当错误
-    if (truncated) return null;
-    try {
-      raw = /gzip/i.test(encoding) ? gunzipSync(buffer) : inflateSync(buffer);
-    } catch {
-      return null;
-    }
-    if (raw.length > LIMITS.decompressedMax) {
-      raw = raw.subarray(0, LIMITS.decompressedMax);
-    }
+    const inflated = inflateTruncated(buffer, /gzip/i.test(encoding));
+    if (!inflated) return null;
+    raw = inflated;
+  }
+  if (raw.length > LIMITS.decompressedMax) {
+    raw = raw.subarray(0, LIMITS.decompressedMax);
   }
   return raw.toString("utf8");
 }
@@ -251,6 +285,8 @@ export const nodeTransport: Transport = (args) => {
       autoSelectFamily: false,
       // 只允许连我们钉死的那一族，避免 Node 因 family 不符再去解析
       family,
+      // 大站的响应头常常超过 Node 默认的 16KB（Gemini 就有 24KB）
+      maxHeaderSize: LIMITS.maxHeaderSize,
       // SNI 用原主机名，否则 TLS 握手会失败
       servername: url.hostname.replace(/^\[|\]$/g, ""),
       setHost: false,
@@ -323,6 +359,18 @@ export async function safeFetch(
     // ★ 每一跳都重跑安全校验，同域跳转也不例外
     const verdict = await assertSafeUrl(currentUrl, options.resolve);
     if (!verdict.safe) {
+      // 解析失败是站点侧信号，必须走 network_error/dns，让它计入 dead 消抖；
+      // 只有真正的安全拒绝才是 unsafe_target。主请求与 robots 共用这一条规则。
+      if (verdict.kind === "dns") {
+        return {
+          kind: "network_error",
+          errorKind: "dns",
+          code: verdict.code,
+          message: verdict.detail,
+          redirectChain,
+          latencyMs: Date.now() - started,
+        };
+      }
       return { kind: "unsafe", verdict, atHop: hop, redirectChain };
     }
     lastPinned = verdict.pinnedIp;
@@ -376,11 +424,7 @@ export async function safeFetch(
         headers,
         body:
           options.method === "GET"
-            ? decodeBody(
-                response.buffer,
-                response.headers["content-encoding"],
-                response.truncated
-              )
+            ? decodeBody(response.buffer, response.headers["content-encoding"])
             : null,
         bytesRead: response.buffer.length,
         truncated: response.truncated,
@@ -397,7 +441,7 @@ export async function safeFetch(
     } catch {
       return {
         kind: "unsafe",
-        verdict: { safe: false, reason: "url_unparsable", detail: "bad Location" },
+        verdict: { safe: false, kind: "unsafe", reason: "url_unparsable", detail: "bad Location" },
         atHop: hop,
         redirectChain,
       };
