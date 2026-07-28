@@ -60,13 +60,95 @@ async function throttleSameDomain(url: string): Promise<void> {
   clock.set(domain, Date.now());
 }
 
-function nextCheckDelayMs(tier: string, reach: Reach, retryAfterMs: number | null): number {
-  if (retryAfterMs !== null) return retryAfterMs;
-  if (reach === "dead") return DEAD_RECHECK_DAYS * 86_400_000;
-  if (reach === "unverifiable") return UNVERIFIABLE_RECHECK_DAYS * 86_400_000;
+// ── 失败候选的加速重探 ─────────────────────────────────────────────────
+//
+// dead 需要「streak≥3 且 3 个不同自然日 且 跨度≥14 天」。可失败态的 reach 仍是
+// unknown，之前就按 tier 常规周期排期 —— longtail 90 天，于是第 3 轮要等到第
+// 180 天，两周的消抖窗口在实际排期下根本走不完。v4 首轮基线里 72 条失败候选
+// 全部排在 81–99 天后，就是这个原因。
+//
+// 加速后：第 1 轮当天 → 第 2 轮约第 7 天 → 第 3 轮约第 14 天，恰好凑满四条件。
+const FAIL_STAGE1_DAYS = 7;
+const FAIL_STAGE2_DAYS = 14;
+const JITTER_WINDOW_MS = 12 * 3600_000; // 0–12 小时，恒非负
+const SHANGHAI_OFFSET_MS = 8 * 3600_000; // 无夏令时，固定 UTC+8
+
+/**
+ * 确定性抖动：同一 (websiteId, stage) 永远得到同一个值，重跑排期不会漂移，
+ * 不同工具则分散开，避免整批同一时刻到期。
+ */
+export function scheduleJitterMs(websiteId: number, stage: number): number {
+  let h = (2166136261 ^ websiteId) >>> 0;
+  h = Math.imul(h ^ stage, 16777619) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 16777619) >>> 0;
+  return h % JITTER_WINDOW_MS;
+}
+
+/** 下一个 Asia/Shanghai 自然日的零点（UTC 时刻） */
+export function nextShanghaiDayStart(at: Date): Date {
+  const shifted = at.getTime() + SHANGHAI_OFFSET_MS;
+  const dayStart = Math.floor(shifted / 86_400_000) * 86_400_000;
+  return new Date(dayStart + 86_400_000 - SHANGHAI_OFFSET_MS);
+}
+
+export type ScheduleInput = {
+  websiteId: number;
+  tier: string;
+  reach: Reach;
+  retryAfterMs: number | null;
+  failFamily: string | null;
+  distinctFailDates: number;
+  firstFailAt: Date | null;
+  at: Date;
+};
+
+export type ScheduleResult = {
+  nextCheckAt: Date;
+  /** 0=常规周期 · 1=失败第二轮(约7天) · 2=失败第三轮(约14天) */
+  stage: number;
+  jitterMs: number;
+};
+
+/**
+ * 排期优先级（高到低）：
+ *   1. deferred —— 严格听 Retry-After / robots / 本地预算，不加速
+ *   2. dead —— 固定复检周期
+ *   3. unverifiable（blocked / unsafe_target）—— 长周期，不加速
+ *   4. 失败链进行中 —— 加速到 7 / 14 天
+ *   5. 其余 —— tier 常规周期
+ */
+export function computeNextCheck(input: ScheduleInput): ScheduleResult {
+  const { websiteId, tier, reach, retryAfterMs, failFamily, distinctFailDates, firstFailAt, at } = input;
+
+  if (retryAfterMs !== null) {
+    return { nextCheckAt: new Date(at.getTime() + retryAfterMs), stage: 0, jitterMs: 0 };
+  }
+  if (reach === "dead") {
+    return { nextCheckAt: new Date(at.getTime() + DEAD_RECHECK_DAYS * 86_400_000), stage: 0, jitterMs: 0 };
+  }
+  if (reach === "unverifiable") {
+    return { nextCheckAt: new Date(at.getTime() + UNVERIFIABLE_RECHECK_DAYS * 86_400_000), stage: 0, jitterMs: 0 };
+  }
+
+  if (failFamily !== null && distinctFailDates >= 1 && firstFailAt !== null) {
+    const stage = distinctFailDates === 1 ? 1 : 2;
+    const jitterMs = scheduleJitterMs(websiteId, stage);
+    const baseDays = stage === 1 ? FAIL_STAGE1_DAYS : FAIL_STAGE2_DAYS;
+    const fromFirstFail = firstFailAt.getTime() + baseDays * 86_400_000 + jitterMs;
+    // 下限：必须落到下一个自然日之后 —— 同日重跑不计新轮次，白探一次。
+    // 排期落后（例如第 2 轮拖到第 20 天才跑）时这个下限才会生效。
+    const nextDay = nextShanghaiDayStart(at).getTime() + jitterMs;
+    return { nextCheckAt: new Date(Math.max(fromFirstFail, nextDay)), stage, jitterMs };
+  }
+
   const days = CHECK_INTERVAL_DAYS[tier] ?? CHECK_INTERVAL_DAYS.standard;
   // ±10% 抖动，避免整批同时到期
-  return days * 86_400_000 * (0.9 + Math.random() * 0.2);
+  return {
+    nextCheckAt: new Date(at.getTime() + days * 86_400_000 * (0.9 + Math.random() * 0.2)),
+    stage: 0,
+    jitterMs: 0,
+  };
 }
 
 export type RoundOutcome = {
@@ -274,6 +356,18 @@ export async function runHealthCheckRound(
       }
     : {};
 
+  // 排期用**本轮之后**的失败链状态：失败候选走 7/14 天加速，其余照 tier 周期
+  const schedule = computeNextCheck({
+    websiteId,
+    tier,
+    reach: next.reach,
+    retryAfterMs: probe.retryAfterMs,
+    failFamily: next.failFamily,
+    distinctFailDates: next.distinctFailDates,
+    firstFailAt: next.firstFailAt,
+    at,
+  });
+
   // 事件与状态在同一事务里落库：round_id 唯一约束一旦拦下重复插入，
   // 状态转移也随之回滚 —— 同一轮重跑绝不会把消抖计数加第二次。
   const persist = () =>
@@ -315,9 +409,7 @@ export async function runHealthCheckRound(
         reach_since: next.reachSince,
         last_ok_at: next.lastOkAt,
         last_checked_at: at,
-        next_check_at: new Date(
-          at.getTime() + nextCheckDelayMs(tier, next.reach, probe.retryAfterMs)
-        ),
+        next_check_at: schedule.nextCheckAt,
         consecutive_fails: next.consecutiveFails,
         distinct_fail_dates: next.distinctFailDates,
         first_fail_at: next.firstFailAt,
@@ -334,9 +426,7 @@ export async function runHealthCheckRound(
         reach_since: next.reachSince,
         last_ok_at: next.lastOkAt,
         last_checked_at: at,
-        next_check_at: new Date(
-          at.getTime() + nextCheckDelayMs(tier, next.reach, probe.retryAfterMs)
-        ),
+        next_check_at: schedule.nextCheckAt,
         consecutive_fails: next.consecutiveFails,
         distinct_fail_dates: next.distinctFailDates,
         first_fail_at: next.firstFailAt,
