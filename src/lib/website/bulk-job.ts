@@ -339,13 +339,13 @@ const ITEM_HEARTBEAT_MS = 60_000;
  * 并发执行两次 —— 对 AI 改写就是重复计费。写 status: "running" 是空操作，
  * 目的只是触发 Prisma 更新 @updatedAt；条目一旦不再是 running 就不会被改到。
  */
-function startItemHeartbeat(itemId: number, jobId: number): () => void {
+function startItemHeartbeat(itemId: number): () => void {
   const timer = setInterval(() => {
     void prisma.bulkJobItem
       .updateMany({ where: { id: itemId, status: "running" }, data: { status: "running" } })
       .catch(() => {});
-    // 顺带给任务租约续期：条目可能跑得比一个租约周期还久
-    void renewJobLease(jobId).catch(() => {});
+    // 任务租约不在这里续 —— 它归 startJobLeaseHeartbeat 管，覆盖整个 chunk。
+    // 挂在这里的旧写法对短条目根本不触发（12s 的条目等不到 60s 的第一跳）。
   }, ITEM_HEARTBEAT_MS);
   timer.unref?.();
   return () => clearInterval(timer);
@@ -384,11 +384,72 @@ async function acquireJobLease(jobId: number): Promise<boolean> {
   return acquired.count === 1;
 }
 
-async function renewJobLease(jobId: number): Promise<void> {
-  await prisma.bulkJob.updateMany({
-    where: { id: jobId, locked_by: WORKER_INSTANCE_ID },
+/** 续租一次。返回 false 表示租约已不属于本 worker（或任务已终态），必须停手。 */
+async function renewJobLease(jobId: number): Promise<boolean> {
+  const renewed = await prisma.bulkJob.updateMany({
+    where: {
+      id: jobId,
+      locked_by: WORKER_INSTANCE_ID,
+      status: { in: DRIVABLE_JOB_STATUSES },
+    },
     data: { locked_until: new Date(Date.now() + JOB_LEASE_MS) },
   });
+  return renewed.count === 1;
+}
+
+/** 续租间隔：必须显著小于租约时长，留出至少一次重试的余量 */
+const LEASE_HEARTBEAT_MS = Number(process.env.BULK_JOB_LEASE_HEARTBEAT_MS) || 30_000;
+
+export type LeaseHeartbeat = {
+  /** 租约是否已丢失（被别人接管、任务终态、或续租连续失败） */
+  lost: () => boolean;
+  /** 丢失原因，供调用方回报 */
+  reason: () => "lease_lost" | "lease_renew_failed" | null;
+  /** 成功续租次数，测试用 */
+  renewals: () => number;
+  stop: () => void;
+};
+
+/**
+ * 任务级租约心跳：整个 chunk 期间持续续租，与单条 item 的执行时长无关。
+ *
+ * 之前续租挂在 item 心跳里（60s 一次），而 health_check 单条只要约 12 秒 ——
+ * 定时器在首次触发前就被 clearInterval 清掉，于是租约只在 chunk 开始时设置一次，
+ * 一个 chunk（20 × 12s ≈ 240s）必然跑过 120s 的租约期。单 worker 时能靠 chunk
+ * 边界自愈，多实例时第二个 worker 就能在 chunk 中途抢走租约并发跑。
+ */
+function startJobLeaseHeartbeat(jobId: number): LeaseHeartbeat {
+  let lost = false;
+  let reason: "lease_lost" | "lease_renew_failed" | null = null;
+  let renewals = 0;
+
+  const timer = setInterval(() => {
+    void renewJobLease(jobId)
+      .then((ok) => {
+        if (ok) renewals++;
+        else if (!lost) {
+          // 条件没匹配上：租约已被别人接管，或任务已终态
+          lost = true;
+          reason = "lease_lost";
+        }
+      })
+      .catch(() => {
+        // 数据库故障导致续租失败：无法证明租约仍属于自己，按丢失处理。
+        // 保守方向 —— 宁可停下让别人接管，也不要两个 worker 同时推进。
+        if (!lost) {
+          lost = true;
+          reason = "lease_renew_failed";
+        }
+      });
+  }, LEASE_HEARTBEAT_MS);
+  timer.unref?.();
+
+  return {
+    lost: () => lost,
+    reason: () => reason,
+    renewals: () => renewals,
+    stop: () => clearInterval(timer),
+  };
 }
 
 async function releaseJobLease(jobId: number): Promise<void> {
@@ -451,7 +512,13 @@ export const TERMINAL_JOB_STATUSES = [
 export const DRIVABLE_JOB_STATUSES = ["queued", "running"];
 
 export type RunNextOutcome =
-  | { ok: true; job: BulkJobView; processedNow: number }
+  | {
+      ok: true;
+      job: BulkJobView;
+      processedNow: number;
+      /** 本块因租约丢失提前收尾；剩余条目仍是 queued，等下一个持有者接手 */
+      leaseLost?: "lease_lost" | "lease_renew_failed";
+    }
   | { ok: false; message: string };
 
 export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
@@ -470,9 +537,14 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
     return { ok: true, job: view!, processedNow: 0 };
   }
 
+  // 租约到手就立刻开始续期，覆盖整个 chunk
+  const lease = startJobLeaseHeartbeat(jobId);
   try {
-    return await runChunkLocked(jobId, job, job.type);
+    return await runChunkLocked(jobId, job, job.type, lease);
   } finally {
+    lease.stop();
+    // 租约已被别人接管时，releaseJobLease 的 where 匹配不到本 worker，
+    // 因此不会清掉新持有者的 locked_by/locked_until
     await releaseJobLease(jobId);
   }
 }
@@ -481,7 +553,8 @@ export async function runNextChunk(jobId: number): Promise<RunNextOutcome> {
 async function runChunkLocked(
   jobId: number,
   job: BulkJob,
-  jobType: BulkJobType
+  jobType: BulkJobType,
+  lease: LeaseHeartbeat
 ): Promise<RunNextOutcome> {
   // queued → running；paused 说明是人工点了「继续执行」，清掉暂停原因
   if (job.status === "queued" || job.status === "paused") {
@@ -565,6 +638,10 @@ async function runChunkLocked(
 
   let processedNow = 0;
   for (const item of queued) {
+    // 租约没了就不再领新条目。正在跑的那条已经在上一轮循环里安全收尾，
+    // 剩下的仍是 queued —— 不标失败，等新持有者接手。
+    if (lease.lost()) break;
+
     // 原子占用：并发 run-next 时同一条只会被一个请求处理
     const claimed = await prisma.bulkJobItem.updateMany({
       where: { id: item.id, status: "queued" },
@@ -573,7 +650,7 @@ async function runChunkLocked(
     if (claimed.count !== 1) continue;
 
     // 处理期间持续刷新 updated_at，让僵死回收只挑真正被中断的条目
-    const stopHeartbeat = startItemHeartbeat(item.id, jobId);
+    const stopHeartbeat = startItemHeartbeat(item.id);
 
     let itemStatus: "success" | "skipped" | "failed" | "qc_failed";
     let itemError: string | null = null;
@@ -763,7 +840,9 @@ async function runChunkLocked(
   });
 
   const view = await getBulkJob(jobId);
-  return { ok: true, job: view!, processedNow };
+  // 租约中途丢失时如实回报：剩余条目仍是 queued，调用方据此知道本块是提前收尾的
+  const leaseLost = lease.reason();
+  return { ok: true, job: view!, processedNow, ...(leaseLost ? { leaseLost } : {}) };
 }
 
 // 导入任务收尾：按文件回填计数、关闭批次、删除临时上传目录
