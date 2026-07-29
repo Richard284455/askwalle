@@ -220,6 +220,13 @@ export type TransportArgs = {
   pinnedIp: string;
   wantBody: boolean;
   signalDeadline: number;
+  /**
+   * 正文字节上限，默认 LIMITS.rangeBytes（64KB）。
+   *
+   * 可达性探测只需要前 64KB 判活，但 RSS/Atom 订阅经常几百 KB，截断后 XML 根本
+   * 解析不了。内容采集因此按需放大；探针一侧不传这个参数，行为逐字节不变。
+   */
+  maxBytes?: number;
 };
 
 export type TransportResponse = {
@@ -240,6 +247,9 @@ export const nodeTransport: Transport = (args) => {
   const { method, url, pinnedIp, wantBody, signalDeadline } = args;
   const transport = url.protocol === "https:" ? https : http;
   const family = pinnedIp.includes(":") ? 6 : 4;
+  // 不传就是探针的既有行为（64KB）；硬上限仍受 hardAbortBytes 约束
+  const maxBytes = args.maxBytes ?? LIMITS.rangeBytes;
+  const hardAbort = Math.max(LIMITS.hardAbortBytes, maxBytes * 4);
 
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {
@@ -249,7 +259,7 @@ export const nodeTransport: Transport = (args) => {
       // 显式 Host：连的是 IP，主机名只能靠这个头传递
       host: url.host,
     };
-    if (wantBody) headers.range = `bytes=0-${LIMITS.rangeBytes - 1}`;
+    if (wantBody) headers.range = `bytes=0-${maxBytes - 1}`;
 
     // autoSelectFamily / family / lookup 会透传给 net.connect，
     // 但 @types/node 没把它们放进 RequestOptions，只能显式断言
@@ -312,9 +322,9 @@ export const nodeTransport: Transport = (args) => {
 
       response.on("data", (chunk: Buffer) => {
         bytes += chunk.length;
-        if (bytes > LIMITS.hardAbortBytes) {
+        if (bytes > hardAbort) {
           truncated = true;
-          chunks.push(chunk.subarray(0, chunk.length - (bytes - LIMITS.hardAbortBytes)));
+          chunks.push(chunk.subarray(0, chunk.length - (bytes - hardAbort)));
           response.destroy();
           return;
         }
@@ -325,7 +335,7 @@ export const nodeTransport: Transport = (args) => {
           status: response.statusCode ?? 0,
           headers: response.headers,
           buffer: Buffer.concat(chunks),
-          truncated: truncated || bytes >= LIMITS.rangeBytes,
+          truncated: truncated || bytes >= maxBytes,
         })
       );
       response.on("error", reject);
@@ -344,7 +354,13 @@ export const nodeTransport: Transport = (args) => {
  */
 export async function safeFetch(
   startUrl: string,
-  options: { method: "HEAD" | "GET"; resolve?: ResolveFn; transport?: Transport }
+  options: {
+    method: "HEAD" | "GET";
+    resolve?: ResolveFn;
+    transport?: Transport;
+    /** 正文字节上限；不传即探针默认的 64KB */
+    maxBytes?: number;
+  }
 ): Promise<FetchResult> {
   const started = Date.now();
   const deadline = started + LIMITS.totalTimeoutMs;
@@ -391,6 +407,7 @@ export async function safeFetch(
         pinnedIp: verdict.pinnedIp,
         wantBody: options.method === "GET",
         signalDeadline: deadline,
+        ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
       });
     } catch (error) {
       const { errorKind, code } = classifyNetworkError(error as NodeJS.ErrnoException);

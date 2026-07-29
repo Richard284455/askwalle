@@ -397,6 +397,9 @@ model BulkJobItem {
   job_id     Int
   job        BulkJob  @relation(fields: [job_id], references: [id])
   website_id Int?
+  // 内容采集任务的条目指向信息源而不是工具（与 website_id 互斥，同为可空）
+  source_id  Int?
+  source     ContentSource? @relation(fields: [source_id], references: [id])
   status     String   @default("queued") // queued / running / success / skipped / failed
   result     Json?
   error      String?
@@ -406,6 +409,7 @@ model BulkJobItem {
   @@map("bulk_job_items")
   @@index([job_id, status])
   @@index([website_id])
+  @@index([source_id])
 }
 
 // ---------------------------------------------------------------------------
@@ -512,4 +516,111 @@ model ToolHealthEvent {
   @@index([website_id, created_at])
   @@index([created_at])
   @@index([outcome])
+}
+
+// ---------------------------------------------------------------------------
+// AI Content Intelligence —— 采集层（第一阶段）
+//
+// 管道：信息源 → 原始来源条目 → 事件聚类 → 事实与证据 → 编辑草稿 → 人工审核
+//       → ResourceContent 发布
+// 本阶段只做前两级。往后每一级都建立在「每条事实都能指回某个 SourceItem」之上，
+// 所以原始层必须是**不可变的快照**：抓到什么存什么，判断留给上层。
+//
+// 与 ResourceContent 的关系：ResourceContent 仍是唯一的发布层，这里不替代它，
+// 只在它上游补出可追溯的原料。本阶段不写 ResourceContent。
+// ---------------------------------------------------------------------------
+
+enum ContentSourceKind {
+  rss // RSS / Atom 订阅
+  manual // 编辑人工提交的单条 URL
+}
+
+enum SourceItemStatus {
+  fetched // 已抓取，正文快照已落库
+  link_only // 只拿到订阅里的元数据，正文抓取失败/未做
+  parse_failed // 订阅或正文解析失败，保留原始证据待排查
+  duplicate // 与同源的既有条目重复（指向 duplicate_of_id）
+}
+
+model ContentSource {
+  id        Int               @id @default(autoincrement())
+  name      String // 展示名，如 "OpenAI Blog"
+  kind      ContentSourceKind
+  /// RSS 源的订阅地址；manual 源为空
+  feed_url  String?
+  homepage  String?
+  /// 出版方，发布时落到 ResourceContent.sources[].publisher
+  publisher String
+  lang      String            @default("en")
+  enabled   Boolean           @default(true)
+
+  // 抓取调度（与工具生命周期同一套思路：到期才抓，失败退避）
+  fetch_interval_minutes Int       @default(60)
+  last_fetched_at        DateTime?
+  next_fetch_at          DateTime?
+  last_status            String? // ok / http_error / parse_error / unsafe_target / dns / timeout ...
+  last_error             String?
+  consecutive_failures   Int       @default(0)
+
+  item_count Int     @default(0)
+  notes      String?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  items     SourceItem[]
+  job_items BulkJobItem[]
+
+  @@map("content_sources")
+  /// 同一个订阅地址只允许配置一次；manual 源 feed_url 为 NULL，Postgres 视 NULL 互不相等，因此不受限
+  @@unique([feed_url])
+  @@index([enabled, next_fetch_at])
+  @@index([kind])
+}
+
+model SourceItem {
+  id        Int           @id @default(autoincrement())
+  source_id Int
+  source    ContentSource @relation(fields: [source_id], references: [id])
+
+  // ── 溯源（落库后不再改写）──
+  /// 规范化后的原文地址（去跟踪参数、统一大小写与末尾斜杠）
+  url           String
+  /// 页面自称的 canonical，或订阅里的 <guid>/<id>
+  canonical_url String?
+  /// url 的 sha256 前 32 位，去重键
+  url_hash      String
+  /// 正文纯文本的 sha256 前 32 位；用于识别「同内容换地址」，本阶段只记录不判定
+  content_hash  String?
+
+  title        String
+  author       String?
+  /// 来源自称的发布时间（可能缺失或不可信，原样保留）
+  published_at DateTime?
+  fetched_at   DateTime  @default(now())
+
+  // ── 原始快照 ──
+  raw_excerpt String? // 订阅里的摘要/description
+  raw_content String? // 正文纯文本，截断存储
+  lang        String?
+
+  // ── 抓取证据（复用探针的 SSRF 加固取回，逐跳校验）──
+  http_status Int?
+  final_url   String?
+  /// redirectChain / pinnedIp / resolvedIps / latency / bytesRead 等
+  evidence    Json?
+
+  status         SourceItemStatus @default(fetched)
+  /// 判为重复时指向同源的首条
+  duplicate_of_id Int?
+
+  created_at DateTime @default(now())
+
+  @@map("source_items")
+  /// 同一个源里同一篇文章只记一次。**跨源不去重** —— 「两个源都报道了同一件事」
+  /// 是真实的溯源信息，合并成事件是下一阶段聚类要做的judgment，不在原始层预判。
+  @@unique([source_id, url_hash])
+  @@index([source_id, published_at])
+  @@index([status, fetched_at])
+  @@index([content_hash])
 }

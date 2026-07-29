@@ -17,6 +17,7 @@ import {
   runHealthCheckRound,
   selectDueWebsites,
 } from "@/lib/website/tool-lifecycle";
+import { ingestSource, selectDueSources } from "@/lib/content/ingest";
 import {
   finalizeDirectRewriteBatch,
   markDirectRewriteStarted,
@@ -57,7 +58,8 @@ export type BulkJobType =
   | "apply_and_review"
   | "publish"
   | "import_excel"
-  | "rewrite_direct";
+  | "rewrite_direct"
+  | "content_ingest";
 
 const JOB_TYPES: BulkJobType[] = [
   "health_check",
@@ -65,14 +67,20 @@ const JOB_TYPES: BulkJobType[] = [
   "publish",
   "import_excel",
   "rewrite_direct",
+  "content_ingest",
 ];
 
 // 可达性探测：每块 20 条。单条约 1–3 秒（HEAD 短路居多），一块 ~1 分钟，
 // 既不会让 run-next 请求超时，也能让进度条稳定推进。
 export const HEALTH_CHECK_CHUNK_SIZE = 20;
 
+// 内容采集：每块 5 个源。单个源要抓订阅再逐条落库，比探测慢得多，
+// 块开得大会让 run-next 请求超时。
+export const CONTENT_INGEST_CHUNK_SIZE = 5;
+
 function chunkSizeFor(type: BulkJobType): number {
   if (type === "health_check") return HEALTH_CHECK_CHUNK_SIZE;
+  if (type === "content_ingest") return CONTENT_INGEST_CHUNK_SIZE;
   return type === "rewrite_direct" ? REWRITE_CHUNK_SIZE : CHUNK_SIZE;
 }
 
@@ -272,6 +280,52 @@ export async function createHealthCheckJob(
   });
   nudgeJobWorker();
   return { ok: true, jobId: job.id, total: websiteIds.length };
+}
+
+// ---------------------------------------------------------------------------
+// 内容采集任务：创建
+// ---------------------------------------------------------------------------
+
+export const CONTENT_INGEST_JOB_MAX = 200;
+
+/**
+ * 建内容采集任务。
+ *
+ * 与 health_check 同一条纪律：**全局同时只允许一个未终结的 content_ingest 任务**。
+ * 多个任务并行会让同一个源被重复抓取，也会把对源站的并发放大到不礼貌的程度。
+ * 想加吞吐应该调 chunk size，不是开多个任务。
+ */
+export async function createContentIngestJob(
+  limit = CONTENT_INGEST_JOB_MAX
+): Promise<{ ok: true; jobId: number; total: number } | { ok: false; message: string }> {
+  const running = await prisma.bulkJob.findFirst({
+    where: { type: "content_ingest", status: { notIn: TERMINAL_JOB_STATUSES } },
+    select: { id: true, status: true },
+  });
+  if (running) {
+    return {
+      ok: false,
+      message: `已有未终结的采集任务 #${running.id}（${running.status}），同时只允许一个`,
+    };
+  }
+
+  const capped = Math.min(Math.max(1, limit), CONTENT_INGEST_JOB_MAX);
+  const sourceIds = await selectDueSources(capped);
+  if (!sourceIds.length) return { ok: false, message: "当前没有到期需要抓取的信息源" };
+
+  const job = await prisma.bulkJob.create({
+    data: {
+      type: "content_ingest",
+      status: "queued",
+      total_count: sourceIds.length,
+      params: { limit: capped, selectedAt: new Date().toISOString() } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.bulkJobItem.createMany({
+    data: sourceIds.map((sourceId) => ({ job_id: job.id, source_id: sourceId })),
+  });
+  nudgeJobWorker();
+  return { ok: true, jobId: job.id, total: sourceIds.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +631,7 @@ async function runChunkLocked(
     where: { job_id: jobId, status: "queued" },
     orderBy: { id: "asc" },
     take: chunkSizeFor(jobType),
-    select: { id: true, website_id: true },
+    select: { id: true, website_id: true, source_id: true },
   });
 
   // 直连改写：每块开始前重新解析 provider 运行时（key 只在进程内传递）。
@@ -680,6 +734,28 @@ async function runChunkLocked(
             select: { id: true },
           });
           itemWebsiteId = website?.id;
+        }
+      } else if (job.type === "content_ingest") {
+        // 一个 item = 一个信息源的一轮抓取。
+        //
+        // 与 health_check 同一套语义：item 状态说的是「采集跑没跑成」，
+        // 不是「源健不健康」。源返回 404 也是 success —— 那是有效的采集结论，
+        // 否则一批失效订阅会把熔断器打爆。
+        if (!item.source_id) {
+          itemStatus = "failed";
+          itemError = "缺少 source_id";
+        } else {
+          const ingest = await ingestSource(item.source_id);
+          itemStatus = ingest.ok ? "success" : "skipped";
+          itemError = ingest.ok ? null : `${ingest.status}: ${ingest.error ?? ""}`.slice(0, 300);
+          itemResult = {
+            sourceId: ingest.sourceId,
+            status: ingest.status,
+            itemsSeen: ingest.itemsSeen,
+            itemsCreated: ingest.itemsCreated,
+            itemsDuplicate: ingest.itemsDuplicate,
+            itemsSkipped: ingest.itemsSkipped,
+          } as Prisma.InputJsonValue;
         }
       } else if (!item.website_id) {
         itemStatus = "failed";
