@@ -78,8 +78,17 @@ export type IngestResult = {
   itemsCreated: number;
   itemsDuplicate: number;
   itemsSkipped: number;
+  /** 单条落库抛异常但没有拖垮整轮的数量 */
+  itemsErrored: number;
+  /** 同一 URL 已存在但标题变了：记录不改写（原始层快照不可变）*/
+  itemsTitleChanged: number;
   httpStatus: number | null;
   finalUrl: string | null;
+  /** 订阅体积超过上限被截断 */
+  truncated: boolean;
+  /** 跟随重定向后的实际订阅地址，与配置不同即为源迁移 */
+  resolvedFeedUrl: string | null;
+  feedMoved: boolean;
 };
 
 type FetchEvidence = {
@@ -87,40 +96,59 @@ type FetchEvidence = {
   finalUrl: string | null;
   evidence: Prisma.InputJsonValue | null;
   body: string | null;
+  /** 响应头里的验证器，下次带上做条件请求 */
+  etag: string | null;
+  lastModified: string | null;
+  /** 正文被字节上限截断（超大订阅的信号） */
+  truncated: boolean;
   /** 失败时的分类，成功为 null */
   failure: { status: string; message: string } | null;
 };
+
+const EMPTY_FETCH = {
+  httpStatus: null, finalUrl: null, body: null,
+  etag: null, lastModified: null, truncated: false,
+} as const;
 
 /** 统一的安全取回：把 safeFetch 的四种结果翻译成采集层的证据结构 */
 async function fetchSafely(
   url: string,
   maxBytes: number,
-  options: IngestOptions
+  options: IngestOptions,
+  conditional?: { etag: string | null; lastModified: string | null }
 ): Promise<FetchEvidence> {
   const res = await safeFetch(url, {
     method: "GET",
     maxBytes,
+    ...(conditional?.etag || conditional?.lastModified
+      ? {
+          conditional: {
+            ...(conditional.etag ? { etag: conditional.etag } : {}),
+            ...(conditional.lastModified ? { lastModified: conditional.lastModified } : {}),
+          },
+        }
+      : {}),
     ...(options.resolve ? { resolve: options.resolve } : {}),
     ...(options.transport ? { transport: options.transport } : {}),
   });
 
   if (res.kind === "unsafe") {
     return {
-      httpStatus: null, finalUrl: null, body: null,
+      ...EMPTY_FETCH,
       evidence: { unsafeReason: res.verdict.reason, atHop: res.atHop } as Prisma.InputJsonValue,
       failure: { status: "unsafe_target", message: `${res.verdict.reason}: ${res.verdict.detail}` },
     };
   }
   if (res.kind === "redirect_loop") {
     return {
-      httpStatus: null, finalUrl: null, body: null,
+      ...EMPTY_FETCH,
       evidence: { redirectChain: res.redirectChain } as unknown as Prisma.InputJsonValue,
       failure: { status: "redirect_loop", message: "重定向成环或超过跳数上限" },
     };
   }
   if (res.kind === "network_error") {
     return {
-      httpStatus: null, finalUrl: null, body: null,
+      ...EMPTY_FETCH,
       evidence: { networkError: `${res.code}: ${res.message}` } as Prisma.InputJsonValue,
       failure: { status: res.errorKind, message: `${res.code}: ${res.message}` },
     };
@@ -136,19 +164,24 @@ async function fetchSafely(
     contentType: res.headers["content-type"] ?? null,
   } as unknown as Prisma.InputJsonValue;
 
+  const etag = res.headers["etag"] ?? null;
+  const lastModified = res.headers["last-modified"] ?? null;
+  const common = {
+    httpStatus: res.status, finalUrl: res.finalUrl, evidence,
+    etag, lastModified, truncated: res.truncated,
+  };
+
+  // 304：源没更新，这是成功而不是失败 —— 条件请求生效的正常结果
+  if (res.status === 304) {
+    return { ...common, body: null, failure: { status: "not_modified", message: "" } };
+  }
   if (res.status >= 400) {
-    return {
-      httpStatus: res.status, finalUrl: res.finalUrl, body: null, evidence,
-      failure: { status: "http_error", message: `HTTP ${res.status}` },
-    };
+    return { ...common, body: null, failure: { status: "http_error", message: `HTTP ${res.status}` } };
   }
   if (res.body === null) {
-    return {
-      httpStatus: res.status, finalUrl: res.finalUrl, body: null, evidence,
-      failure: { status: "undecodable", message: "正文无法解码" },
-    };
+    return { ...common, body: null, failure: { status: "undecodable", message: "正文无法解码" } };
   }
-  return { httpStatus: res.status, finalUrl: res.finalUrl, body: res.body, evidence, failure: null };
+  return { ...common, body: res.body, failure: null };
 }
 
 /**
@@ -167,7 +200,9 @@ export async function ingestSource(
   const base: IngestResult = {
     sourceId, ok: false, status: "ok", error: null,
     itemsSeen: 0, itemsCreated: 0, itemsDuplicate: 0, itemsSkipped: 0,
+    itemsErrored: 0, itemsTitleChanged: 0,
     httpStatus: null, finalUrl: null,
+    truncated: false, resolvedFeedUrl: null, feedMoved: false,
   };
 
   if (source.kind !== ContentSourceKind.rss || !source.feed_url) {
@@ -175,52 +210,105 @@ export async function ingestSource(
     return finish({ ...base, ok: true, status: "not_a_feed" }, source, now);
   }
 
-  const fetched = await fetchSafely(source.feed_url, FEED_MAX_BYTES, options);
+  const fetched = await fetchSafely(source.feed_url, FEED_MAX_BYTES, options, {
+    etag: source.etag,
+    lastModified: source.last_modified,
+  });
   base.httpStatus = fetched.httpStatus;
   base.finalUrl = fetched.finalUrl;
+  base.truncated = fetched.truncated;
+  base.resolvedFeedUrl = fetched.finalUrl;
+  // 源迁移只记录、不自动改配置 —— 与工具域名迁移同一条纪律，等人工确认
+  base.feedMoved = Boolean(fetched.finalUrl && fetched.finalUrl !== source.feed_url);
 
+  // 304：源没更新，本轮无事可做，是成功
+  if (fetched.failure?.status === "not_modified") {
+    return finish({ ...base, ok: true, status: "not_modified" }, source, now, fetched);
+  }
   if (fetched.failure) {
     return finish(
       { ...base, ok: false, status: fetched.failure.status, error: fetched.failure.message },
-      source, now);
+      source, now, fetched);
   }
 
   let items: FeedItem[];
   try {
     items = parseFeed(fetched.body!).items;
   } catch (e) {
-    return finish(
-      {
-        ...base, ok: false, status: "parse_error",
-        error: e instanceof FeedParseError ? e.message : `解析失败: ${String(e).slice(0, 200)}`,
-      },
-      source, now);
+    // 截断导致的解析失败要能一眼看出是体积问题，而不是笼统的格式错误
+    const status = fetched.truncated ? "feed_too_large" : "parse_error";
+    const detail = fetched.truncated
+      ? `订阅超过 ${FEED_MAX_BYTES} 字节上限被截断，XML 不完整`
+      : e instanceof FeedParseError
+        ? e.message
+        : `解析失败: ${String(e).slice(0, 200)}`;
+    return finish({ ...base, ok: false, status, error: detail }, source, now, fetched);
   }
+
+  // 解析器只认完整的 <item>…</item>，截断的尾部会被静默忽略 —— 于是「只抓到一部分」
+  // 会长得和「全部抓到」一模一样。对情报系统来说这比解析失败更危险：
+  // 少掉的条目没人知道。已解析的照常保留，但状态必须把话说明白。
+  const truncatedNote = fetched.truncated
+    ? `订阅超过 ${FEED_MAX_BYTES} 字节上限被截断，本轮只看到前 ${items.length} 条，更早的条目未纳入`
+    : null;
 
   base.itemsSeen = items.length;
   if (!items.length) {
-    return finish({ ...base, ok: true, status: "empty_feed" }, source, now);
+    return finish(
+      {
+        ...base, ok: true,
+        status: fetched.truncated ? "feed_too_large" : "empty_feed",
+        error: truncatedNote,
+      },
+      source, now, fetched);
   }
+
+  // 相对地址以**跟随重定向后的实际订阅地址**为 base：源迁移后用旧地址解会解错
+  const linkBase = fetched.finalUrl ?? source.feed_url;
 
   const limit = options.maxItems ?? 50;
   for (const item of items.slice(0, limit)) {
-    const outcome = await persistItem(source.id, source.feed_url, source.lang, item, options);
-    if (outcome === "created") base.itemsCreated++;
-    else if (outcome === "duplicate") base.itemsDuplicate++;
-    else base.itemsSkipped++;
+    // ★ 单条出错绝不能拖垮整个源：一条畸形条目不该让其余几十条一起丢掉
+    try {
+      const outcome = await persistItem(source.id, linkBase, source.lang, item, options);
+      if (outcome === "created") base.itemsCreated++;
+      else if (outcome === "duplicate") base.itemsDuplicate++;
+      else if (outcome === "title_changed") {
+        base.itemsDuplicate++;
+        base.itemsTitleChanged++;
+      } else base.itemsSkipped++;
+    } catch (e) {
+      base.itemsErrored++;
+      console.error(
+        `[content-ingest] 源 #${source.id} 条目落库失败（其余条目继续）:`,
+        e instanceof Error ? e.message : String(e)
+      );
+    }
   }
 
-  return finish({ ...base, ok: true, status: "ok" }, source, now);
+  return finish(
+    {
+      ...base,
+      ok: true,
+      status: truncatedNote ? "feed_truncated" : "ok",
+      error: truncatedNote,
+    },
+    source, now, fetched);
 }
 
-/** 落一条 SourceItem。返回值只描述发生了什么，不抛异常打断整轮。 */
+/**
+ * 落一条 SourceItem。
+ *
+ * 返回值只描述发生了什么。调用方对本函数的异常做了兜底 —— 一条畸形条目
+ * 不该让同一个源的其余条目一起丢掉。
+ */
 async function persistItem(
   sourceId: number,
   feedUrl: string,
   sourceLang: string,
   item: FeedItem,
   options: IngestOptions
-): Promise<"created" | "duplicate" | "skipped"> {
+): Promise<"created" | "duplicate" | "title_changed" | "skipped"> {
   // link 缺失时退回 guid —— 有些源只在 guid 里放地址
   const rawLink = item.link ?? item.guid;
   if (!rawLink) return "skipped";
@@ -229,9 +317,13 @@ async function persistItem(
 
   const existing = await prisma.sourceItem.findUnique({
     where: { source_id_url_hash: { source_id: sourceId, url_hash: normalized.hash } },
-    select: { id: true },
+    select: { id: true, title: true },
   });
-  if (existing) return "duplicate";
+  if (existing) {
+    // 同一 URL 标题变了：**不改写既有快照** —— 原始层的价值就在于它不可变。
+    // 只把「观察到变化」这件事报上去，是否算新版本由上层聚类阶段判断。
+    return existing.title !== item.title.slice(0, 500) ? "title_changed" : "duplicate";
+  }
 
   // 订阅自带的正文/摘要
   const excerptText = item.excerpt ? htmlToText(item.excerpt) : null;
@@ -268,6 +360,7 @@ async function persistItem(
         title: item.title.slice(0, 500),
         author: item.author?.slice(0, 200) ?? null,
         published_at: item.publishedAt,
+        source_updated_at: item.updatedAt,
         raw_excerpt: excerptText ? excerptText.slice(0, EXCERPT_MAX_CHARS) : null,
         raw_content: trimmedContent,
         lang: sourceLang,
@@ -289,7 +382,8 @@ async function persistItem(
 async function finish(
   result: IngestResult,
   source: { id: number; fetch_interval_minutes: number; consecutive_failures: number; item_count: number },
-  now: Date
+  now: Date,
+  fetched?: Pick<FetchEvidence, "etag" | "lastModified" | "finalUrl">
 ): Promise<IngestResult> {
   const failures = result.ok ? 0 : source.consecutive_failures + 1;
   const delayMin = backoffMinutes(source.fetch_interval_minutes, failures);
@@ -303,6 +397,12 @@ async function finish(
       last_error: result.error,
       consecutive_failures: failures,
       item_count: source.item_count + result.itemsCreated,
+      // 验证器只在成功拿到响应时更新；失败轮不能把旧值冲掉
+      ...(fetched?.etag !== undefined && fetched.etag !== null ? { etag: fetched.etag } : {}),
+      ...(fetched?.lastModified !== undefined && fetched.lastModified !== null
+        ? { last_modified: fetched.lastModified }
+        : {}),
+      ...(fetched?.finalUrl ? { resolved_feed_url: fetched.finalUrl } : {}),
     },
   });
   return result;

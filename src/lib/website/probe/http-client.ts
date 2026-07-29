@@ -91,6 +91,8 @@ const KEPT_HEADERS = [
   "x-parking-provider",
   "x-served-by",
   "content-encoding",
+  "etag",
+  "last-modified",
 ];
 
 function pickHeaders(raw: http.IncomingHttpHeaders): Record<string, string> {
@@ -227,6 +229,11 @@ export type TransportArgs = {
    * 解析不了。内容采集因此按需放大；探针一侧不传这个参数，行为逐字节不变。
    */
   maxBytes?: number;
+  /**
+   * 条件请求头。带上后源没更新会回 304，省流量也更礼貌。
+   * 探针不传（每轮都要真实判活），只有内容采集用。
+   */
+  conditional?: { etag?: string; lastModified?: string };
 };
 
 export type TransportResponse = {
@@ -260,6 +267,9 @@ export const nodeTransport: Transport = (args) => {
       host: url.host,
     };
     if (wantBody) headers.range = `bytes=0-${maxBytes - 1}`;
+    // 条件请求：命中则服务端回 304，不再传正文
+    if (args.conditional?.etag) headers["if-none-match"] = args.conditional.etag;
+    if (args.conditional?.lastModified) headers["if-modified-since"] = args.conditional.lastModified;
 
     // autoSelectFamily / family / lookup 会透传给 net.connect，
     // 但 @types/node 没把它们放进 RequestOptions，只能显式断言
@@ -360,6 +370,8 @@ export async function safeFetch(
     transport?: Transport;
     /** 正文字节上限；不传即探针默认的 64KB */
     maxBytes?: number;
+    /** 条件请求头；不传即无条件 GET（探针的既有行为） */
+    conditional?: { etag?: string; lastModified?: string };
   }
 ): Promise<FetchResult> {
   const started = Date.now();
@@ -408,6 +420,7 @@ export async function safeFetch(
         wantBody: options.method === "GET",
         signalDeadline: deadline,
         ...(options.maxBytes !== undefined ? { maxBytes: options.maxBytes } : {}),
+        ...(options.conditional ? { conditional: options.conditional } : {}),
       });
     } catch (error) {
       const { errorKind, code } = classifyNetworkError(error as NodeJS.ErrnoException);
@@ -422,8 +435,12 @@ export async function safeFetch(
     }
 
     const headers = pickHeaders(response.headers);
+    // 304 属于 3xx 但不是重定向：它是「你手里的副本还新鲜」，直接当结果返回
     const isRedirect =
-      response.status >= 300 && response.status < 400 && Boolean(response.headers.location);
+      response.status !== 304 &&
+      response.status >= 300 &&
+      response.status < 400 &&
+      Boolean(response.headers.location);
 
     redirectChain.push({
       hop,

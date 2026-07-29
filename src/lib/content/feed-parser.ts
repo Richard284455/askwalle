@@ -18,6 +18,8 @@ export type FeedItem = {
   excerpt: string | null;
   /** <content:encoded> / Atom <content>，可能含 HTML */
   content: string | null;
+  /** Atom <updated> / RSS <atom:updated>：条目自称的最后修改时间 */
+  updatedAt: Date | null;
 };
 
 export type ParsedFeed = {
@@ -150,6 +152,8 @@ function parseRss(doc: string): ParsedFeed {
       excerpt: childText(raw, "description"),
       // content:encoded 才是全文，description 往往只是摘要
       content: childText(raw, "encoded"),
+      // 不少 RSS 源混用 atom:updated 表示条目被改过
+      updatedAt: parseFeedDate(childText(raw, "updated") ?? childText(raw, "modified")),
     };
   });
 
@@ -181,6 +185,7 @@ function parseAtom(doc: string): ParsedFeed {
       publishedAt: parseFeedDate(childText(raw, "published") ?? childText(raw, "updated")),
       excerpt: childText(raw, "summary"),
       content: childText(raw, "content"),
+      updatedAt: parseFeedDate(childText(raw, "updated")),
     };
   });
 

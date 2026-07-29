@@ -23,7 +23,9 @@
     "test:schedule": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/schedule-tests.ts",
     "reschedule:failures": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/reschedule-failure-candidates.ts",
     "check:lifecycle": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/lifecycle-daily-check.ts",
-    "test:ingest": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/content-ingest-tests.ts"
+    "test:ingest": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/content-ingest-tests.ts",
+    "test:feededge": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/feed-edge-case-tests.ts",
+    "sources:import": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/import-content-sources.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

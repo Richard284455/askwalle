@@ -558,9 +558,15 @@ model ContentSource {
   fetch_interval_minutes Int       @default(60)
   last_fetched_at        DateTime?
   next_fetch_at          DateTime?
-  last_status            String? // ok / http_error / parse_error / unsafe_target / dns / timeout ...
+  last_status            String? // ok / not_modified / http_error / parse_error / unsafe_target / dns / timeout ...
   last_error             String?
   consecutive_failures   Int       @default(0)
+
+  // 条件请求：源没更新时回 304，既省流量也是对源站的礼貌
+  etag          String?
+  last_modified String?
+  /// 跟随重定向后的实际订阅地址；与 feed_url 不同即说明源迁移了，需人工确认后再改配置
+  resolved_feed_url String?
 
   item_count Int     @default(0)
   notes      String?
@@ -597,6 +603,8 @@ model SourceItem {
   author       String?
   /// 来源自称的发布时间（可能缺失或不可信，原样保留）
   published_at DateTime?
+  /// 来源自称的最后修改时间（Atom <updated> / RSS <atom:updated>），用于识别条目被改过
+  source_updated_at DateTime?
   fetched_at   DateTime  @default(now())
 
   // ── 原始快照 ──
