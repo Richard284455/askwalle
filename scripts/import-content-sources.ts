@@ -17,15 +17,22 @@ import { readFileSync } from "fs";
 import { prisma } from "@/lib/prisma";
 import { normalizeUrl } from "@/lib/content/url-normalize";
 
+type Tier = "OFFICIAL_PRIMARY" | "STRUCTURED_TECHNICAL" | "AUTHORITATIVE_MEDIA" | "COMMUNITY_SIGNAL";
+const TIERS: Tier[] = ["OFFICIAL_PRIMARY", "STRUCTURED_TECHNICAL", "AUTHORITATIVE_MEDIA", "COMMUNITY_SIGNAL"];
+
+/** 定义文件的字段形状（snake_case，与人工维护的 JSON 一致） */
 type SourceDef = {
+  external_key: string;
   name: string;
-  kind: "rss" | "manual";
-  feedUrl?: string | null;
-  homepage?: string | null;
   publisher: string;
-  lang?: string;
+  source_tier: Tier;
+  /** RSS / ATOM —— 仅声明；解析器仍会自行探测，两者不符值得报警 */
+  adapter_type: "RSS" | "ATOM";
+  feed_url?: string | null;
+  homepage?: string | null;
+  language?: string;
   enabled?: boolean;
-  fetchIntervalMinutes?: number;
+  fetch_interval_minutes?: number;
   /** 人工确认记录：发布者身份与使用边界 */
   notes?: string;
 };
@@ -35,21 +42,32 @@ const FILE = process.argv.slice(2).find((a) => !a.startsWith("--"));
 
 function validate(defs: unknown): SourceDef[] {
   if (!Array.isArray(defs)) throw new Error("定义文件顶层必须是数组");
+  const seenKeys = new Set<string>();
+  const seenUrls = new Set<string>();
   return defs.map((raw, i) => {
     const d = raw as SourceDef;
     const at = `第 ${i + 1} 条`;
+    if (!d.external_key?.trim()) throw new Error(`${at}: 缺少 external_key`);
+    if (seenKeys.has(d.external_key)) throw new Error(`${at}: external_key 重复: ${d.external_key}`);
+    seenKeys.add(d.external_key);
     if (!d.name?.trim()) throw new Error(`${at}: 缺少 name`);
-    if (d.kind !== "rss" && d.kind !== "manual") throw new Error(`${at}: kind 必须是 rss 或 manual`);
     if (!d.publisher?.trim()) throw new Error(`${at}: 缺少 publisher（发布者身份必须人工确认）`);
-    if (d.kind === "rss") {
-      if (!d.feedUrl?.trim()) throw new Error(`${at}: rss 源必须有 feedUrl`);
-      const n = normalizeUrl(d.feedUrl);
-      if (!n) throw new Error(`${at}: feedUrl 不是合法的 http/https 地址: ${d.feedUrl}`);
-      // 规范化后入库，避免同一个源因为末尾斜杠差异被建成两个
-      d.feedUrl = n.url;
-    } else if (d.feedUrl) {
-      throw new Error(`${at}: manual 源不应有 feedUrl`);
+    if (!TIERS.includes(d.source_tier)) {
+      throw new Error(`${at}: source_tier 必须是 ${TIERS.join(" / ")}`);
     }
+    if (d.adapter_type !== "RSS" && d.adapter_type !== "ATOM") {
+      throw new Error(`${at}: adapter_type 必须是 RSS 或 ATOM`);
+    }
+    if (!d.feed_url?.trim()) throw new Error(`${at}: 缺少 feed_url`);
+    // 只校验合法性，**原样存储**。URL 归一化是给文章去重用的；订阅地址是人工确认过的
+    // 配置端点，改写它（比如剥掉 /feed/ 的末尾斜杠）会让服务端 301 回来，白多一跳，
+    // 还会把 feedMoved 误报成「源迁移」。
+    if (!normalizeUrl(d.feed_url)) {
+      throw new Error(`${at}: feed_url 不是合法的 http/https 地址: ${d.feed_url}`);
+    }
+    d.feed_url = d.feed_url.trim();
+    if (seenUrls.has(d.feed_url)) throw new Error(`${at}: feed_url 重复: ${d.feed_url}`);
+    seenUrls.add(d.feed_url);
     if (!d.notes?.trim()) throw new Error(`${at}: 缺少 notes（使用边界需人工确认后写明）`);
     return d;
   });
@@ -67,9 +85,10 @@ async function main() {
   const plan: { action: "create" | "update" | "unchanged"; def: SourceDef; id?: number; changes?: string[] }[] = [];
 
   for (const def of defs) {
-    const existing = def.kind === "rss"
-      ? await prisma.contentSource.findUnique({ where: { feed_url: def.feedUrl! } })
-      : await prisma.contentSource.findFirst({ where: { kind: "manual", name: def.name } });
+    // 身份以 external_key 为准：feed_url 可能迁移，配置与库靠它对齐
+    const existing = await prisma.contentSource.findUnique({
+      where: { external_key: def.external_key },
+    });
 
     if (!existing) {
       plan.push({ action: "create", def });
@@ -79,9 +98,12 @@ async function main() {
       name: def.name,
       homepage: def.homepage ?? null,
       publisher: def.publisher,
-      lang: def.lang ?? "en",
+      source_tier: def.source_tier,
+      declared_format: def.adapter_type,
+      feed_url: def.feed_url ?? null,
+      lang: def.language ?? "en",
       enabled: def.enabled ?? true,
-      fetch_interval_minutes: def.fetchIntervalMinutes ?? 60,
+      fetch_interval_minutes: def.fetch_interval_minutes ?? 60,
       notes: def.notes ?? null,
     };
     const changes = Object.entries(desired)
@@ -92,10 +114,11 @@ async function main() {
 
   for (const p of plan) {
     const mark = p.action === "create" ? "＋新建" : p.action === "update" ? "～更新" : "＝不变";
-    console.log(`  ${mark}  ${p.def.name}${p.id ? ` (#${p.id})` : ""}`);
-    console.log(`         ${p.def.kind}  ${p.def.feedUrl ?? "(人工提交)"}`);
+    console.log(`  ${mark}  ${p.def.external_key}  ${p.def.name}${p.id ? ` (#${p.id})` : ""}`);
+    console.log(`         ${p.def.source_tier} · ${p.def.adapter_type} · ${p.def.fetch_interval_minutes ?? 60} 分钟`);
+    console.log(`         ${p.def.feed_url}`);
     console.log(`         发布者: ${p.def.publisher}`);
-    console.log(`         边界: ${p.def.notes}`);
+    console.log(`         边界: ${(p.def.notes ?? "").slice(0, 110)}${(p.def.notes ?? "").length > 110 ? "…" : ""}`);
     for (const c of p.changes ?? []) console.log(`         · ${c}`);
   }
 
@@ -106,10 +129,20 @@ async function main() {
   };
   console.log(`\n新建 ${counts.create} · 更新 ${counts.update} · 不变 ${counts.unchanged}`);
 
+  const tally = (key: (d: SourceDef) => string) => {
+    const m = new Map<string, number>();
+    for (const d of defs) m.set(key(d), (m.get(key(d)) ?? 0) + 1);
+    return [...m].sort().map(([k, v]) => `${k}=${v}`).join(" · ");
+  };
+  console.log(`tier:    ${tally((d) => d.source_tier)}`);
+  console.log(`adapter: ${tally((d) => d.adapter_type)}`);
+  console.log(`发布者:  ${tally((d) => d.publisher)}`);
+  console.log(`校验:    external_key 无重复 ✅ · feed_url 无重复 ✅ · publisher/notes 均非空 ✅ · 全程未发网络请求 ✅`);
+
   // 文件里没有但库里有的源：只提示，不删不改
-  const known = new Set(defs.filter((d) => d.feedUrl).map((d) => d.feedUrl!));
+  const known = defs.map((d) => d.external_key);
   const orphans = await prisma.contentSource.findMany({
-    where: { kind: "rss", NOT: { feed_url: { in: [...known] } } },
+    where: { NOT: { external_key: { in: known } } },
     select: { id: true, name: true, feed_url: true, enabled: true },
   });
   if (orphans.length) {
@@ -126,14 +159,18 @@ async function main() {
   let updated = 0;
   for (const p of plan) {
     const data = {
+      external_key: p.def.external_key,
       name: p.def.name,
-      kind: p.def.kind,
-      feed_url: p.def.feedUrl ?? null,
+      // RSS 与 ATOM 都走订阅抓取；kind 区分的是「订阅」还是「人工提交」
+      kind: "rss" as const,
+      declared_format: p.def.adapter_type,
+      source_tier: p.def.source_tier,
+      feed_url: p.def.feed_url ?? null,
       homepage: p.def.homepage ?? null,
       publisher: p.def.publisher,
-      lang: p.def.lang ?? "en",
+      lang: p.def.language ?? "en",
       enabled: p.def.enabled ?? true,
-      fetch_interval_minutes: p.def.fetchIntervalMinutes ?? 60,
+      fetch_interval_minutes: p.def.fetch_interval_minutes ?? 60,
       notes: p.def.notes ?? null,
     };
     if (p.action === "create") {

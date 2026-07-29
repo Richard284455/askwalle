@@ -535,6 +535,14 @@ enum ContentSourceKind {
   manual // 编辑人工提交的单条 URL
 }
 
+/// 来源分级：决定这个源能支撑什么强度的事实主张，以及未来的正文抓取策略
+enum ContentSourceTier {
+  OFFICIAL_PRIMARY // 第一方官方口径
+  STRUCTURED_TECHNICAL // 结构化技术信号（changelog / release / 混合作者博客）
+  AUTHORITATIVE_MEDIA // 权威媒体
+  COMMUNITY_SIGNAL // 社区信号
+}
+
 enum SourceItemStatus {
   fetched // 已抓取，正文快照已落库
   link_only // 只拿到订阅里的元数据，正文抓取失败/未做
@@ -544,8 +552,13 @@ enum SourceItemStatus {
 
 model ContentSource {
   id        Int               @id @default(autoincrement())
+  /// 稳定身份键：feed_url 可能迁移，配置文件与库之间靠这个对齐
+  external_key String?        @unique
   name      String // 展示名，如 "OpenAI Blog"
   kind      ContentSourceKind
+  /// 定义文件声明的格式（RSS / ATOM）。解析器会自行探测，两者不符值得报警
+  declared_format String?
+  source_tier ContentSourceTier?
   /// RSS 源的订阅地址；manual 源为空
   feed_url  String?
   homepage  String?

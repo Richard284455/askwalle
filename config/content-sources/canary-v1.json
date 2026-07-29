@@ -1,0 +1,68 @@
+[
+  {
+    "external_key": "openai-news",
+    "name": "OpenAI News",
+    "publisher": "OpenAI",
+    "source_tier": "OFFICIAL_PRIMARY",
+    "adapter_type": "RSS",
+    "feed_url": "https://openai.com/news/rss.xml",
+    "language": "en",
+    "fetch_interval_minutes": 60,
+    "notes": "Official OpenAI newsroom feed. May support claims about OpenAI products, models, research, safety, policy and company announcements. Vendor performance claims remain vendor claims and are not independent validation. Feed-only; do not fetch article pages."
+  },
+  {
+    "external_key": "google-deepmind-news",
+    "name": "Google DeepMind News",
+    "publisher": "Google DeepMind",
+    "source_tier": "OFFICIAL_PRIMARY",
+    "adapter_type": "RSS",
+    "feed_url": "https://deepmind.google/blog/rss.xml",
+    "language": "en",
+    "fetch_interval_minutes": 60,
+    "notes": "Official Google DeepMind news feed. May support claims about DeepMind models, research, safety and company announcements. Benchmark and performance claims remain vendor claims. Feed-only; do not fetch article pages."
+  },
+  {
+    "external_key": "aws-machine-learning-blog",
+    "name": "AWS Machine Learning Blog",
+    "publisher": "Amazon Web Services",
+    "source_tier": "OFFICIAL_PRIMARY",
+    "adapter_type": "RSS",
+    "feed_url": "https://aws.amazon.com/blogs/machine-learning/feed/",
+    "language": "en",
+    "fetch_interval_minutes": 120,
+    "notes": "Official AWS AI and machine-learning blog. Contains product announcements, tutorials, customer stories and partner content. It is primary only for AWS announcements; customer outcomes and comparative claims require separate verification. Feed-only."
+  },
+  {
+    "external_key": "github-changelog",
+    "name": "GitHub Changelog",
+    "publisher": "GitHub",
+    "source_tier": "STRUCTURED_TECHNICAL",
+    "adapter_type": "RSS",
+    "feed_url": "https://github.blog/changelog/feed/",
+    "language": "en",
+    "fetch_interval_minutes": 60,
+    "notes": "Official GitHub product changelog. Suitable for release, improvement and retirement dates. Contains substantial non-AI content, so no SourceItem may be promoted to editorial use until a later relevance filter is implemented. Feed-only."
+  },
+  {
+    "external_key": "hugging-face-blog",
+    "name": "Hugging Face Blog",
+    "publisher": "Hugging Face",
+    "source_tier": "STRUCTURED_TECHNICAL",
+    "adapter_type": "RSS",
+    "feed_url": "https://huggingface.co/blog/feed.xml",
+    "language": "en",
+    "fetch_interval_minutes": 120,
+    "notes": "Mixed official and community-authored feed. Do not treat all entries as Hugging Face corporate claims. Until item-level publisher classification exists, entries are technical signals requiring author and organization verification. Feed-only."
+  },
+  {
+    "external_key": "openai-python-releases",
+    "name": "OpenAI Python SDK Releases",
+    "publisher": "OpenAI",
+    "source_tier": "STRUCTURED_TECHNICAL",
+    "adapter_type": "ATOM",
+    "feed_url": "https://github.com/openai/openai-python/releases.atom",
+    "language": "en",
+    "fetch_interval_minutes": 60,
+    "notes": "Release feed for the official openai/openai-python repository. Suitable for SDK version, release date and release-note evidence only. An SDK release must not be interpreted as an OpenAI model or product launch. Feed-only."
+  }
+]
