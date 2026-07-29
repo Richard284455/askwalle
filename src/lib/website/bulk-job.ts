@@ -283,6 +283,71 @@ export async function createHealthCheckJob(
 }
 
 // ---------------------------------------------------------------------------
+// 任务终态收口
+// ---------------------------------------------------------------------------
+
+/**
+ * 把任务转入终态，并终结它剩下的 queued 条目。
+ *
+ * 不这么做的后果实测过：C3 Canary 取消任务 #176 时留下了 item#2925 —— 归属任务
+ * 已终态、worker 永远不会驱动它，但「卡住 item」这个监控指标会一直显示 1，
+ * 把真正的卡死淹掉。
+ *
+ * running 条目**不粗暴覆盖**：那是别人正在跑的活，交给 worker 安全收尾或
+ * 僵死回收，这里只管 queued。历史记录一条都不删。
+ */
+export async function terminalizeJob(
+  jobId: number,
+  status: "canceled" | "failed",
+  reason = "parent_job_cancelled"
+): Promise<{ jobStatus: string; itemsTerminalized: number }> {
+  const [, terminalized] = await prisma.$transaction([
+    prisma.bulkJob.update({
+      where: { id: jobId },
+      data: { status, finished_at: new Date(), locked_by: null, locked_until: null },
+    }),
+    prisma.bulkJobItem.updateMany({
+      where: { job_id: jobId, status: "queued" },
+      data: { status: "skipped", error: reason },
+    }),
+  ]);
+  return { jobStatus: status, itemsTerminalized: terminalized.count };
+}
+
+/**
+ * 真正卡住的条目：只算归属任务仍可驱动的。
+ * 终态任务下的 queued 条目是历史残留，不是待办。
+ */
+export async function countActionableStuckItems(olderThanMs = 30 * 60_000): Promise<number> {
+  return prisma.bulkJobItem.count({
+    where: {
+      status: { in: ["queued", "running"] },
+      job: { status: { in: DRIVABLE_JOB_STATUSES } },
+      updated_at: { lt: new Date(Date.now() - olderThanMs) },
+    },
+  });
+}
+
+/**
+ * 修复历史遗留：终态任务下仍是 queued 的条目。
+ * 只改状态并写明原因，**不删除**任何记录。
+ */
+export async function repairTerminalJobItems(
+  reason = "parent_job_cancelled"
+): Promise<{ repaired: number; jobs: number[] }> {
+  const orphans = await prisma.bulkJobItem.findMany({
+    where: { status: "queued", job: { status: { in: TERMINAL_JOB_STATUSES } } },
+    select: { id: true, job_id: true },
+  });
+  if (!orphans.length) return { repaired: 0, jobs: [] };
+  await prisma.bulkJobItem.updateMany({
+    where: { id: { in: orphans.map((o) => o.id) } },
+    data: { status: "skipped", error: reason },
+  });
+  return { repaired: orphans.length, jobs: [...new Set(orphans.map((o) => o.job_id))] };
+}
+
+// ---------------------------------------------------------------------------
 // 内容采集任务：创建
 // ---------------------------------------------------------------------------
 
@@ -745,16 +810,35 @@ async function runChunkLocked(
           itemStatus = "failed";
           itemError = "缺少 source_id";
         } else {
-          const ingest = await ingestSource(item.source_id);
-          itemStatus = ingest.ok ? "success" : "skipped";
-          itemError = ingest.ok ? null : `${ingest.status}: ${ingest.error ?? ""}`.slice(0, 300);
+          const ingest = await ingestSource(item.source_id, {
+            jobId,
+            jobItemId: item.id,
+          });
+          // item 状态按**归因**分：源侧问题记 skipped（源坏了不是任务坏了），
+          // 基础设施问题记 failed（那是我们这边的故障，运维需要看见）。
+          itemStatus = ingest.ok
+            ? "success"
+            : ingest.sourceAtFault
+              ? "skipped"
+              : "failed";
+          itemError = ingest.ok
+            ? null
+            : `${ingest.runOutcome}/${ingest.errorDomain}: ${ingest.error ?? ""}`.slice(0, 300);
           itemResult = {
             sourceId: ingest.sourceId,
+            runId: ingest.runId,
+            outcome: ingest.runOutcome,
+            errorDomain: ingest.errorDomain,
+            sourceAtFault: ingest.sourceAtFault,
             status: ingest.status,
+            feedFormat: ingest.feedFormat,
             itemsSeen: ingest.itemsSeen,
             itemsCreated: ingest.itemsCreated,
             itemsDuplicate: ingest.itemsDuplicate,
+            itemsTitleChanged: ingest.itemsTitleChanged,
             itemsSkipped: ingest.itemsSkipped,
+            itemsErrored: ingest.itemsErrored,
+            truncated: ingest.truncated,
           } as Prisma.InputJsonValue;
         }
       } else if (!item.website_id) {

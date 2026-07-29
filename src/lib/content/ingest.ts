@@ -1,4 +1,10 @@
-import { Prisma, ContentSourceKind, SourceItemStatus } from "@prisma/client";
+import {
+  Prisma,
+  ContentSourceKind,
+  SourceItemStatus,
+  SourceRunOutcome,
+  SourceRunErrorDomain,
+} from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 import { safeFetch, Transport } from "@/lib/website/probe/http-client";
@@ -50,6 +56,64 @@ export const ARTICLE_MAX_BYTES = 524_288;
 export const RAW_CONTENT_MAX_CHARS = 60_000;
 export const EXCERPT_MAX_CHARS = 2_000;
 
+/**
+ * 把取回/解析的失败翻译成「归谁的错」。
+ *
+ * 这套分类的全部意义是区分**源坏了**和**我们这边坏了**。
+ * C3 Canary 首轮 AWS 那次「失败」其实是 Supabase 中断 —— 源根本没被请求，
+ * 却被记成来源失败并触发退避。源被冤枉了，而且退避会让它更久抓不到。
+ */
+export const SOURCE_SIDE_DOMAINS: SourceRunErrorDomain[] = [
+  SourceRunErrorDomain.DNS,
+  SourceRunErrorDomain.NETWORK,
+  SourceRunErrorDomain.TLS,
+  SourceRunErrorDomain.HTTP,
+  SourceRunErrorDomain.ROBOTS,
+  SourceRunErrorDomain.PARSE,
+];
+
+/** 基础设施故障重试得快，且不动来源健康度 */
+export const INFRA_RETRY_MINUTES = 10;
+
+/** status 字符串 → 错误域 */
+export function errorDomainOf(status: string): SourceRunErrorDomain {
+  switch (status) {
+    case "dns": return SourceRunErrorDomain.DNS;
+    case "timeout":
+    case "connection":
+    case "redirect_loop": return SourceRunErrorDomain.NETWORK;
+    case "tls": return SourceRunErrorDomain.TLS;
+    case "http_error": return SourceRunErrorDomain.HTTP;
+    case "robots_disallow": return SourceRunErrorDomain.ROBOTS;
+    case "parse_error":
+    case "undecodable": return SourceRunErrorDomain.PARSE;
+    case "feed_too_large":
+    case "feed_truncated": return SourceRunErrorDomain.TRUNCATED;
+    case "unsafe_target":
+    case "internal": return SourceRunErrorDomain.INTERNAL;
+    default: return SourceRunErrorDomain.NONE;
+  }
+}
+
+/**
+ * 判断一个异常是不是基础设施故障（数据库不可达、连接池耗尽、租约丢失）。
+ * 这类绝不能算在源头上。
+ */
+export function infraDomainOf(error: unknown): SourceRunErrorDomain | null {
+  const msg = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  if (
+    /Can't reach database server/i.test(msg) ||
+    /connection pool/i.test(msg) ||
+    /PrismaClientInitializationError/i.test(msg) ||
+    /PrismaClientRustPanicError/i.test(msg) ||
+    /ECONNREFUSED.*5432/i.test(msg)
+  ) {
+    return SourceRunErrorDomain.DATABASE;
+  }
+  if (/lease_lost|lease_renew_failed/i.test(msg)) return SourceRunErrorDomain.LEASE;
+  return null;
+}
+
 /** 失败退避：连续失败越多，下次越晚，上限 24 小时 */
 export function backoffMinutes(baseMinutes: number, consecutiveFailures: number): number {
   if (consecutiveFailures <= 0) return baseMinutes;
@@ -66,6 +130,9 @@ export type IngestOptions = {
   /** 是否抓取每条条目的正文（第一阶段默认只用订阅自带内容） */
   fetchArticles?: boolean;
   now?: Date;
+  /** 归属任务；ContentSourceRun 以 (job_id, source_id) 做幂等 */
+  jobId?: number | null;
+  jobItemId?: number | null;
 };
 
 export type IngestResult = {
@@ -89,6 +156,25 @@ export type IngestResult = {
   /** 跟随重定向后的实际订阅地址，与配置不同即为源迁移 */
   resolvedFeedUrl: string | null;
   feedMoved: boolean;
+  /** 本次尝试的归因结果 */
+  /** 解析器实测的格式（rss / atom），与定义声明比对可发现 mismatch */
+  feedFormat: string | null;
+  /** 本轮落库的条目里带 source_updated_at 的数量 */
+  sourceUpdatedAtCount: number;
+  runOutcome: SourceRunOutcome;
+  errorDomain: SourceRunErrorDomain;
+  /** 是否算在来源头上（决定要不要递增 failure_count 并退避） */
+  sourceAtFault: boolean;
+  runId: number | null;
+};
+
+/** 一次 run 的上下文：谁在跑、什么时候开始、送出了什么条件请求头 */
+type RunContext = {
+  jobId?: number | null;
+  jobItemId?: number | null;
+  startedAt: Date;
+  etagSent: string | null;
+  lastModifiedSent: string | null;
 };
 
 type FetchEvidence = {
@@ -96,6 +182,10 @@ type FetchEvidence = {
   finalUrl: string | null;
   evidence: Prisma.InputJsonValue | null;
   body: string | null;
+  bytesRead: number | null;
+  latencyMs: number | null;
+  pinnedIp: string | null;
+  redirectCount: number | null;
   /** 响应头里的验证器，下次带上做条件请求 */
   etag: string | null;
   lastModified: string | null;
@@ -108,6 +198,7 @@ type FetchEvidence = {
 const EMPTY_FETCH = {
   httpStatus: null, finalUrl: null, body: null,
   etag: null, lastModified: null, truncated: false,
+  bytesRead: null, latencyMs: null, pinnedIp: null, redirectCount: null,
 } as const;
 
 /** 统一的安全取回：把 safeFetch 的四种结果翻译成采集层的证据结构 */
@@ -169,6 +260,10 @@ async function fetchSafely(
   const common = {
     httpStatus: res.status, finalUrl: res.finalUrl, evidence,
     etag, lastModified, truncated: res.truncated,
+    bytesRead: res.bytesRead,
+    latencyMs: res.latencyMs,
+    pinnedIp: res.pinnedIp,
+    redirectCount: res.redirectChain.length,
   };
 
   // 304：源没更新，这是成功而不是失败 —— 条件请求生效的正常结果
@@ -195,7 +290,26 @@ export async function ingestSource(
   options: IngestOptions = {}
 ): Promise<IngestResult> {
   const now = options.now ?? new Date();
-  const source = await prisma.contentSource.findUniqueOrThrow({ where: { id: sourceId } });
+
+  // 读取源本身就可能因数据库中断失败 —— 那是基础设施问题，绝不能记成来源失败。
+  // C3 Canary 首轮 AWS 就死在这一步，源根本没被请求过。
+  let source: Awaited<ReturnType<typeof prisma.contentSource.findUniqueOrThrow>>;
+  try {
+    source = await prisma.contentSource.findUniqueOrThrow({ where: { id: sourceId } });
+  } catch (e) {
+    const domain = infraDomainOf(e) ?? SourceRunErrorDomain.DATABASE;
+    return {
+      sourceId, ok: false, status: "infra_error",
+      error: e instanceof Error ? e.message.split("\n")[0].slice(0, 300) : String(e),
+      itemsSeen: 0, itemsCreated: 0, itemsDuplicate: 0, itemsSkipped: 0,
+      itemsErrored: 0, itemsTitleChanged: 0,
+      httpStatus: null, finalUrl: null,
+      truncated: false, resolvedFeedUrl: null, feedMoved: false,
+      feedFormat: null, sourceUpdatedAtCount: 0,
+      runOutcome: SourceRunOutcome.INFRA_ERROR, errorDomain: domain,
+      sourceAtFault: false, runId: null,
+    };
+  }
 
   const base: IngestResult = {
     sourceId, ok: false, status: "ok", error: null,
@@ -203,12 +317,26 @@ export async function ingestSource(
     itemsErrored: 0, itemsTitleChanged: 0,
     httpStatus: null, finalUrl: null,
     truncated: false, resolvedFeedUrl: null, feedMoved: false,
+    feedFormat: null, sourceUpdatedAtCount: 0,
+    runOutcome: SourceRunOutcome.OK, errorDomain: SourceRunErrorDomain.NONE,
+    sourceAtFault: false, runId: null,
   };
 
   if (source.kind !== ContentSourceKind.rss || !source.feed_url) {
     // manual 源没有订阅地址，条目由编辑单条提交，不在这里抓
-    return finish({ ...base, ok: true, status: "not_a_feed" }, source, now);
+    return finish({ ...base, ok: true, status: "not_a_feed" }, source, now, undefined, {
+      jobId: options.jobId ?? null, jobItemId: options.jobItemId ?? null,
+      startedAt: now, etagSent: null, lastModifiedSent: null,
+    });
   }
+
+  const ctx: RunContext = {
+    jobId: options.jobId ?? null,
+    jobItemId: options.jobItemId ?? null,
+    startedAt: now,
+    etagSent: source.etag,
+    lastModifiedSent: source.last_modified,
+  };
 
   const fetched = await fetchSafely(source.feed_url, FEED_MAX_BYTES, options, {
     etag: source.etag,
@@ -223,17 +351,19 @@ export async function ingestSource(
 
   // 304：源没更新，本轮无事可做，是成功
   if (fetched.failure?.status === "not_modified") {
-    return finish({ ...base, ok: true, status: "not_modified" }, source, now, fetched);
+    return finish({ ...base, ok: true, status: "not_modified" }, source, now, fetched, ctx);
   }
   if (fetched.failure) {
     return finish(
       { ...base, ok: false, status: fetched.failure.status, error: fetched.failure.message },
-      source, now, fetched);
+      source, now, fetched, ctx);
   }
 
   let items: FeedItem[];
   try {
-    items = parseFeed(fetched.body!).items;
+    const parsed = parseFeed(fetched.body!);
+    base.feedFormat = parsed.kind;
+    items = parsed.items;
   } catch (e) {
     // 截断导致的解析失败要能一眼看出是体积问题，而不是笼统的格式错误
     const status = fetched.truncated ? "feed_too_large" : "parse_error";
@@ -242,7 +372,7 @@ export async function ingestSource(
       : e instanceof FeedParseError
         ? e.message
         : `解析失败: ${String(e).slice(0, 200)}`;
-    return finish({ ...base, ok: false, status, error: detail }, source, now, fetched);
+    return finish({ ...base, ok: false, status, error: detail }, source, now, fetched, ctx);
   }
 
   // 解析器只认完整的 <item>…</item>，截断的尾部会被静默忽略 —— 于是「只抓到一部分」
@@ -260,7 +390,7 @@ export async function ingestSource(
         status: fetched.truncated ? "feed_too_large" : "empty_feed",
         error: truncatedNote,
       },
-      source, now, fetched);
+      source, now, fetched, ctx);
   }
 
   // 相对地址以**跟随重定向后的实际订阅地址**为 base：源迁移后用旧地址解会解错
@@ -271,8 +401,10 @@ export async function ingestSource(
     // ★ 单条出错绝不能拖垮整个源：一条畸形条目不该让其余几十条一起丢掉
     try {
       const outcome = await persistItem(source.id, linkBase, source.lang, item, options);
-      if (outcome === "created") base.itemsCreated++;
-      else if (outcome === "duplicate") base.itemsDuplicate++;
+      if (outcome === "created") {
+        base.itemsCreated++;
+        if (item.updatedAt) base.sourceUpdatedAtCount++;
+      } else if (outcome === "duplicate") base.itemsDuplicate++;
       else if (outcome === "title_changed") {
         base.itemsDuplicate++;
         base.itemsTitleChanged++;
@@ -293,7 +425,7 @@ export async function ingestSource(
       status: truncatedNote ? "feed_truncated" : "ok",
       error: truncatedNote,
     },
-    source, now, fetched);
+    source, now, fetched, ctx);
 }
 
 /**
@@ -379,32 +511,124 @@ async function persistItem(
 }
 
 /** 写回源的抓取状态与下次排期 */
+/**
+ * 收尾：定归因 → 写 run → 更新源汇总。
+ *
+ * 核心纪律：**只有源侧错误才动来源健康度**。
+ * 基础设施故障（DATABASE / LEASE / INTERNAL）不递增 failure_count、
+ * 不覆盖 last_status、不走指数退避 —— 只排一次短重试，把证据留给运维。
+ */
 async function finish(
   result: IngestResult,
-  source: { id: number; fetch_interval_minutes: number; consecutive_failures: number; item_count: number },
+  source: {
+    id: number; feed_url: string | null; fetch_interval_minutes: number;
+    consecutive_failures: number; item_count: number;
+  },
   now: Date,
-  fetched?: Pick<FetchEvidence, "etag" | "lastModified" | "finalUrl">
+  fetched?: FetchEvidence,
+  ctx?: RunContext
 ): Promise<IngestResult> {
-  const failures = result.ok ? 0 : source.consecutive_failures + 1;
-  const delayMin = backoffMinutes(source.fetch_interval_minutes, failures);
+  const domain = result.ok
+    ? result.status === "feed_truncated" || result.status === "feed_too_large"
+      ? SourceRunErrorDomain.TRUNCATED
+      : SourceRunErrorDomain.NONE
+    : errorDomainOf(result.status);
 
-  await prisma.contentSource.update({
-    where: { id: source.id },
-    data: {
-      last_fetched_at: now,
-      next_fetch_at: new Date(now.getTime() + delayMin * 60_000),
-      last_status: result.status,
-      last_error: result.error,
-      consecutive_failures: failures,
-      item_count: source.item_count + result.itemsCreated,
-      // 验证器只在成功拿到响应时更新；失败轮不能把旧值冲掉
-      ...(fetched?.etag !== undefined && fetched.etag !== null ? { etag: fetched.etag } : {}),
-      ...(fetched?.lastModified !== undefined && fetched.lastModified !== null
-        ? { last_modified: fetched.lastModified }
-        : {}),
-      ...(fetched?.finalUrl ? { resolved_feed_url: fetched.finalUrl } : {}),
-    },
-  });
+  const outcome: SourceRunOutcome = !result.ok
+    ? SOURCE_SIDE_DOMAINS.includes(domain)
+      ? SourceRunOutcome.SOURCE_ERROR
+      : SourceRunOutcome.INFRA_ERROR
+    : result.status === "not_modified"
+      ? SourceRunOutcome.NOT_MODIFIED
+      : domain === SourceRunErrorDomain.TRUNCATED
+        ? SourceRunOutcome.PARTIAL_SUCCESS
+        : SourceRunOutcome.OK;
+
+  const sourceAtFault = outcome === SourceRunOutcome.SOURCE_ERROR;
+  const isSuccess = outcome === SourceRunOutcome.OK || outcome === SourceRunOutcome.NOT_MODIFIED;
+  const isInfra = outcome === SourceRunOutcome.INFRA_ERROR;
+
+  result.runOutcome = outcome;
+  result.errorDomain = domain;
+  result.sourceAtFault = sourceAtFault;
+
+  // 排期：源侧失败走指数退避；基础设施故障只排短重试；其余按正常间隔
+  const failures = sourceAtFault ? source.consecutive_failures + 1 : isSuccess ? 0 : source.consecutive_failures;
+  const delayMin = isInfra
+    ? INFRA_RETRY_MINUTES
+    : backoffMinutes(source.fetch_interval_minutes, failures);
+
+  const runData = {
+    source_id: source.id,
+    job_id: ctx?.jobId ?? null,
+    job_item_id: ctx?.jobItemId ?? null,
+    started_at: ctx?.startedAt ?? now,
+    finished_at: new Date(),
+    outcome,
+    error_domain: domain,
+    requested_feed_url: source.feed_url ?? "",
+    resolved_feed_url: fetched?.finalUrl ?? null,
+    http_status: result.httpStatus,
+    bytes_read: fetched?.bytesRead ?? null,
+    truncated: result.truncated,
+    latency_fetch_ms: fetched?.latencyMs ?? null,
+    latency_total_ms: Date.now() - (ctx?.startedAt ?? now).getTime(),
+    pinned_ip: fetched?.pinnedIp ?? null,
+    redirect_count: fetched?.redirectCount ?? null,
+    etag_sent: ctx?.etagSent ?? null,
+    etag_received: fetched?.etag ?? null,
+    last_modified_sent: ctx?.lastModifiedSent ?? null,
+    last_modified_received: fetched?.lastModified ?? null,
+    feed_format: result.feedFormat ?? null,
+    items_parsed: result.itemsSeen,
+    items_inserted: result.itemsCreated,
+    items_duplicate: result.itemsDuplicate,
+    items_title_changed: result.itemsTitleChanged,
+    items_errored: result.itemsErrored,
+    source_updated_at_count: result.sourceUpdatedAtCount,
+    error_code: result.ok ? null : result.status,
+    error_message: result.error?.slice(0, 500) ?? null,
+    // 只放跳转/SSRF/响应/解析元数据，绝不放 Cookie、认证头或第三方正文
+    evidence_json: (fetched?.evidence ?? Prisma.DbNull) as Prisma.InputJsonValue,
+  };
+
+  // run 与源汇总放同一事务：要么都落，要么都不落，避免 run 说成功而源说失败
+  try {
+    const [run] = await prisma.$transaction([
+      prisma.contentSourceRun.upsert({
+        // job_id+source_id 幂等：worker 回收重跑不会写第二条有效 run
+        where: ctx?.jobId
+          ? { job_id_source_id: { job_id: ctx.jobId, source_id: source.id } }
+          : { id: -1 },
+        create: runData,
+        update: runData,
+        select: { id: true },
+      }),
+      prisma.contentSource.update({
+        where: { id: source.id },
+        data: {
+          last_fetched_at: now,
+          next_fetch_at: new Date(now.getTime() + delayMin * 60_000),
+          // 基础设施故障不得覆盖源站最后一次健康状态
+          ...(isInfra ? {} : { last_status: result.status, last_error: result.error }),
+          consecutive_failures: failures,
+          item_count: source.item_count + result.itemsCreated,
+          ...(isSuccess ? { last_success_at: now } : {}),
+          // 验证器只在成功拿到响应时更新；失败轮不能把旧值冲掉
+          ...(fetched?.etag ? { etag: fetched.etag } : {}),
+          ...(fetched?.lastModified ? { last_modified: fetched.lastModified } : {}),
+          ...(fetched?.finalUrl ? { resolved_feed_url: fetched.finalUrl } : {}),
+        },
+      }),
+    ]);
+    result.runId = run.id;
+  } catch (e) {
+    // 写 run 本身失败也只是基础设施问题，不该把已抓到的结果丢掉
+    console.error(
+      `[content-ingest] 源 #${source.id} 写 run 失败:`,
+      e instanceof Error ? e.message.split("\n")[0] : String(e)
+    );
+  }
   return result;
 }
 

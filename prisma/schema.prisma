@@ -70,68 +70,68 @@ model Setting {
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
-  @@map("settings")
   @@index([key])
+  @@map("settings")
 }
 
 model Website {
-  id          Int      @id @default(autoincrement())
-  title       String
-  url         String
-  description String
-  slug        String?  @unique
-  category    Category @relation(fields: [category_id], references: [id])
-  category_id Int
-  import_batch_id Int?
-  thumbnail   String?
+  id               Int                 @id @default(autoincrement())
+  title            String
+  url              String
+  description      String
+  slug             String?             @unique
+  category         Category            @relation(fields: [category_id], references: [id])
+  category_id      Int
+  import_batch_id  Int?
+  thumbnail        String?
   thumbnail_base64 String?
-  status      String   @default("pending")
-  visits      Int      @default(0)
-  likes       Int      @default(0)
-  active      Int      @default(1)
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
-  toolDetail  ToolDetail?
-  toolTags    WebsiteToolTag[]
-  toolLinks   ToolLink[]
-  toolMedia   ToolMedia[]
-  toolFaqs    ToolFAQ[]
-  rewriteItems ToolRewriteItem[]
-  lifecycleState ToolLifecycleState?
-  healthEvents   ToolHealthEvent[]
+  status           String              @default("pending")
+  visits           Int                 @default(0)
+  likes            Int                 @default(0)
+  active           Int                 @default(1)
+  created_at       DateTime            @default(now())
+  updated_at       DateTime            @updatedAt
+  toolDetail       ToolDetail?
+  toolTags         WebsiteToolTag[]
+  toolLinks        ToolLink[]
+  toolMedia        ToolMedia[]
+  toolFaqs         ToolFAQ[]
+  rewriteItems     ToolRewriteItem[]
+  lifecycleState   ToolLifecycleState?
+  healthEvents     ToolHealthEvent[]
 
-  @@map("websites")
   @@index([category_id])
   @@index([status])
   @@index([import_batch_id])
+  @@map("websites")
 }
 
 model Category {
-  id         Int       @id @default(autoincrement())
+  id         Int        @id @default(autoincrement())
   name       String
-  slug       String    @unique
+  slug       String     @unique
   parent_id  Int?
   parent     Category?  @relation("CategoryHierarchy", fields: [parent_id], references: [id])
   children   Category[] @relation("CategoryHierarchy")
-  created_at DateTime  @default(now())
-  updated_at DateTime  @updatedAt
+  created_at DateTime   @default(now())
+  updated_at DateTime   @updatedAt
   websites   Website[]
 
-  @@map("categories")
   @@index([slug])
   @@index([parent_id])
+  @@map("categories")
 }
 
 model FooterLink {
   id         Int      @id @default(autoincrement())
-  title      String   // 链接标题
+  title      String // 链接标题
   url        String   @unique // 链接地址
   isExternal Boolean  @default(true) // 是否为外部链接
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
-  @@map("footer_links")
   @@index([url])
+  @@map("footer_links")
 }
 
 model ResourceContent {
@@ -151,35 +151,35 @@ model ResourceContent {
   seoTitle       String?
   seoDescription String?
 
-  @@map("resource_contents")
   @@unique([type, slug])
   @@index([type, status, publishedAt])
   @@index([category])
+  @@map("resource_contents")
 }
 
 model ToolDetail {
-  id               Int       @id @default(autoincrement())
-  website_id       Int       @unique
-  website          Website   @relation(fields: [website_id], references: [id])
-  what             String?
-  how              String?
-  features_text    String?
-  features         Json?
-  use_cases        Json?
-  rating           Float?
-  review_count     Int       @default(0)
-  saved_count      Int       @default(0)
-  monthly_visitors Int?
-  listed_at        DateTime?
-  source           String?
-  external_raw     String?
-  raw_imported_content Json?          // 原始导入底稿快照（仅内部）
-  ai_rewrite_draft     Json?          // AI 改写草稿（仅内部，人工审核前不公开）
+  id                   Int            @id @default(autoincrement())
+  website_id           Int            @unique
+  website              Website        @relation(fields: [website_id], references: [id])
+  what                 String?
+  how                  String?
+  features_text        String?
+  features             Json?
+  use_cases            Json?
+  rating               Float?
+  review_count         Int            @default(0)
+  saved_count          Int            @default(0)
+  monthly_visitors     Int?
+  listed_at            DateTime?
+  source               String?
+  external_raw         String?
+  raw_imported_content Json? // 原始导入底稿快照（仅内部）
+  ai_rewrite_draft     Json? // AI 改写草稿（仅内部，人工审核前不公开）
   rewrite_status       RewriteStatus? // raw_imported / draft_generated / human_reviewed
   reviewed_at          DateTime?
   review_notes         String?
-  created_at       DateTime  @default(now())
-  updated_at       DateTime  @updatedAt
+  created_at           DateTime       @default(now())
+  updated_at           DateTime       @updatedAt
 
   @@map("tool_details")
 }
@@ -191,8 +191,8 @@ model ToolTag {
   kind     ToolTagKind
   websites WebsiteToolTag[]
 
-  @@map("tool_tags")
   @@unique([kind, name])
+  @@map("tool_tags")
 }
 
 model WebsiteToolTag {
@@ -201,9 +201,9 @@ model WebsiteToolTag {
   website    Website @relation(fields: [website_id], references: [id])
   tag        ToolTag @relation(fields: [tag_id], references: [id])
 
-  @@map("website_tool_tags")
   @@id([website_id, tag_id])
   @@index([tag_id])
+  @@map("website_tool_tags")
 }
 
 model ToolLink {
@@ -215,9 +215,9 @@ model ToolLink {
   label      String?
   created_at DateTime     @default(now())
 
-  @@map("tool_links")
   @@unique([website_id, kind, url])
   @@index([website_id])
+  @@map("tool_links")
 }
 
 model ToolMedia {
@@ -238,8 +238,8 @@ model ToolMedia {
   cache_error  String?
   cached_at    DateTime?
 
-  @@map("tool_media")
   @@index([website_id])
+  @@map("tool_media")
 }
 
 model ToolImportBatch {
@@ -273,8 +273,8 @@ model ToolImportFile {
   level2_category String?
   created_at      DateTime        @default(now())
 
-  @@map("tool_import_files")
   @@index([batch_id])
+  @@map("tool_import_files")
 }
 
 model AIProviderConfig {
@@ -283,11 +283,11 @@ model AIProviderConfig {
   display_name         String?
   enabled              Boolean   @default(true)
   base_url             String?
-  encrypted_api_key    String?   // AES-256-GCM 密文，绝不明文
+  encrypted_api_key    String? // AES-256-GCM 密文，绝不明文
   api_key_last4        String?
-  api_key_source       String?   // env / db / missing（保存时记录，展示以运行时解析为准）
+  api_key_source       String? // env / db / missing（保存时记录，展示以运行时解析为准）
   default_model        String?
-  model_presets        Json?     // string[] 模型 ID 列表
+  model_presets        Json? // string[] 模型 ID 列表
   supports_batch       Boolean   @default(false)
   supports_direct      Boolean   @default(true)
   supports_json_schema Boolean   @default(false)
@@ -345,9 +345,9 @@ model ToolRewriteItem {
   created_at    DateTime         @default(now())
   updated_at    DateTime         @updatedAt
 
-  @@map("tool_rewrite_items")
   @@index([batch_id])
   @@index([website_id])
+  @@map("tool_rewrite_items")
 }
 
 model ToolFAQ {
@@ -358,58 +358,58 @@ model ToolFAQ {
   answer     String?
   position   Int     @default(0)
 
-  @@map("tool_faqs")
   @@index([website_id])
+  @@map("tool_faqs")
 }
 
 // 通用后台批量任务（异步化长操作：apply&review / publish 等；分块执行 + 进度）
 model BulkJob {
-  id                      Int           @id @default(autoincrement())
-  type                    String // import_excel / rewrite_direct / apply_drafts / apply_and_review / mark_reviewed / publish / media_cache
-  status                  String        @default("queued") // queued / running / completed / completed_with_errors / failed / canceled
-  total_count             Int           @default(0)
-  processed_count         Int           @default(0)
-  success_count           Int           @default(0)
-  skipped_count           Int           @default(0)
-  failed_count            Int           @default(0)
+  id                       Int           @id @default(autoincrement())
+  type                     String // import_excel / rewrite_direct / apply_drafts / apply_and_review / mark_reviewed / publish / media_cache
+  status                   String        @default("queued") // queued / running / completed / completed_with_errors / failed / canceled
+  total_count              Int           @default(0)
+  processed_count          Int           @default(0)
+  success_count            Int           @default(0)
+  skipped_count            Int           @default(0)
+  failed_count             Int           @default(0)
   // QC 未通过（模型答了但内容不合格）与 failed（请求本身失败）分开记账
-  qc_failed_count         Int           @default(0)
-  params                  Json?
-  result                  Json?
-  error                   Json?
+  qc_failed_count          Int           @default(0)
+  params                   Json?
+  result                   Json?
+  error                    Json?
   related_import_batch_id  Int?
   related_rewrite_batch_id Int?
   // 任务级租约：同一时刻只让一个 worker 推进该任务（多实例部署时收敛 provider 并发）
-  locked_by               String?
-  locked_until            DateTime?
-  created_at              DateTime      @default(now())
-  started_at              DateTime?
-  finished_at             DateTime?
-  updated_at              DateTime      @updatedAt
-  items                   BulkJobItem[]
+  locked_by                String?
+  locked_until             DateTime?
+  created_at               DateTime      @default(now())
+  started_at               DateTime?
+  finished_at              DateTime?
+  updated_at               DateTime      @updatedAt
+  items                    BulkJobItem[]
 
-  @@map("bulk_jobs")
   @@index([type, status])
+  @@map("bulk_jobs")
 }
 
 model BulkJobItem {
-  id         Int      @id @default(autoincrement())
+  id         Int            @id @default(autoincrement())
   job_id     Int
-  job        BulkJob  @relation(fields: [job_id], references: [id])
+  job        BulkJob        @relation(fields: [job_id], references: [id])
   website_id Int?
   // 内容采集任务的条目指向信息源而不是工具（与 website_id 互斥，同为可空）
   source_id  Int?
   source     ContentSource? @relation(fields: [source_id], references: [id])
-  status     String   @default("queued") // queued / running / success / skipped / failed
+  status     String         @default("queued") // queued / running / success / skipped / failed
   result     Json?
   error      String?
-  created_at DateTime @default(now())
-  updated_at DateTime @updatedAt
+  created_at DateTime       @default(now())
+  updated_at DateTime       @updatedAt
 
-  @@map("bulk_job_items")
   @@index([job_id, status])
   @@index([website_id])
   @@index([source_id])
+  @@map("bulk_job_items")
 }
 
 // ---------------------------------------------------------------------------
@@ -428,9 +428,9 @@ model ToolLifecycleState {
   tier_locked Boolean @default(false) // 人工锁定，不被自动分层覆盖
 
   // ── 可达性 ──
-  reach        String    @default("unknown") // ok / dead / unverifiable / unknown
-  reach_since  DateTime?
-  last_ok_at   DateTime?
+  reach           String    @default("unknown") // ok / dead / unverifiable / unknown
+  reach_since     DateTime?
+  last_ok_at      DateTime?
   last_checked_at DateTime?
   next_check_at   DateTime?
 
@@ -450,10 +450,10 @@ model ToolLifecycleState {
   next_content_check_at   DateTime?
 
   // ── 观测线索 ──
-  final_url         String? // 跟随重定向后的落地 URL（换域名线索）
-  archive_url       String? // 死链时给用户的历史快照入口（P0b 用）
-  needs_manual_check Boolean  @default(false)
-  probe_version     Int? // 最近一次判定所用的分类器版本
+  final_url          String? // 跟随重定向后的落地 URL（换域名线索）
+  archive_url        String? // 死链时给用户的历史快照入口（P0b 用）
+  needs_manual_check Boolean @default(false)
+  probe_version      Int? // 最近一次判定所用的分类器版本
 
   // ── 内容新鲜度（轨道 B 预留，P0a 不写）──
   freshness        String?
@@ -465,14 +465,14 @@ model ToolLifecycleState {
   human_decision String? // confirmed_dead / url_updated / false_positive
   decided_at     DateTime?
   notes          String?
-  created_at     DateTime @default(now())
-  updated_at     DateTime @updatedAt
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
 
-  @@map("tool_lifecycle_states")
   @@index([reach])
   @@index([next_check_at])
   @@index([tier, freshness])
   @@index([needs_manual_check])
+  @@map("tool_lifecycle_states")
 }
 
 // 每个 scheduled check round 一条。ok 存轻量证据，异常存完整证据。
@@ -493,15 +493,15 @@ model ToolHealthEvent {
   error_kind        String?
   error_family      String? // network / server / gone
   evidence_strength String? // strong / weak
-  confidence        String  @default("high") // high / low
+  confidence        String   @default("high") // high / low
   change_flags      String[] // domain_migrated / recovered / state_changed / needs_manual_check / archive_found
   reach_from        String?
   reach_to          String?
 
   // ── 轻量证据（每轮都存）──
-  final_status   Int?
-  final_url      String?
-  latency_ms     Int?
+  final_status    Int?
+  final_url       String?
+  latency_ms      Int?
   content_verdict String? // normal / spa_shell / non_html / truncated / undecodable
 
   // ── 完整证据（仅异常/状态变化）──
@@ -509,13 +509,13 @@ model ToolHealthEvent {
 
   created_at DateTime @default(now())
 
-  @@map("tool_health_events")
   // round_id 是确定性幂等键：worker 回收后重跑同一轮，必须被数据库挡下来，
   // 而不是写第二条事件、再把消抖计数加一次。
   @@unique([round_id])
   @@index([website_id, created_at])
   @@index([created_at])
   @@index([outcome])
+  @@map("tool_health_events")
 }
 
 // ---------------------------------------------------------------------------
@@ -551,21 +551,21 @@ enum SourceItemStatus {
 }
 
 model ContentSource {
-  id        Int               @id @default(autoincrement())
+  id              Int                @id @default(autoincrement())
   /// 稳定身份键：feed_url 可能迁移，配置文件与库之间靠这个对齐
-  external_key String?        @unique
-  name      String // 展示名，如 "OpenAI Blog"
-  kind      ContentSourceKind
+  external_key    String?            @unique
+  name            String // 展示名，如 "OpenAI Blog"
+  kind            ContentSourceKind
   /// 定义文件声明的格式（RSS / ATOM）。解析器会自行探测，两者不符值得报警
   declared_format String?
-  source_tier ContentSourceTier?
+  source_tier     ContentSourceTier?
   /// RSS 源的订阅地址；manual 源为空
-  feed_url  String?
-  homepage  String?
+  feed_url        String?
+  homepage        String?
   /// 出版方，发布时落到 ResourceContent.sources[].publisher
-  publisher String
-  lang      String            @default("en")
-  enabled   Boolean           @default(true)
+  publisher       String
+  lang            String             @default("en")
+  enabled         Boolean            @default(true)
 
   // 抓取调度（与工具生命周期同一套思路：到期才抓，失败退避）
   fetch_interval_minutes Int       @default(60)
@@ -576,25 +576,113 @@ model ContentSource {
   consecutive_failures   Int       @default(0)
 
   // 条件请求：源没更新时回 304，既省流量也是对源站的礼貌
-  etag          String?
-  last_modified String?
+  etag              String?
+  last_modified     String?
   /// 跟随重定向后的实际订阅地址；与 feed_url 不同即说明源迁移了，需人工确认后再改配置
   resolved_feed_url String?
 
-  item_count Int     @default(0)
-  notes      String?
+  item_count      Int       @default(0)
+  /// 最近一次成功（OK / NOT_MODIFIED）的时刻；基础设施故障不得覆盖它
+  last_success_at DateTime?
+  notes           String?
 
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
 
   items     SourceItem[]
   job_items BulkJobItem[]
+  runs      ContentSourceRun[]
 
-  @@map("content_sources")
   /// 同一个订阅地址只允许配置一次；manual 源 feed_url 为 NULL，Postgres 视 NULL 互不相等，因此不受限
   @@unique([feed_url])
   @@index([enabled, next_fetch_at])
   @@index([kind])
+  @@map("content_sources")
+}
+
+/// 一次采集尝试的结果分类。区分「源坏了」和「我们这边坏了」是这套分类的全部意义。
+enum SourceRunOutcome {
+  OK
+  NOT_MODIFIED
+  PARTIAL_SUCCESS // 抓到了但不完整（如订阅被字节上限截断）
+  SOURCE_ERROR // 源侧问题：计入来源失败并退避
+  INFRA_ERROR // 我们这边的问题：**不得**归因于源
+}
+
+/// 错误归属域。DATABASE / LEASE / INTERNAL 属基础设施，绝不计入来源健康度。
+enum SourceRunErrorDomain {
+  NONE
+  DNS
+  NETWORK
+  TLS
+  HTTP
+  ROBOTS
+  PARSE
+  TRUNCATED
+  DATABASE
+  LEASE
+  INTERNAL
+}
+
+/// 每个 source 在每个 job 中的一次采集尝试。
+///
+/// 建这张表的直接动机：C3 Canary 首轮 AWS 那次「失败」其实是 Supabase 中断，
+/// 源根本没被请求，却被记成了来源失败并触发退避 —— 源被冤枉了。
+/// 汇总状态说不清这种事，必须逐次留证。
+model ContentSourceRun {
+  id          Int           @id @default(autoincrement())
+  source_id   Int
+  source      ContentSource @relation(fields: [source_id], references: [id])
+  job_id      Int?
+  job_item_id Int?
+
+  started_at  DateTime  @default(now())
+  finished_at DateTime?
+
+  outcome      SourceRunOutcome
+  error_domain SourceRunErrorDomain @default(NONE)
+
+  // ── 取回证据 ──
+  requested_feed_url String
+  resolved_feed_url  String?
+  http_status        Int?
+  bytes_read         Int?
+  truncated          Boolean @default(false)
+  latency_dns_ms     Int?
+  latency_fetch_ms   Int?
+  latency_total_ms   Int?
+  pinned_ip          String?
+  redirect_count     Int?
+
+  // ── 条件请求 ──
+  etag_sent              String?
+  etag_received          String?
+  last_modified_sent     String?
+  last_modified_received String?
+
+  // ── 解析结果 ──
+  feed_format             String? // rss / atom；解析器实测值
+  items_parsed            Int     @default(0)
+  items_inserted          Int     @default(0)
+  items_duplicate         Int     @default(0)
+  items_title_changed     Int     @default(0)
+  items_errored           Int     @default(0)
+  source_updated_at_count Int     @default(0)
+
+  error_code    String?
+  error_message String?
+  /// 只放跳转/SSRF/响应/解析元数据。**不存** Cookie、Authorization、
+  /// 完整 XML、完整 HTML、第三方正文或任何 secret。
+  evidence_json Json?
+
+  created_at DateTime @default(now())
+
+  /// 同一个 job 里同一个源只允许一条有效 run：worker 回收或重复驱动不会写第二条
+  @@unique([job_id, source_id])
+  @@index([source_id, started_at])
+  @@index([outcome, started_at])
+  @@index([error_domain, started_at])
+  @@map("content_source_runs")
 }
 
 model SourceItem {
@@ -612,13 +700,13 @@ model SourceItem {
   /// 正文纯文本的 sha256 前 32 位；用于识别「同内容换地址」，本阶段只记录不判定
   content_hash  String?
 
-  title        String
-  author       String?
+  title             String
+  author            String?
   /// 来源自称的发布时间（可能缺失或不可信，原样保留）
-  published_at DateTime?
+  published_at      DateTime?
   /// 来源自称的最后修改时间（Atom <updated> / RSS <atom:updated>），用于识别条目被改过
   source_updated_at DateTime?
-  fetched_at   DateTime  @default(now())
+  fetched_at        DateTime  @default(now())
 
   // ── 原始快照 ──
   raw_excerpt String? // 订阅里的摘要/description
@@ -631,17 +719,17 @@ model SourceItem {
   /// redirectChain / pinnedIp / resolvedIps / latency / bytesRead 等
   evidence    Json?
 
-  status         SourceItemStatus @default(fetched)
+  status          SourceItemStatus @default(fetched)
   /// 判为重复时指向同源的首条
   duplicate_of_id Int?
 
   created_at DateTime @default(now())
 
-  @@map("source_items")
   /// 同一个源里同一篇文章只记一次。**跨源不去重** —— 「两个源都报道了同一件事」
   /// 是真实的溯源信息，合并成事件是下一阶段聚类要做的judgment，不在原始层预判。
   @@unique([source_id, url_hash])
   @@index([source_id, published_at])
   @@index([status, fetched_at])
   @@index([content_hash])
+  @@map("source_items")
 }

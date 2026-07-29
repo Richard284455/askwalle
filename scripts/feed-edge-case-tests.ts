@@ -170,6 +170,21 @@ function mockTransport(state: MockState): { transport: Transport; resolve: Resol
 
 // ── 测试 ──────────────────────────────────────────────────────────────
 
+/** 清掉本套测试自己造的源（按 publisher 标记识别），不碰任何真实源 */
+async function purgeTestSources(): Promise<void> {
+  const orphans = await prisma.contentSource.findMany({
+    where: { publisher: "__edge_test__" },
+    select: { id: true },
+  });
+  if (!orphans.length) return;
+  const ids = orphans.map((o) => o.id);
+  await prisma.contentSourceRun.deleteMany({ where: { source_id: { in: ids } } });
+  await prisma.sourceItem.deleteMany({ where: { source_id: { in: ids } } });
+  await prisma.bulkJobItem.deleteMany({ where: { source_id: { in: ids } } });
+  await prisma.contentSource.deleteMany({ where: { id: { in: ids } } });
+  console.log(`  （清理上一轮残留的 ${ids.length} 个测试源）`);
+}
+
 async function main() {
   const state: MockState = {
     etag: null,
@@ -180,6 +195,10 @@ async function main() {
   const mock = mockTransport(state);
   const opts = { transport: mock.transport, resolve: mock.resolve };
   const created: number[] = [];
+
+  // 前置清理：上一轮若在数据库中断时崩溃，会留下同名同 feed_url 的测试源，
+  // 下一轮建源就会撞唯一约束。只按 publisher 标记清，碰不到真实源。
+  await purgeTestSources();
 
   const mkSource = async (path: string, name: string) => {
     const s = await prisma.contentSource.create({
@@ -346,9 +365,12 @@ async function main() {
       state.requests.every((r) => !r.path.startsWith("/posts/")),
       state.requests.filter((r) => r.path.startsWith("/posts/")).length + " 次");
   } finally {
+    // run 先删：它有指向 content_sources 的外键，不先清就删不掉源
+    await prisma.contentSourceRun.deleteMany({ where: { source_id: { in: created } } });
     await prisma.sourceItem.deleteMany({ where: { source_id: { in: created } } });
     await prisma.bulkJobItem.deleteMany({ where: { source_id: { in: created } } });
     await prisma.contentSource.deleteMany({ where: { id: { in: created } } });
+    await purgeTestSources();
     const left = await prisma.contentSource.count({ where: { publisher: "__edge_test__" } });
     console.log(`\n收尾：临时源残留 ${left} 个 ${left === 0 ? "✅" : "❌"}`);
   }
