@@ -35,6 +35,38 @@ export type RedirectHop = {
   host: string;
   resolvedIp: string | null;
   ssrfOk: boolean;
+  /** 该跳解析的主机名（与 host 相同，显式留一份便于跨域分析） */
+  hostname?: string;
+  /** 该跳校验通过的全部地址 */
+  resolvedIps?: string[];
+  /** 该跳的 DNS 解析耗时；字面量 IP 或缓存命中可为 0 */
+  dnsLatencyMs?: number;
+};
+
+/**
+ * 响应完整性证据。
+ *
+ * 存在的理由：服务端接受 Range 时会**恰好**返回上限字节而不报任何错误，
+ * 正则解析器又能从截断的 XML 里成功读出前半部分完整的 <item> ——
+ * 两件事叠加，一个不完整的订阅会被记成完整成功。这组字段就是用来
+ * 证明「我们到底有没有拿到整个资源」，证明不了就不许声称完整。
+ */
+export type ResponseIntegrity = {
+  /** 本次请求是否带了 Range 头 */
+  rangeRequested: boolean;
+  /** 服务端是否以 206 应答了 Range */
+  rangeSatisfied: boolean;
+  contentRange: string | null;
+  contentRangeStart: number | null;
+  contentRangeEnd: number | null;
+  contentRangeTotal: number | null;
+  contentLength: number | null;
+  /** 读到的字节数达到或超过本次上限 */
+  bodyLimitReached: boolean;
+  /** 响应流正常结束（而不是被我们主动掐断） */
+  streamEndedNormally: boolean;
+  /** 能够证明拿到了完整资源。证明不了一律 false */
+  responseComplete: boolean;
 };
 
 /**
@@ -57,6 +89,9 @@ export type FetchResult =
       pinnedIp: string;
       resolvedIps: string[];
       latencyMs: number;
+      /** 全部跳转的 DNS 解析耗时累计 */
+      dnsLatencyMs: number;
+      integrity: ResponseIntegrity;
     }
   | {
       kind: "network_error";
@@ -65,17 +100,20 @@ export type FetchResult =
       message: string;
       redirectChain: RedirectHop[];
       latencyMs: number;
+      dnsLatencyMs: number;
     }
   | {
       kind: "unsafe";
       verdict: UnsafeVerdict;
       atHop: number;
       redirectChain: RedirectHop[];
+      dnsLatencyMs: number;
     }
   | {
       kind: "redirect_loop";
       redirectChain: RedirectHop[];
       latencyMs: number;
+      dnsLatencyMs: number;
     };
 
 // 只保留判定与取证需要的响应头，不整包存
@@ -83,6 +121,7 @@ const KEPT_HEADERS = [
   "server",
   "content-type",
   "content-length",
+  "content-range",
   "retry-after",
   "location",
   "cf-ray",
@@ -241,6 +280,10 @@ export type TransportResponse = {
   headers: http.IncomingHttpHeaders;
   buffer: Buffer;
   truncated: boolean;
+  /** 读满上限而停。可选：既有 fixture 不提供时由 safeFetch 依字节数推断 */
+  bodyLimitReached?: boolean;
+  /** 响应流正常收尾。可选：不提供时由 truncated 推断 */
+  streamEndedNormally?: boolean;
 };
 
 /**
@@ -316,6 +359,7 @@ export const nodeTransport: Transport = (args) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
       let truncated = false;
+      let endedNormally = false;
 
       if (!wantBody) {
         response.resume();
@@ -325,10 +369,18 @@ export const nodeTransport: Transport = (args) => {
             headers: response.headers,
             buffer: Buffer.alloc(0),
             truncated: false,
+            bodyLimitReached: false,
+            streamEndedNormally: true,
           })
         );
         return;
       }
+
+      // 'end' 只在服务端把响应发完时触发；我们主动 destroy 时不会。
+      // 这是「拿到完整资源」与「读到上限就停」的唯一可靠区分。
+      response.on("end", () => {
+        endedNormally = true;
+      });
 
       response.on("data", (chunk: Buffer) => {
         bytes += chunk.length;
@@ -346,6 +398,8 @@ export const nodeTransport: Transport = (args) => {
           headers: response.headers,
           buffer: Buffer.concat(chunks),
           truncated: truncated || bytes >= maxBytes,
+          bodyLimitReached: bytes >= maxBytes,
+          streamEndedNormally: endedNormally,
         })
       );
       response.on("error", reject);
@@ -358,6 +412,80 @@ export const nodeTransport: Transport = (args) => {
     request.end();
   });
 };
+
+
+/**
+ * 解析 Content-Range。`bytes 0-1023/4096` → {start:0,end:1023,total:4096}。
+ * 星号形式（范围未知或总长未知）与不可解析的值一律返回 null 位。
+ */
+export function parseContentRange(value: string | null | undefined): {
+  start: number | null;
+  end: number | null;
+  total: number | null;
+} {
+  const empty = { start: null, end: null, total: null };
+  if (!value || typeof value !== "string") return empty;
+  const m = /^\s*bytes\s+(?:(\d+)-(\d+)|\*)\/(\d+|\*)\s*$/i.exec(value);
+  if (!m) return empty;
+  const num = (raw: string | undefined) => (raw === undefined || raw === "*" ? null : Number(raw));
+  const start = num(m[1]);
+  const end = num(m[2]);
+  const total = num(m[3]);
+  const ok = (n: number | null) => n === null || (Number.isSafeInteger(n) && n >= 0);
+  if (!ok(start) || !ok(end) || !ok(total)) return empty;
+  return { start, end, total };
+}
+
+/**
+ * 判定「这次响应是不是完整资源」。
+ *
+ * 原则：**证明不了就算不完整**。宁可把一次完整的抓取标成 PARTIAL 让人复核，
+ * 也不能把半个订阅记成完整成功 —— 后者会安静地污染下游的全部事实。
+ */
+function deriveIntegrity(args: {
+  status: number;
+  headers: Record<string, string>;
+  bytesRead: number;
+  truncated: boolean;
+  wantBody: boolean;
+  rangeRequested: boolean;
+  bodyLimitReached: boolean;
+  streamEndedNormally: boolean;
+}): ResponseIntegrity {
+  const contentRange = args.headers["content-range"] ?? null;
+  const { start, end, total } = parseContentRange(contentRange);
+  const rawLength = Number(args.headers["content-length"]);
+  const contentLength = Number.isSafeInteger(rawLength) && rawLength >= 0 ? rawLength : null;
+  const rangeSatisfied = args.status === 206;
+
+  const base = {
+    rangeRequested: args.rangeRequested,
+    rangeSatisfied,
+    contentRange,
+    contentRangeStart: start,
+    contentRangeEnd: end,
+    contentRangeTotal: total,
+    contentLength,
+    bodyLimitReached: args.bodyLimitReached,
+    streamEndedNormally: args.streamEndedNormally,
+  };
+
+  // 304 与 HEAD 不携带正文，完整性判断对它们没有意义
+  if (args.status === 304 || !args.wantBody) return { ...base, responseComplete: true };
+
+  // Content-Range 说得清就以它为准：end+1 >= total 才算覆盖到结尾
+  if (end !== null && total !== null) {
+    return { ...base, responseComplete: end + 1 >= total && (start === null || start === 0) };
+  }
+  // 206 却讲不清覆盖范围 —— 证明不了完整
+  if (rangeSatisfied) return { ...base, responseComplete: false };
+  // 声明了长度却没读够
+  if (contentLength !== null && args.bytesRead < contentLength) {
+    return { ...base, responseComplete: false };
+  }
+  if (args.truncated || args.bodyLimitReached) return { ...base, responseComplete: false };
+  return { ...base, responseComplete: args.streamEndedNormally };
+}
 
 /**
  * 带 SSRF 校验与连接固定的取回。每一跳重定向都重新校验 + 重新固定。
@@ -382,10 +510,13 @@ export async function safeFetch(
   let currentUrl = startUrl;
   let lastPinned = "";
   let lastResolved: string[] = [];
+  // 每跳的解析耗时累加：一次跨域跳转要解析两个主机名，两次都算数
+  let dnsLatencyMs = 0;
 
   for (let hop = 0; hop <= LIMITS.maxRedirects; hop++) {
     // ★ 每一跳都重跑安全校验，同域跳转也不例外
     const verdict = await assertSafeUrl(currentUrl, options.resolve);
+    dnsLatencyMs += verdict.dnsLatencyMs;
     if (!verdict.safe) {
       // 解析失败是站点侧信号，必须走 network_error/dns，让它计入 dead 消抖；
       // 只有真正的安全拒绝才是 unsafe_target。主请求与 robots 共用这一条规则。
@@ -397,9 +528,10 @@ export async function safeFetch(
           message: verdict.detail,
           redirectChain,
           latencyMs: Date.now() - started,
+          dnsLatencyMs,
         };
       }
-      return { kind: "unsafe", verdict, atHop: hop, redirectChain };
+      return { kind: "unsafe", verdict, atHop: hop, redirectChain, dnsLatencyMs };
     }
     lastPinned = verdict.pinnedIp;
     lastResolved = verdict.addresses;
@@ -407,7 +539,7 @@ export async function safeFetch(
     const url = new URL(currentUrl);
     const dedupeKey = `${url.origin}${url.pathname}${url.search}`;
     if (seen.has(dedupeKey)) {
-      return { kind: "redirect_loop", redirectChain, latencyMs: Date.now() - started };
+      return { kind: "redirect_loop", redirectChain, latencyMs: Date.now() - started, dnsLatencyMs };
     }
     seen.add(dedupeKey);
 
@@ -431,6 +563,7 @@ export async function safeFetch(
         message: (error as Error).message?.slice(0, 300) ?? "",
         redirectChain,
         latencyMs: Date.now() - started,
+        dnsLatencyMs,
       };
     }
 
@@ -449,6 +582,9 @@ export async function safeFetch(
       host: url.host,
       resolvedIp: verdict.pinnedIp,
       ssrfOk: true,
+      hostname: verdict.hostname,
+      resolvedIps: verdict.addresses,
+      dnsLatencyMs: verdict.dnsLatencyMs,
     });
 
     if (!isRedirect) {
@@ -467,6 +603,22 @@ export async function safeFetch(
         pinnedIp: verdict.pinnedIp,
         resolvedIps: verdict.addresses,
         latencyMs: Date.now() - started,
+        dnsLatencyMs,
+        integrity: deriveIntegrity({
+          status: response.status,
+          headers,
+          bytesRead: response.buffer.length,
+          truncated: response.truncated,
+          wantBody: options.method === "GET",
+          rangeRequested: options.method === "GET",
+          // 既有 fixture 不提供这两个信号时按字节数与 truncated 推断
+          bodyLimitReached:
+            response.bodyLimitReached ??
+            (options.maxBytes !== undefined
+              ? response.buffer.length >= options.maxBytes
+              : response.buffer.length >= LIMITS.rangeBytes),
+          streamEndedNormally: response.streamEndedNormally ?? !response.truncated,
+        }),
       };
     }
 
@@ -475,18 +627,19 @@ export async function safeFetch(
     } catch {
       return {
         kind: "unsafe",
-        verdict: { safe: false, kind: "unsafe", reason: "url_unparsable", detail: "bad Location" },
+        verdict: { safe: false, kind: "unsafe", reason: "url_unparsable", detail: "bad Location", dnsLatencyMs: 0 },
         atHop: hop,
         redirectChain,
+        dnsLatencyMs,
       };
     }
     if (Date.now() > deadline) {
-      return { kind: "redirect_loop", redirectChain, latencyMs: Date.now() - started };
+      return { kind: "redirect_loop", redirectChain, latencyMs: Date.now() - started, dnsLatencyMs };
     }
   }
 
   // 跳数用尽
   void lastPinned;
   void lastResolved;
-  return { kind: "redirect_loop", redirectChain, latencyMs: Date.now() - started };
+  return { kind: "redirect_loop", redirectChain, latencyMs: Date.now() - started, dnsLatencyMs };
 }

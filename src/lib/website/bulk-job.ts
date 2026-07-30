@@ -415,7 +415,9 @@ export async function createArticleEnrichJob(
   limit = 10,
   sourceIds?: number[],
   /** Canary 用的显式条目列表。资格仍由 selectEnrichableItems 逐条重判，不绕策略闸门 */
-  onlyItemIds?: number[]
+  onlyItemIds?: number[],
+  /** 允许重跑已成功的条目；只在给了显式列表时生效 */
+  allowReenrich = false
 ): Promise<{ ok: true; jobId: number; total: number } | { ok: false; message: string }> {
   const running = await prisma.bulkJob.findFirst({
     where: { type: "content_article_enrich", status: { notIn: TERMINAL_JOB_STATUSES } },
@@ -429,7 +431,7 @@ export async function createArticleEnrichJob(
   }
 
   const capped = Math.min(Math.max(1, limit), ARTICLE_ENRICH_JOB_MAX);
-  const itemIds = await selectEnrichableItems(capped, sourceIds, onlyItemIds);
+  const itemIds = await selectEnrichableItems(capped, sourceIds, onlyItemIds, allowReenrich);
   if (!itemIds.length) return { ok: false, message: "没有符合条件的待增强条目" };
 
   const job = await prisma.bulkJob.create({

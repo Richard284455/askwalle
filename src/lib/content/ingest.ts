@@ -7,7 +7,7 @@ import {
 } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
-import { safeFetch, Transport } from "@/lib/website/probe/http-client";
+import { safeFetch, Transport, type ResponseIntegrity } from "@/lib/website/probe/http-client";
 import { ResolveFn } from "@/lib/website/probe/ssrf";
 import { parseFeed, htmlToText, FeedParseError, FeedItem } from "./feed-parser";
 import { normalizeUrl, contentHash } from "./url-normalize";
@@ -191,6 +191,10 @@ type FetchEvidence = {
   lastModified: string | null;
   /** 正文被字节上限截断（超大订阅的信号） */
   truncated: boolean;
+  /** 全部跳转的 DNS 解析耗时累计 */
+  dnsLatencyMs: number | null;
+  /** 响应完整性证据；失败路径为 null */
+  integrity: ResponseIntegrity | null;
   /** 失败时的分类，成功为 null */
   failure: { status: string; message: string } | null;
 };
@@ -199,7 +203,89 @@ const EMPTY_FETCH = {
   httpStatus: null, finalUrl: null, body: null,
   etag: null, lastModified: null, truncated: false,
   bytesRead: null, latencyMs: null, pinnedIp: null, redirectCount: null,
+  dnsLatencyMs: null, integrity: null,
 } as const;
+
+
+/**
+ * 真实重定向次数。
+ *
+ * 请求链的第 0 项是**首次请求**而不是一次跳转，所以链长减一才是 Location 跳转数。
+ * 旧口径把「零跳转」记成 1、「一跳」记成 2，读数系统性偏大一位。
+ * 完整链仍原样保存在 evidence 里，这里只算派生值。
+ */
+export function redirectCountOf(chain: { hop: number }[] | null | undefined): number | null {
+  if (!Array.isArray(chain)) return null;
+  return Math.max(0, chain.length - 1);
+}
+
+/** 订阅是否不完整，以及为什么。判不出完整就算不完整。 */
+export type FeedCompleteness = { complete: boolean; reason: string | null };
+
+/**
+ * XML 是否收尾。
+ *
+ * 正则解析器只认完整的 <item>…</item>，被截断的尾巴会被静默忽略 ——
+ * 「只抓到前一半」于是长得和「全部抓到」一模一样。根元素的闭合标签
+ * 是判断文档有没有被切断最直接的证据。
+ */
+export function xmlDocumentClosed(body: string | null): boolean {
+  if (!body) return false;
+  const tail = body.slice(-4_000).toLowerCase();
+  return /<\/(rss|feed|rdf:rdf)\s*>/.test(tail);
+}
+
+/**
+ * 综合判定订阅完整性。
+ *
+ * 顺序即优先级：先看传输层能不能证明拿到了整个资源，再看文档本身收没收尾。
+ * 任何一处证明不了，都记 PARTIAL_SUCCESS/TRUNCATED —— 宁可让人复核一次完整的抓取，
+ * 也不能把半个订阅记成完整成功。
+ */
+export function assessFeedCompleteness(args: {
+  httpStatus: number | null;
+  truncated: boolean;
+  bytesRead: number | null;
+  maxBytes: number;
+  integrity: ResponseIntegrity | null;
+  body: string | null;
+  itemsParsed: number | null;
+}): FeedCompleteness {
+  if (args.httpStatus === 304) return { complete: true, reason: null };
+
+  const g = args.integrity;
+  if (args.truncated) {
+    return { complete: false, reason: `读取在 ${args.bytesRead ?? "?"} 字节处被上限截断` };
+  }
+  if (g) {
+    if (g.contentRangeEnd !== null && g.contentRangeTotal !== null && g.contentRangeEnd + 1 < g.contentRangeTotal) {
+      return {
+        complete: false,
+        reason: `Content-Range 显示只覆盖 ${g.contentRangeStart ?? 0}-${g.contentRangeEnd}/${g.contentRangeTotal}`,
+      };
+    }
+    if (g.contentLength !== null && args.bytesRead !== null && args.bytesRead < g.contentLength) {
+      return { complete: false, reason: `声明 Content-Length ${g.contentLength} 但只读到 ${args.bytesRead}` };
+    }
+    if (g.rangeSatisfied && !g.responseComplete) {
+      return { complete: false, reason: "HTTP 206 且无法从 Content-Range 证明已覆盖完整资源" };
+    }
+    if (g.bodyLimitReached) {
+      return { complete: false, reason: `读满 ${args.maxBytes} 字节上限，无法证明响应完整` };
+    }
+    if (!g.responseComplete) {
+      return { complete: false, reason: "传输层无法证明响应完整" };
+    }
+  } else if (args.bytesRead !== null && args.bytesRead >= args.maxBytes) {
+    return { complete: false, reason: `读满 ${args.maxBytes} 字节上限，无法证明响应完整` };
+  }
+
+  // 传输层说完整了，再看文档本身有没有收尾
+  if (args.body !== null && !xmlDocumentClosed(args.body)) {
+    return { complete: false, reason: "XML 根元素没有闭合标签，文档被切断" };
+  }
+  return { complete: true, reason: null };
+}
 
 /** 统一的安全取回：把 safeFetch 的四种结果翻译成采集层的证据结构 */
 async function fetchSafely(
@@ -227,6 +313,7 @@ async function fetchSafely(
     return {
       ...EMPTY_FETCH,
       evidence: { unsafeReason: res.verdict.reason, atHop: res.atHop } as Prisma.InputJsonValue,
+      dnsLatencyMs: res.dnsLatencyMs,
       failure: { status: "unsafe_target", message: `${res.verdict.reason}: ${res.verdict.detail}` },
     };
   }
@@ -234,6 +321,7 @@ async function fetchSafely(
     return {
       ...EMPTY_FETCH,
       evidence: { redirectChain: res.redirectChain } as unknown as Prisma.InputJsonValue,
+      dnsLatencyMs: res.dnsLatencyMs,
       failure: { status: "redirect_loop", message: "重定向成环或超过跳数上限" },
     };
   }
@@ -241,6 +329,7 @@ async function fetchSafely(
     return {
       ...EMPTY_FETCH,
       evidence: { networkError: `${res.code}: ${res.message}` } as Prisma.InputJsonValue,
+      dnsLatencyMs: res.dnsLatencyMs,
       failure: { status: res.errorKind, message: `${res.code}: ${res.message}` },
     };
   }
@@ -248,11 +337,14 @@ async function fetchSafely(
   const evidence = {
     pinnedIp: res.pinnedIp,
     resolvedIps: res.resolvedIps,
+    // 完整的请求链原样保留（含首次请求），派生的 redirect_count 另算
     redirectChain: res.redirectChain,
     bytesRead: res.bytesRead,
     truncated: res.truncated,
     latencyMs: res.latencyMs,
+    dnsLatencyMs: res.dnsLatencyMs,
     contentType: res.headers["content-type"] ?? null,
+    integrity: res.integrity,
   } as unknown as Prisma.InputJsonValue;
 
   const etag = res.headers["etag"] ?? null;
@@ -263,7 +355,10 @@ async function fetchSafely(
     bytesRead: res.bytesRead,
     latencyMs: res.latencyMs,
     pinnedIp: res.pinnedIp,
-    redirectCount: res.redirectChain.length,
+    // ★ 真实跳转次数：请求链含首次请求，减一才是 Location 跳转数
+    redirectCount: redirectCountOf(res.redirectChain),
+    dnsLatencyMs: res.dnsLatencyMs,
+    integrity: res.integrity,
   };
 
   // 304：源没更新，这是成功而不是失败 —— 条件请求生效的正常结果
@@ -366,28 +461,44 @@ export async function ingestSource(
     items = parsed.items;
   } catch (e) {
     // 截断导致的解析失败要能一眼看出是体积问题，而不是笼统的格式错误
-    const status = fetched.truncated ? "feed_too_large" : "parse_error";
-    const detail = fetched.truncated
-      ? `订阅超过 ${FEED_MAX_BYTES} 字节上限被截断，XML 不完整`
-      : e instanceof FeedParseError
+    // 这里**只看传输层证据**（body 传 null 跳过文档闭合检查）。
+    // 一个畸形订阅同样没有闭合的根元素，但它不是被截断的 ——
+    // 把「格式错」说成「太大了」会把人引向完全错误的排查方向。
+    const incompleteAtParse = assessFeedCompleteness({
+      httpStatus: fetched.httpStatus, truncated: fetched.truncated, bytesRead: fetched.bytesRead,
+      maxBytes: FEED_MAX_BYTES, integrity: fetched.integrity, body: null, itemsParsed: null,
+    });
+    const status = incompleteAtParse.complete ? "parse_error" : "feed_too_large";
+    const detail = incompleteAtParse.complete
+      ? e instanceof FeedParseError
         ? e.message
-        : `解析失败: ${String(e).slice(0, 200)}`;
+        : `解析失败: ${String(e).slice(0, 200)}`
+      : `订阅不完整（${incompleteAtParse.reason}），XML 无法解析`;
     return finish({ ...base, ok: false, status, error: detail }, source, now, fetched, ctx);
   }
 
   // 解析器只认完整的 <item>…</item>，截断的尾部会被静默忽略 —— 于是「只抓到一部分」
   // 会长得和「全部抓到」一模一样。对情报系统来说这比解析失败更危险：
   // 少掉的条目没人知道。已解析的照常保留，但状态必须把话说明白。
-  const truncatedNote = fetched.truncated
-    ? `订阅超过 ${FEED_MAX_BYTES} 字节上限被截断，本轮只看到前 ${items.length} 条，更早的条目未纳入`
-    : null;
+  //
+  // 判定不再只看「传输层有没有主动掐断」：服务端接受 Range 时会恰好返回上限字节
+  // 而不报任何错，Content-Range / Content-Length / 根元素闭合都得一起看。
+  const completeness = assessFeedCompleteness({
+    httpStatus: fetched.httpStatus, truncated: fetched.truncated, bytesRead: fetched.bytesRead,
+    maxBytes: FEED_MAX_BYTES, integrity: fetched.integrity, body: fetched.body,
+    itemsParsed: items.length,
+  });
+  base.truncated = !completeness.complete;
+  const truncatedNote = completeness.complete
+    ? null
+    : `订阅不完整：${completeness.reason}。本轮只看到前 ${items.length} 条，更早的条目未纳入`;
 
   base.itemsSeen = items.length;
   if (!items.length) {
     return finish(
       {
         ...base, ok: true,
-        status: fetched.truncated ? "feed_too_large" : "empty_feed",
+        status: completeness.complete ? "empty_feed" : "feed_too_large",
         error: truncatedNote,
       },
       source, now, fetched, ctx);
@@ -571,6 +682,7 @@ async function finish(
     http_status: result.httpStatus,
     bytes_read: fetched?.bytesRead ?? null,
     truncated: result.truncated,
+    latency_dns_ms: fetched?.dnsLatencyMs ?? null,
     latency_fetch_ms: fetched?.latencyMs ?? null,
     latency_total_ms: Date.now() - (ctx?.startedAt ?? now).getTime(),
     pinned_ip: fetched?.pinnedIp ?? null,

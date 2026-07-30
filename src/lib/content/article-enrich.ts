@@ -1,9 +1,25 @@
 import crypto from "crypto";
 
-import { ArticleFetchPolicy, EnrichmentOutcome, Prisma, SourceRunErrorDomain } from "@prisma/client";
+import {
+  ArticleFetchPolicy,
+  ContentSourceTier,
+  EnrichmentOutcome,
+  Prisma,
+  SourceRunErrorDomain,
+} from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
-import { extractArticle, EXCERPT_MAX_CHARS, MAX_HEADINGS, MIN_VISIBLE_TEXT_CHARS } from "@/lib/content/html-extract";
+import {
+  extractArticle,
+  gradeContent,
+  EXCERPT_MAX_CHARS,
+  MAX_HEADINGS,
+  MIN_VISIBLE_TEXT_CHARS,
+  type ContentQuality,
+  type ExtractionMethod,
+  type FieldSource,
+} from "@/lib/content/html-extract";
+import { redirectCountOf } from "@/lib/content/ingest";
 import { safeFetch, type Transport } from "@/lib/website/probe/http-client";
 import { checkRobots } from "@/lib/website/probe/robots";
 import type { ResolveFn } from "@/lib/website/probe/ssrf";
@@ -116,6 +132,16 @@ function networkDomain(kind: string): SourceRunErrorDomain {
   return SourceRunErrorDomain.NETWORK;
 }
 
+/** 取主机名；不可解析返回 null。只用于记录身份信号，不参与任何安全判断 */
+export function safeHost(url: string | null | undefined): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
 function contentHashOf(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex").slice(0, 32);
 }
@@ -167,6 +193,12 @@ type RunDraft = {
   headings: Prisma.InputJsonValue | null;
   metadata: Prisma.InputJsonValue | null;
   evidence: Prisma.InputJsonValue | null;
+  dnsLatencyMs: number | null;
+  contentQuality: ContentQuality | null;
+  extractionMethod: ExtractionMethod | null;
+  titleSource: FieldSource | null;
+  authorSource: FieldSource | null;
+  publishedAtSource: FieldSource | null;
 };
 
 function emptyDraft(): RunDraft {
@@ -179,6 +211,8 @@ function emptyDraft(): RunDraft {
     etagReceived: null, lastModifiedReceived: null, pageTitle: null, author: null,
     pagePublishedAt: null, language: null, visibleTextLength: null, contentHash: null,
     excerpt: null, headings: null, metadata: null, evidence: null,
+    dnsLatencyMs: null, contentQuality: null, extractionMethod: null,
+    titleSource: null, authorSource: null, publishedAtSource: null,
   };
 }
 
@@ -194,14 +228,23 @@ export async function enrichSourceItem(
   // 也不该留下一条谎称「抓过」的 run（页面根本没被请求）。
   let item: {
     id: number; url: string; source_id: number;
-    source: { id: number; article_fetch_policy: ArticleFetchPolicy; external_key: string | null };
+    author: string | null; published_at: Date | null; title: string;
+    source: {
+      id: number; article_fetch_policy: ArticleFetchPolicy; external_key: string | null;
+      publisher: string; source_tier: ContentSourceTier | null;
+    };
   };
   try {
     item = await prisma.sourceItem.findUniqueOrThrow({
       where: { id: sourceItemId },
       select: {
-        id: true, url: true, source_id: true,
-        source: { select: { id: true, article_fetch_policy: true, external_key: true } },
+        id: true, url: true, source_id: true, author: true, published_at: true, title: true,
+        source: {
+          select: {
+            id: true, article_fetch_policy: true, external_key: true,
+            publisher: true, source_tier: true,
+          },
+        },
       },
     });
   } catch (e) {
@@ -287,7 +330,8 @@ export async function enrichSourceItem(
       draft.errorDomain = SourceRunErrorDomain.NETWORK;
       draft.errorCode = "unsafe_target";
       draft.errorMessage = `${res.verdict.reason}（第 ${res.atHop} 跳）`;
-      draft.redirectCount = res.redirectChain.length;
+      draft.redirectCount = redirectCountOf(res.redirectChain);
+      draft.dnsLatencyMs = res.dnsLatencyMs;
       draft.evidence = { unsafeReason: res.verdict.reason, atHop: res.atHop } as Prisma.InputJsonValue;
       return await finish(item, draft, requestedUrl, startedAt, t0, options, etagSent, lastModifiedSent);
     }
@@ -296,7 +340,8 @@ export async function enrichSourceItem(
       draft.errorDomain = SourceRunErrorDomain.HTTP;
       draft.errorCode = "redirect_loop";
       draft.errorMessage = "重定向成环或超过跳数上限";
-      draft.redirectCount = res.redirectChain.length;
+      draft.redirectCount = redirectCountOf(res.redirectChain);
+      draft.dnsLatencyMs = res.dnsLatencyMs;
       return await finish(item, draft, requestedUrl, startedAt, t0, options, etagSent, lastModifiedSent);
     }
     if (res.kind === "network_error") {
@@ -305,7 +350,8 @@ export async function enrichSourceItem(
       draft.errorCode = res.code;
       draft.errorMessage = `${res.code}: ${res.message}`.slice(0, 300);
       draft.latencyFetchMs = res.latencyMs;
-      draft.redirectCount = res.redirectChain.length;
+      draft.redirectCount = redirectCountOf(res.redirectChain);
+      draft.dnsLatencyMs = res.dnsLatencyMs;
       return await finish(item, draft, requestedUrl, startedAt, t0, options, etagSent, lastModifiedSent);
     }
 
@@ -315,22 +361,27 @@ export async function enrichSourceItem(
     draft.bytesRead = res.bytesRead;
     draft.latencyFetchMs = res.latencyMs;
     draft.pinnedIp = res.pinnedIp;
-    draft.redirectCount = res.redirectChain.length;
+    // ★ 真实跳转次数：请求链含首次请求，减一才是 Location 跳转数
+    draft.redirectCount = redirectCountOf(res.redirectChain);
+    draft.dnsLatencyMs = res.dnsLatencyMs;
     draft.contentType = res.headers["content-type"] ?? null;
     draft.etagReceived = res.headers["etag"] ?? null;
     draft.lastModifiedReceived = res.headers["last-modified"] ?? null;
     // transport 只在超过 4×maxBytes 时置 truncated；服务端认 Range 时会**恰好**
     // 返回上限字节而不报截断 —— 那同样是不完整的正文，必须如实记。
-    draft.truncated = res.truncated || res.bytesRead >= ARTICLE_MAX_BYTES;
+    draft.truncated = res.truncated || !res.integrity.responseComplete;
     draft.evidence = {
       pinnedIp: res.pinnedIp,
       resolvedIps: res.resolvedIps,
+      // 完整请求链原样保留（含首次请求），派生的 redirect_count 另算
       redirectChain: res.redirectChain,
       bytesRead: res.bytesRead,
       truncated: draft.truncated,
       latencyMs: res.latencyMs,
+      dnsLatencyMs: res.dnsLatencyMs,
       contentType: draft.contentType,
       robotsDecision: draft.robotsDecision,
+      integrity: res.integrity,
     } as unknown as Prisma.InputJsonValue;
 
     if (res.status === 304) {
@@ -371,6 +422,8 @@ export async function enrichSourceItem(
       draft.errorDomain = SourceRunErrorDomain.NONE;
       draft.errorCode = "unsupported_content_type";
       draft.errorMessage = `暂不支持的类型：${draft.contentType}`;
+      draft.contentQuality = "UNSUPPORTED";
+      draft.extractionMethod = "NONE";
       return await finish(item, draft, requestedUrl, startedAt, t0, options, etagSent, lastModifiedSent);
     }
     if (res.body === null) {
@@ -395,14 +448,47 @@ export async function enrichSourceItem(
 
     draft.canonicalUrl = extracted.canonicalUrl;
     draft.pageTitle = extracted.title;
-    draft.author = extracted.author;
-    draft.pagePublishedAt = extracted.publishedAt;
     draft.language = extracted.language;
     draft.visibleTextLength = extracted.visibleTextLength;
     draft.contentHash = extracted.visibleTextLength > 0 ? contentHashOf(extracted.visibleText) : null;
     draft.excerpt = extracted.excerpt.slice(0, EXCERPT_MAX_CHARS) || null;
     draft.headings = extracted.headings.slice(0, MAX_HEADINGS) as unknown as Prisma.InputJsonValue;
-    draft.metadata = extracted.metadata as unknown as Prisma.InputJsonValue;
+
+    // ── 字段回落：页面没有就用订阅的，但**必须标明来源** ──────────────────
+    // 把订阅日期伪装成页面声明日期，等于凭空制造一条页面从未做出的断言。
+    draft.author = extracted.author ?? item.author ?? null;
+    draft.authorSource =
+      extracted.author ? extracted.authorSource : item.author ? "FEED" : "NONE";
+    draft.pagePublishedAt = extracted.publishedAt ?? item.published_at ?? null;
+    draft.publishedAtSource =
+      extracted.publishedAt ? extracted.publishedAtSource : item.published_at ? "FEED" : "NONE";
+    draft.titleSource = extracted.title ? extracted.titleSource : item.title ? "FEED" : "NONE";
+    if (!extracted.title && item.title) draft.pageTitle = item.title;
+    draft.extractionMethod = extracted.extractionMethod;
+    // 截断优先于长度分级：半篇文章的字数再多也不是完整正文
+    draft.contentQuality = draft.truncated ? "TRUNCATED" : gradeContent(extracted.visibleTextLength);
+
+    // ── 发布者身份：来源身份只认 ContentSource，final host 只是取回证据 ──
+    const requestedHost = safeHost(requestedUrl);
+    const finalHost = safeHost(res.finalUrl);
+    const canonicalHost = safeHost(extracted.canonicalUrl);
+    draft.metadata = {
+      ...extracted.metadata,
+      contentQuality: draft.contentQuality,
+      extractionMethod: draft.extractionMethod,
+      titleSource: draft.titleSource,
+      authorSource: draft.authorSource,
+      publishedAtSource: draft.publishedAtSource,
+      visibleTextLength: String(extracted.visibleTextLength),
+      // 身份信号只记录，不据此改写来源
+      requestedHost: requestedHost ?? "",
+      finalHost: finalHost ?? "",
+      canonicalHost: canonicalHost ?? "",
+      crossDomainRedirect: String(Boolean(requestedHost && finalHost && requestedHost !== finalHost)),
+      canonicalHostDiffers: String(Boolean(canonicalHost && finalHost && canonicalHost !== finalHost)),
+      sourcePublisher: item.source.publisher,
+      sourceTier: item.source.source_tier ?? "",
+    } as unknown as Prisma.InputJsonValue;
 
     if (extracted.visibleTextLength < MIN_VISIBLE_TEXT_CHARS) {
       draft.outcome = EnrichmentOutcome.CONTENT_INSUFFICIENT;
@@ -465,7 +551,7 @@ async function finish(
     content_type: draft.contentType,
     bytes_read: draft.bytesRead,
     truncated: draft.truncated,
-    latency_dns_ms: null,
+    latency_dns_ms: draft.dnsLatencyMs,
     latency_fetch_ms: draft.latencyFetchMs,
     latency_total_ms: Date.now() - t0,
     pinned_ip: draft.pinnedIp,
@@ -520,18 +606,31 @@ async function finish(
 export async function selectEnrichableItems(
   limit: number,
   sourceIds?: number[],
-  /** 只保留这些 id（Canary 的显式选择）。资格仍然逐条重判，显式列表不绕闸门 */
-  onlyItemIds?: number[]
+  /** 只保留这些 id（Canary 的显式选择）。资格仍然逐条重判，显式列表不绕策略闸门 */
+  onlyItemIds?: number[],
+  /**
+   * 允许重跑已成功的条目。
+   *
+   * 只在**给了显式条目列表**时生效：一份点名的清单本身就是操作者的判断，
+   * 「已经成功过」不该挡住一次刻意的复核。策略闸门（FEED_ONLY / NEVER_FETCH）
+   * 与来源启用状态照旧生效，这里放宽的只是「别重复劳动」这一条效率规则。
+   */
+  allowReenrich = false
 ): Promise<number[]> {
+  const reenrich = allowReenrich && Boolean(onlyItemIds?.length);
   const items = await prisma.sourceItem.findMany({
     where: {
       status: "link_only",
       ...(sourceIds?.length ? { source_id: { in: sourceIds } } : {}),
       ...(onlyItemIds?.length ? { id: { in: onlyItemIds } } : {}),
       source: { article_fetch_policy: { in: ALLOWED_POLICIES }, enabled: true },
-      enrichment_runs: {
-        none: { outcome: { in: [EnrichmentOutcome.OK, EnrichmentOutcome.NOT_MODIFIED] } },
-      },
+      ...(reenrich
+        ? {}
+        : {
+            enrichment_runs: {
+              none: { outcome: { in: [EnrichmentOutcome.OK, EnrichmentOutcome.NOT_MODIFIED] } },
+            },
+          }),
     },
     orderBy: [{ published_at: "desc" }, { id: "desc" }],
     take: limit,

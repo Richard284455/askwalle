@@ -47,6 +47,28 @@ const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 
 export type ExtractedHeading = { level: number; text: string };
 
+/** 字段来自哪里。Fact Pack 必须能分辨「页面自己声明的」和「订阅告诉我们的」 */
+export type FieldSource = "JSON_LD" | "OPEN_GRAPH" | "META" | "HTML_TITLE" | "PAGE" | "FEED" | "NONE";
+
+/** 正文分量。不改变 outcome 语义，只给下游一个确定性的取舍依据 */
+export type ContentQuality = "INSUFFICIENT" | "THIN" | "SUBSTANTIAL" | "TRUNCATED" | "UNSUPPORTED";
+
+/** 正文取自哪一层 */
+export type ExtractionMethod = "ARTICLE" | "MAIN" | "BODY" | "METADATA_ONLY" | "NONE";
+
+/** 正文分量下限：低于此值需要补来源或人工确认，不进自动 Fact Pack */
+export const THIN_MAX_CHARS = 1_499;
+
+/**
+ * 只按字符数分级，不看语义 —— 判定必须确定性可复现。
+ * 截断与不支持类型由调用方在取回层判定后覆盖。
+ */
+export function gradeContent(visibleTextLength: number): ContentQuality {
+  if (visibleTextLength < MIN_VISIBLE_TEXT_CHARS) return "INSUFFICIENT";
+  if (visibleTextLength <= THIN_MAX_CHARS) return "THIN";
+  return "SUBSTANTIAL";
+}
+
 export type ExtractedArticle = {
   canonicalUrl: string | null;
   title: string | null;
@@ -64,6 +86,13 @@ export type ExtractedArticle = {
   metadata: Record<string, string>;
   /** 正文取自哪一层，用于判断提取质量 */
   container: "article" | "main" | "body";
+  /** 与 container 同源，但用 Fact Pack 的词汇表达 */
+  extractionMethod: ExtractionMethod;
+  contentQuality: ContentQuality;
+  /** 字段溯源：页面声明的 vs 兜底来的。回落到 Feed 由调用方标注 */
+  titleSource: FieldSource;
+  authorSource: FieldSource;
+  publishedAtSource: FieldSource;
 };
 
 /** 只接受 http/https 的绝对化；其它协议（javascript:、data: 等）一律丢弃 */
@@ -274,9 +303,23 @@ export function extractArticle(html: string, baseUrl: string): ExtractedArticle 
   const headingRoot = (container === "article" && articleEl) || (container === "main" && mainEl) || bodyEl;
   const headings = headingsOf(headingRoot ? [headingRoot] : nodes);
 
+  // 溯源：取到值的那一条路径就是它的来源。取不到记 NONE，
+  // 由调用方决定要不要回落到 Feed，并把回落如实标成 FEED。
   const title = ogTitle ?? jsonLd.headline ?? docTitle;
+  const titleSource: FieldSource = ogTitle
+    ? "OPEN_GRAPH"
+    : jsonLd.headline
+      ? "JSON_LD"
+      : docTitle
+        ? "HTML_TITLE"
+        : "NONE";
   const author = ogAuthor ?? jsonLd.author;
-  const publishedAt = parseFeedDate(ogPublished ?? jsonLd.datePublished);
+  const authorSource: FieldSource = ogAuthor ? "META" : jsonLd.author ? "JSON_LD" : "NONE";
+  const publishedRaw = ogPublished ?? jsonLd.datePublished;
+  const publishedAt = parseFeedDate(publishedRaw);
+  // 页面给了日期但解析不出来，等于没给 —— 不能把无效值当作页面声明
+  const publishedAtSource: FieldSource =
+    publishedAt === null ? "NONE" : ogPublished ? "META" : "JSON_LD";
   const modifiedAt = parseFeedDate(ogModified ?? jsonLd.dateModified);
 
   // metadata 只放已提取字段，且逐项截断 —— 它是索引，不是页面副本
@@ -297,6 +340,13 @@ export function extractArticle(html: string, baseUrl: string): ExtractedArticle 
   put("docTitle", docTitle);
   put("container", container);
 
+  const extractionMethod: ExtractionMethod =
+    visibleText.length === 0
+      ? title || author || canonicalUrl
+        ? "METADATA_ONLY"
+        : "NONE"
+      : (container.toUpperCase() as ExtractionMethod);
+
   return {
     canonicalUrl,
     title,
@@ -310,5 +360,10 @@ export function extractArticle(html: string, baseUrl: string): ExtractedArticle 
     headings,
     metadata,
     container,
+    extractionMethod,
+    contentQuality: gradeContent(visibleText.length),
+    titleSource,
+    authorSource,
+    publishedAtSource,
   };
 }

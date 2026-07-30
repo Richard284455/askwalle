@@ -33,10 +33,16 @@ export type UnsafeReason =
 /** 解析失败：站点侧信号，走 network 族并计入消抖 */
 export type DnsFailureReason = "dns_no_address" | "dns_error";
 
+/**
+ * `dnsLatencyMs` 记这一跳为解析主机名实际花掉的时间。
+ * 字面量 IP 没有解析动作，记 0；解析**失败**同样记已消耗的时间 ——
+ * 「解析慢到超时」和「解析瞬间失败」是完全不同的故障，遥测必须能分开。
+ * 计时只包裹既有的那一次 resolve 调用，不会多解析一次。
+ */
 export type SafetyVerdict =
-  | { safe: true; hostname: string; port: number; addresses: string[]; pinnedIp: string }
-  | { safe: false; kind: "unsafe"; reason: UnsafeReason; detail: string }
-  | { safe: false; kind: "dns"; reason: DnsFailureReason; code: string; detail: string };
+  | { safe: true; hostname: string; port: number; addresses: string[]; pinnedIp: string; dnsLatencyMs: number }
+  | { safe: false; kind: "unsafe"; reason: UnsafeReason; detail: string; dnsLatencyMs: number }
+  | { safe: false; kind: "dns"; reason: DnsFailureReason; code: string; detail: string; dnsLatencyMs: number };
 
 export type UnsafeVerdict = Extract<SafetyVerdict, { safe: false; kind: "unsafe" }>;
 export type DnsVerdict = Extract<SafetyVerdict, { safe: false; kind: "dns" }>;
@@ -216,25 +222,25 @@ export async function assertSafeUrl(
   try {
     url = new URL(rawUrl);
   } catch {
-    return { safe: false, kind: "unsafe", reason: "url_unparsable", detail: rawUrl.slice(0, 200) };
+    return { safe: false, kind: "unsafe", reason: "url_unparsable", detail: rawUrl.slice(0, 200), dnsLatencyMs: 0 };
   }
 
   if (!ALLOWED_PROTOCOLS.includes(url.protocol)) {
-    return { safe: false, kind: "unsafe", reason: "protocol_not_allowed", detail: url.protocol };
+    return { safe: false, kind: "unsafe", reason: "protocol_not_allowed", detail: url.protocol, dnsLatencyMs: 0 };
   }
   if (url.username || url.password) {
-    return { safe: false, kind: "unsafe", reason: "userinfo_in_url", detail: "URL 含 user:pass@" };
+    return { safe: false, kind: "unsafe", reason: "userinfo_in_url", detail: "URL 含 user:pass@", dnsLatencyMs: 0 };
   }
 
   const port = url.port ? Number(url.port) : url.protocol === "https:" ? 443 : 80;
   if (!ALLOWED_PORTS.includes(port)) {
-    return { safe: false, kind: "unsafe", reason: "port_not_allowed", detail: String(port) };
+    return { safe: false, kind: "unsafe", reason: "port_not_allowed", detail: String(port), dnsLatencyMs: 0 };
   }
 
   // URL 会把 IPv6 主机包在方括号里
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
   if (hostnameBlocked(hostname)) {
-    return { safe: false, kind: "unsafe", reason: "hostname_not_allowed", detail: hostname };
+    return { safe: false, kind: "unsafe", reason: "hostname_not_allowed", detail: hostname, dnsLatencyMs: 0 };
   }
 
   // punycode 归一化后再看一次（URL 构造时已做，这里防御 tldts 解析异常）
@@ -242,16 +248,17 @@ export async function assertSafeUrl(
 
   if (info.isIp || isIP(hostname) !== 0) {
     if (isMetadataAddress(hostname)) {
-      return { safe: false, kind: "unsafe", reason: "metadata_endpoint", detail: hostname };
+      return { safe: false, kind: "unsafe", reason: "metadata_endpoint", detail: hostname, dnsLatencyMs: 0 };
     }
     if (isBlockedAddress(hostname)) {
-      return { safe: false, kind: "unsafe", reason: "private_ip", detail: hostname };
+      return { safe: false, kind: "unsafe", reason: "private_ip", detail: hostname, dnsLatencyMs: 0 };
     }
-    return { safe: true, hostname, port, addresses: [hostname], pinnedIp: hostname };
+    return { safe: true, hostname, port, addresses: [hostname], pinnedIp: hostname, dnsLatencyMs: 0 };
   }
 
   // ★ 解析失败走 dns 通道，不是安全拒绝。解析**成功**之后的地址校验才是安全判断。
   let addresses: string[];
+  const dnsStartedAt = Date.now();
   try {
     addresses = await resolve(hostname);
   } catch (error) {
@@ -261,8 +268,10 @@ export async function assertSafeUrl(
       reason: "dns_error",
       code: dnsCodeOf(error),
       detail: error instanceof Error ? error.message.slice(0, 200) : "resolve failed",
+      dnsLatencyMs: Date.now() - dnsStartedAt,
     };
   }
+  const dnsLatencyMs = Date.now() - dnsStartedAt;
   if (!addresses.length) {
     return {
       safe: false,
@@ -270,6 +279,7 @@ export async function assertSafeUrl(
       reason: "dns_no_address",
       code: "ENODATA",
       detail: hostname,
+      dnsLatencyMs,
     };
   }
 
@@ -277,12 +287,12 @@ export async function assertSafeUrl(
   // 不能只看第一个 —— 轮询 DNS 可能先给公网 IP，再给内网 IP。
   for (const address of addresses) {
     if (isMetadataAddress(address)) {
-      return { safe: false, kind: "unsafe", reason: "metadata_endpoint", detail: address };
+      return { safe: false, kind: "unsafe", reason: "metadata_endpoint", detail: address, dnsLatencyMs };
     }
     if (isBlockedAddress(address)) {
-      return { safe: false, kind: "unsafe", reason: "private_ip", detail: address };
+      return { safe: false, kind: "unsafe", reason: "private_ip", detail: address, dnsLatencyMs };
     }
   }
 
-  return { safe: true, hostname, port, addresses, pinnedIp: addresses[0] };
+  return { safe: true, hostname, port, addresses, pinnedIp: addresses[0], dnsLatencyMs };
 }

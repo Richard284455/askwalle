@@ -27,7 +27,9 @@
     "test:feededge": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/feed-edge-case-tests.ts",
     "sources:import": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/import-content-sources.ts",
     "test:telemetry": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/ingest-telemetry-tests.ts",
-    "test:enrich": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/article-enrich-tests.ts"
+    "test:enrich": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/article-enrich-tests.ts",
+    "backfill:acquisition": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/backfill-acquisition-derived.ts",
+    "test:acquisition-integrity": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/acquisition-integrity-tests.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
