@@ -393,22 +393,29 @@ model BulkJob {
 }
 
 model BulkJobItem {
-  id         Int            @id @default(autoincrement())
-  job_id     Int
-  job        BulkJob        @relation(fields: [job_id], references: [id])
-  website_id Int?
+  id             Int            @id @default(autoincrement())
+  job_id         Int
+  job            BulkJob        @relation(fields: [job_id], references: [id])
+  website_id     Int?
   // 内容采集任务的条目指向信息源而不是工具（与 website_id 互斥，同为可空）
-  source_id  Int?
-  source     ContentSource? @relation(fields: [source_id], references: [id])
-  status     String         @default("queued") // queued / running / success / skipped / failed
-  result     Json?
-  error      String?
-  created_at DateTime       @default(now())
-  updated_at DateTime       @updatedAt
+  source_id      Int?
+  source         ContentSource? @relation(fields: [source_id], references: [id])
+  /// 文章增强任务的条目指向单条来源条目。三个外键按 job type 互斥：
+  /// website_id 用于工具类任务，source_id 用于 content_ingest，
+  /// source_item_id 用于 content_article_enrich。执行器按显式 type 白名单分派，
+  /// 不依赖「哪个字段非空」来猜任务种类。
+  source_item_id Int?
+  source_item    SourceItem?    @relation(fields: [source_item_id], references: [id])
+  status         String         @default("queued") // queued / running / success / skipped / failed
+  result         Json?
+  error          String?
+  created_at     DateTime       @default(now())
+  updated_at     DateTime       @updatedAt
 
   @@index([job_id, status])
   @@index([website_id])
   @@index([source_id])
+  @@index([source_item_id])
   @@map("bulk_job_items")
 }
 
@@ -550,6 +557,28 @@ enum SourceItemStatus {
   duplicate // 与同源的既有条目重复（指向 duplicate_of_id）
 }
 
+/// 每个源允许的文章正文抓取强度。默认最保守的 FEED_ONLY：
+/// 只用订阅自带的字段，永不请求文章页。放宽必须逐源显式决定。
+enum ArticleFetchPolicy {
+  FEED_ONLY // 只用订阅内容，不抓文章页（默认）
+  ON_DEMAND // 订阅只给标题时，按需抓文章页补齐
+  NEVER_FETCH // 明确不允许抓（条款、robots 或内容性质决定）
+  ALWAYS_FETCH // 每条都抓；本阶段不启用
+}
+
+/// 单条来源条目的一次正文增强结果。
+/// 与 SourceRunOutcome 分开：采集看的是「订阅这一轮跑没跑成」，
+/// 这里看的是「这一篇正文能不能用」，两者的失败语义不一样。
+enum EnrichmentOutcome {
+  OK // 取到并提取出可用正文
+  NOT_MODIFIED // 条件请求命中 304
+  BLOCKED // robots / WAF / 403 / 451：源站不让抓，不是我们故障
+  CONTENT_INSUFFICIENT // 200 但正文过少或只有应用壳
+  UNSUPPORTED // 非 HTML 等暂不支持的类型
+  SOURCE_ERROR // 源站网络 / TLS / HTTP / 解析问题
+  INFRA_ERROR // 数据库 / 租约 / 客户端内部问题，**不得**归因于源
+}
+
 model ContentSource {
   id              Int                @id @default(autoincrement())
   /// 稳定身份键：feed_url 可能迁移，配置文件与库之间靠这个对齐
@@ -585,6 +614,10 @@ model ContentSource {
   /// 最近一次成功（OK / NOT_MODIFIED）的时刻；基础设施故障不得覆盖它
   last_success_at DateTime?
   notes           String?
+
+  /// 这个源允许多强的正文抓取。默认 FEED_ONLY —— 放宽是逐源的显式决定，
+  /// 不能因为「订阅字段不够用」就自动升级。
+  article_fetch_policy ArticleFetchPolicy @default(FEED_ONLY)
 
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
@@ -725,6 +758,9 @@ model SourceItem {
 
   created_at DateTime @default(now())
 
+  enrichment_runs SourceItemEnrichmentRun[]
+  job_items       BulkJobItem[]
+
   /// 同一个源里同一篇文章只记一次。**跨源不去重** —— 「两个源都报道了同一件事」
   /// 是真实的溯源信息，合并成事件是下一阶段聚类要做的judgment，不在原始层预判。
   @@unique([source_id, url_hash])
@@ -732,4 +768,80 @@ model SourceItem {
   @@index([status, fetched_at])
   @@index([content_hash])
   @@map("source_items")
+}
+
+/// 单条来源条目的一次正文增强尝试（不可变运行记录）。
+///
+/// 与 ContentSourceRun 同一条纪律：**先能解释发生了什么，再谈自动化**。
+/// 每次尝试都留下取回证据与归因，基础设施故障绝不写进源或条目的健康度。
+///
+/// 存储边界（硬性）：不存完整 HTML、不存完整正文、不存 script/style、
+/// 不存 Cookie / Authorization / 页面里的用户数据 / 任何 secret。
+/// excerpt 至多 2000 字符，headings_json 至多 20 条。
+model SourceItemEnrichmentRun {
+  id             Int        @id @default(autoincrement())
+  source_item_id Int
+  source_item    SourceItem @relation(fields: [source_item_id], references: [id])
+  job_id         Int?
+  job_item_id    Int?
+
+  started_at  DateTime  @default(now())
+  finished_at DateTime?
+
+  outcome      EnrichmentOutcome
+  error_domain SourceRunErrorDomain @default(NONE)
+
+  // ── 取回证据 ──
+  requested_url  String
+  final_url      String?
+  canonical_url  String?
+  http_status    Int?
+  content_type   String?
+  bytes_read     Int?
+  truncated      Boolean @default(false)
+  latency_dns_ms Int?
+
+  latency_fetch_ms Int?
+  latency_total_ms Int?
+  pinned_ip        String?
+  redirect_count   Int?
+  /// allow / disallow / deferred —— 取不回 robots 时不当作允许
+  robots_decision  String?
+
+  // ── 条件请求 ──
+  etag_sent              String?
+  etag_received          String?
+  last_modified_sent     String?
+  last_modified_received String?
+
+  // ── 提取结果（有限元数据 + 摘要，不是全文）──
+  page_title          String?
+  author              String?
+  page_published_at   DateTime?
+  language            String?
+  /// 规范化后可见正文的字符数。正文本身只在内存里短暂存在，处理完即丢弃
+  visible_text_length Int?
+  /// 可见正文的 sha256 前 32 位；用于识别「同内容换地址」
+  content_hash        String?
+  /// 至多 2000 字符
+  excerpt             String?
+  /// 至多 20 条标题：[{ level, text }]
+  headings_json       Json?
+  /// canonical / og / twitter / JSON-LD 的**已提取字段**，不是页面原文
+  metadata_json       Json?
+
+  error_code    String?
+  error_message String?
+  /// 只放跳转/SSRF/响应/提取元数据。**不存**任何页面正文或凭据。
+  evidence_json Json?
+
+  created_at DateTime @default(now())
+
+  /// 同一个 job 里同一条条目只留一条有效 run —— worker 回收或重复驱动不写第二条
+  @@unique([job_id, source_item_id])
+  @@index([source_item_id, started_at])
+  @@index([outcome, started_at])
+  @@index([error_domain, started_at])
+  @@index([content_hash])
+  @@map("source_item_enrichment_runs")
 }

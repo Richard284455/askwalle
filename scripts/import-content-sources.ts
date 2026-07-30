@@ -14,11 +14,14 @@
  */
 import { readFileSync } from "fs";
 
+import type { ArticleFetchPolicy } from "@prisma/client";
+
 import { prisma } from "@/lib/prisma";
 import { normalizeUrl } from "@/lib/content/url-normalize";
 
 type Tier = "OFFICIAL_PRIMARY" | "STRUCTURED_TECHNICAL" | "AUTHORITATIVE_MEDIA" | "COMMUNITY_SIGNAL";
 const TIERS: Tier[] = ["OFFICIAL_PRIMARY", "STRUCTURED_TECHNICAL", "AUTHORITATIVE_MEDIA", "COMMUNITY_SIGNAL"];
+const POLICIES: ArticleFetchPolicy[] = ["FEED_ONLY", "ON_DEMAND", "NEVER_FETCH", "ALWAYS_FETCH"];
 
 /** 定义文件的字段形状（snake_case，与人工维护的 JSON 一致） */
 type SourceDef = {
@@ -35,6 +38,8 @@ type SourceDef = {
   fetch_interval_minutes?: number;
   /** 人工确认记录：发布者身份与使用边界 */
   notes?: string;
+  /** 正文抓取强度。缺省 FEED_ONLY —— 放宽必须在定义文件里显式写出来 */
+  article_fetch_policy?: ArticleFetchPolicy;
 };
 
 const APPLY = process.argv.includes("--apply");
@@ -69,6 +74,9 @@ function validate(defs: unknown): SourceDef[] {
     if (seenUrls.has(d.feed_url)) throw new Error(`${at}: feed_url 重复: ${d.feed_url}`);
     seenUrls.add(d.feed_url);
     if (!d.notes?.trim()) throw new Error(`${at}: 缺少 notes（使用边界需人工确认后写明）`);
+    if (d.article_fetch_policy && !POLICIES.includes(d.article_fetch_policy)) {
+      throw new Error(`${at}: article_fetch_policy 必须是 ${POLICIES.join(" / ")}`);
+    }
     return d;
   });
 }
@@ -100,6 +108,7 @@ async function main() {
       publisher: def.publisher,
       source_tier: def.source_tier,
       declared_format: def.adapter_type,
+      article_fetch_policy: def.article_fetch_policy ?? "FEED_ONLY",
       feed_url: def.feed_url ?? null,
       lang: def.language ?? "en",
       enabled: def.enabled ?? true,
@@ -135,6 +144,7 @@ async function main() {
     return [...m].sort().map(([k, v]) => `${k}=${v}`).join(" · ");
   };
   console.log(`tier:    ${tally((d) => d.source_tier)}`);
+  console.log(`policy:  ${tally((d) => d.article_fetch_policy ?? "FEED_ONLY")}`);
   console.log(`adapter: ${tally((d) => d.adapter_type)}`);
   console.log(`发布者:  ${tally((d) => d.publisher)}`);
   console.log(`校验:    external_key 无重复 ✅ · feed_url 无重复 ✅ · publisher/notes 均非空 ✅ · 全程未发网络请求 ✅`);
@@ -165,6 +175,7 @@ async function main() {
       kind: "rss" as const,
       declared_format: p.def.adapter_type,
       source_tier: p.def.source_tier,
+      article_fetch_policy: p.def.article_fetch_policy ?? "FEED_ONLY",
       feed_url: p.def.feed_url ?? null,
       homepage: p.def.homepage ?? null,
       publisher: p.def.publisher,

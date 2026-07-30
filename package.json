@@ -26,7 +26,8 @@
     "test:ingest": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/content-ingest-tests.ts",
     "test:feededge": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/feed-edge-case-tests.ts",
     "sources:import": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/import-content-sources.ts",
-    "test:telemetry": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/ingest-telemetry-tests.ts"
+    "test:telemetry": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/ingest-telemetry-tests.ts",
+    "test:enrich": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/article-enrich-tests.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
@@ -66,7 +67,9 @@
     "clsx": "^2.1.1",
     "critters": "^0.0.23",
     "cron": "^3.3.2",
+    "domutils": "3.2.2",
     "framer-motion": "^11.15.0",
+    "htmlparser2": "8.0.2",
     "jotai": "^2.10.4",
     "jsonwebtoken": "^9.0.2",
     "lucide-react": "^0.468.0",

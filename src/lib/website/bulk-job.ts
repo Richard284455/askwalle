@@ -17,6 +17,7 @@ import {
   runHealthCheckRound,
   selectDueWebsites,
 } from "@/lib/website/tool-lifecycle";
+import { enrichSourceItem, selectEnrichableItems } from "@/lib/content/article-enrich";
 import { ingestSource, selectDueSources } from "@/lib/content/ingest";
 import {
   finalizeDirectRewriteBatch,
@@ -59,7 +60,8 @@ export type BulkJobType =
   | "publish"
   | "import_excel"
   | "rewrite_direct"
-  | "content_ingest";
+  | "content_ingest"
+  | "content_article_enrich";
 
 const JOB_TYPES: BulkJobType[] = [
   "health_check",
@@ -68,6 +70,7 @@ const JOB_TYPES: BulkJobType[] = [
   "import_excel",
   "rewrite_direct",
   "content_ingest",
+  "content_article_enrich",
 ];
 
 // 可达性探测：每块 20 条。单条约 1–3 秒（HEAD 短路居多），一块 ~1 分钟，
@@ -81,6 +84,7 @@ export const CONTENT_INGEST_CHUNK_SIZE = 5;
 function chunkSizeFor(type: BulkJobType): number {
   if (type === "health_check") return HEALTH_CHECK_CHUNK_SIZE;
   if (type === "content_ingest") return CONTENT_INGEST_CHUNK_SIZE;
+  if (type === "content_article_enrich") return ARTICLE_ENRICH_CHUNK_SIZE;
   return type === "rewrite_direct" ? REWRITE_CHUNK_SIZE : CHUNK_SIZE;
 }
 
@@ -394,6 +398,60 @@ export async function createContentIngestJob(
 }
 
 // ---------------------------------------------------------------------------
+// 文章增强任务：创建
+// ---------------------------------------------------------------------------
+
+/** 一次一条：抓第三方页面要串行且有间隔，吞吐不是这里的目标 */
+export const ARTICLE_ENRICH_CHUNK_SIZE = 1;
+export const ARTICLE_ENRICH_JOB_MAX = 50;
+
+/**
+ * 建文章增强任务。
+ *
+ * 与 content_ingest 同一条纪律：**全局同时只允许一个未终结的增强任务**。
+ * 并行会把对同一个源站的请求频率放大到不礼貌的程度，同域 2 秒间隔也就形同虚设。
+ */
+export async function createArticleEnrichJob(
+  limit = 10,
+  sourceIds?: number[],
+  /** Canary 用的显式条目列表。资格仍由 selectEnrichableItems 逐条重判，不绕策略闸门 */
+  onlyItemIds?: number[]
+): Promise<{ ok: true; jobId: number; total: number } | { ok: false; message: string }> {
+  const running = await prisma.bulkJob.findFirst({
+    where: { type: "content_article_enrich", status: { notIn: TERMINAL_JOB_STATUSES } },
+    select: { id: true, status: true },
+  });
+  if (running) {
+    return {
+      ok: false,
+      message: `已有未终结的文章增强任务 #${running.id}（${running.status}），同时只允许一个`,
+    };
+  }
+
+  const capped = Math.min(Math.max(1, limit), ARTICLE_ENRICH_JOB_MAX);
+  const itemIds = await selectEnrichableItems(capped, sourceIds, onlyItemIds);
+  if (!itemIds.length) return { ok: false, message: "没有符合条件的待增强条目" };
+
+  const job = await prisma.bulkJob.create({
+    data: {
+      type: "content_article_enrich",
+      status: "queued",
+      total_count: itemIds.length,
+      params: {
+        limit: capped,
+        ...(sourceIds?.length ? { sourceIds } : {}),
+        selectedAt: new Date().toISOString(),
+      } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.bulkJobItem.createMany({
+    data: itemIds.map((sourceItemId) => ({ job_id: job.id, source_item_id: sourceItemId })),
+  });
+  nudgeJobWorker();
+  return { ok: true, jobId: job.id, total: itemIds.length };
+}
+
+// ---------------------------------------------------------------------------
 // 直连 AI 改写任务：创建
 // ---------------------------------------------------------------------------
 
@@ -696,7 +754,7 @@ async function runChunkLocked(
     where: { job_id: jobId, status: "queued" },
     orderBy: { id: "asc" },
     take: chunkSizeFor(jobType),
-    select: { id: true, website_id: true, source_id: true },
+    select: { id: true, website_id: true, source_id: true, source_item_id: true },
   });
 
   // 直连改写：每块开始前重新解析 provider 运行时（key 只在进程内传递）。
@@ -839,6 +897,32 @@ async function runChunkLocked(
             itemsSkipped: ingest.itemsSkipped,
             itemsErrored: ingest.itemsErrored,
             truncated: ingest.truncated,
+          } as Prisma.InputJsonValue;
+        }
+      } else if (job.type === "content_article_enrich") {
+        // 一个 item = 一条来源条目的一次正文抓取。
+        //
+        // 与 content_ingest 同一套归因：源站拒绝 / 正文不足都是**有效结论**，
+        // 记 skipped 而不是 failed —— 那不是任务坏了。只有我们这边的故障记 failed。
+        if (!item.source_item_id) {
+          itemStatus = "failed";
+          itemError = "缺少 source_item_id";
+        } else {
+          const enriched = await enrichSourceItem(item.source_item_id, {
+            jobId,
+            jobItemId: item.id,
+          });
+          itemStatus = enriched.ok ? "success" : enriched.sourceAtFault ? "skipped" : "failed";
+          itemError = enriched.ok
+            ? null
+            : `${enriched.outcome ?? "NONE"}/${enriched.errorDomain}: ${enriched.error ?? ""}`.slice(0, 300);
+          itemResult = {
+            sourceItemId: enriched.sourceItemId,
+            runId: enriched.runId,
+            outcome: enriched.outcome,
+            errorDomain: enriched.errorDomain,
+            sourceAtFault: enriched.sourceAtFault,
+            visibleTextLength: enriched.visibleTextLength,
           } as Prisma.InputJsonValue;
         }
       } else if (!item.website_id) {
