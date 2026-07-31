@@ -5,7 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { assertSingleObjectValue, buildClaims, excerptHashOf } from "./claims";
 import { evaluateSourceFactPackEligibility } from "./eligibility";
 import { buildPackInput, computeInputHash } from "./input-snapshot";
-import { isNewerFactPackInput, selectLatestUsableEnrichmentRun } from "./latest-run";
+import { isNewerFactPackInput, selectRunForEligibilityReport } from "./latest-run";
 import { EXTRACTOR_VERSION, type BuildResult, type IneligibleReason } from "./types";
 
 /**
@@ -52,19 +52,9 @@ export async function buildSourceFactPack(args: {
 
   try {
     // ── 选定提取记录。指定了就用指定的，仍要逐条判资格 ──────────────────
-    let run = args.enrichmentRunId
+    const run = args.enrichmentRunId
       ? await prisma.sourceItemEnrichmentRun.findUnique({ where: { id: args.enrichmentRunId } })
-      : await selectLatestUsableEnrichmentRun(item.id, item.source.enabled);
-
-    // 一条都不可用时，退回看**最近那一条**再判一次 —— 只是为了给出真实的原因。
-    // 否则一条 894 字的 THIN 记录会被报成「没有提取记录」，把人支去找一条
-    // 根本不缺的 run。真的没有记录时才报 NO_ENRICHMENT_RUN。
-    if (!run) {
-      run = await prisma.sourceItemEnrichmentRun.findFirst({
-        where: { source_item_id: item.id },
-        orderBy: [{ started_at: "desc" }, { id: "desc" }],
-      });
-    }
+      : await selectRunForEligibilityReport(item.id, item.source.enabled);
 
     const verdict = evaluateSourceFactPackEligibility({
       sourceItemId: item.id,
@@ -252,7 +242,11 @@ export async function buildSourceFactPack(args: {
 }
 
 export { evaluateSourceFactPackEligibility } from "./eligibility";
-export { selectLatestUsableEnrichmentRun, isNewerFactPackInput } from "./latest-run";
+export {
+  selectLatestUsableEnrichmentRun,
+  selectRunForEligibilityReport,
+  isNewerFactPackInput,
+} from "./latest-run";
 export { buildPackInput, computeInputHash, canonicalize } from "./input-snapshot";
 export { buildClaims, assertSingleObjectValue, excerptHashOf } from "./claims";
 export * from "./types";

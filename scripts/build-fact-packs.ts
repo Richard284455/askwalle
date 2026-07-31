@@ -14,7 +14,7 @@ import { prisma } from "@/lib/prisma";
 
 import { buildSourceFactPack } from "@/lib/content/fact-pack/builder";
 import { evaluateSourceFactPackEligibility } from "@/lib/content/fact-pack/eligibility";
-import { selectLatestUsableEnrichmentRun } from "@/lib/content/fact-pack/latest-run";
+import { selectRunForEligibilityReport } from "@/lib/content/fact-pack/latest-run";
 import { EXTRACTOR_VERSION } from "@/lib/content/fact-pack/types";
 
 const argv = process.argv.slice(2);
@@ -78,7 +78,7 @@ async function main() {
       bump("NOT_FOUND");
       continue;
     }
-    const run = await selectLatestUsableEnrichmentRun(id, item.source.enabled);
+    const run = await selectRunForEligibilityReport(id, item.source.enabled);
     const verdict = evaluateSourceFactPackEligibility({
       sourceItemId: id,
       sourceEnabled: item.source.enabled,

@@ -31,6 +31,28 @@ export async function selectLatestUsableEnrichmentRun(
 }
 
 /**
+ * 判资格时该看哪一条记录。
+ *
+ * 优先返回可用的那条；一条都不可用时退回**最近那一条**，只是为了给出真实的原因 ——
+ * 否则一条 894 字的 THIN 记录会被报成「没有提取记录」，把人支去找一条根本不缺的 run。
+ * 真的一条都没有时才返回 null。
+ *
+ * builder 与 CLI 共用这一个入口：各写一套查询迟早漂移，而「为什么不合格」
+ * 正是操作者唯一会看的东西。
+ */
+export async function selectRunForEligibilityReport(
+  sourceItemId: number,
+  sourceEnabled = true
+): Promise<SourceItemEnrichmentRun | null> {
+  const usable = await selectLatestUsableEnrichmentRun(sourceItemId, sourceEnabled);
+  if (usable) return usable;
+  return prisma.sourceItemEnrichmentRun.findFirst({
+    where: { source_item_id: sourceItemId },
+    orderBy: [{ started_at: "desc" }, { id: "desc" }],
+  });
+}
+
+/**
  * 候选提取记录是否比当前 pack 用的那条更新。
  * 同一条或更旧的一律返回 false —— 重复调用不该改变当前 pack。
  */
