@@ -542,6 +542,23 @@ enum ContentSourceKind {
   manual // 编辑人工提交的单条 URL
 }
 
+/// 发布者相对于**它所发布的内容**的身份关系。
+///
+/// 与 ContentSourceTier 正交：tier 说的是「这个源能支撑多强的事实主张」，
+/// 这里说的是「这份材料的作者与事件主体是什么关系」。
+///
+/// 刻意**不**表达 primary/secondary —— 那是相对于具体事件的判断：
+/// DOE 对自己的 Genesis Mission 计划是 originating，对 Google 的捐赠公告
+/// 却是 independent。同一个源在不同文档上关系不同，所以结论留到 candidate
+/// review 层，不在来源上固化。
+enum SourceOriginRole {
+  ORIGINATING_AUTHORITY // 事件主体自己发布（公司发自家产品、机构发自家计划）
+  INDEPENDENT_AUTHORITY // 与事件主体独立的权威机构（政府、标准组织、独立基金会）
+  INDEPENDENT_REPORTING // 有原创采编能力的独立媒体
+  SAME_ORIGIN_DIFFERENT_CHANNEL // 同一主体的另一个渠道（论文预印本、镜像、docs）
+  UNCLASSIFIED // 未分类；历史 pack 一律留在这里
+}
+
 /// 来源分级：决定这个源能支撑什么强度的事实主张，以及未来的正文抓取策略
 enum ContentSourceTier {
   OFFICIAL_PRIMARY // 第一方官方口径
@@ -618,6 +635,10 @@ model ContentSource {
   /// 这个源允许多强的正文抓取。默认 FEED_ONLY —— 放宽是逐源的显式决定，
   /// 不能因为「订阅字段不够用」就自动升级。
   article_fetch_policy ArticleFetchPolicy @default(FEED_ONLY)
+
+  /// 声明式的发布者身份关系，人工确认后写进定义文件。
+  /// **不是** primary/secondary 标记 —— 那个判断相对于具体事件，留在 review 层。
+  origin_role SourceOriginRole?
 
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
@@ -939,6 +960,9 @@ model SourceFactPack {
   publisher_snapshot           String
   source_tier_snapshot         ContentSourceTier?
   source_external_key_snapshot String?
+  /// 生成 pack 那一刻的发布者身份关系快照。
+  /// 历史 pack 为 null —— 不回填不可变快照。
+  source_origin_role_snapshot  SourceOriginRole?
 
   // ── 取回身份快照 ──
   requested_url_snapshot String
