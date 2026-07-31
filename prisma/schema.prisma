@@ -1113,6 +1113,7 @@ model EventClusteringRun {
 
   edges      EventSimilarityEdge[]
   candidates EventClusterCandidate[]
+  members    EventClusterCandidateMember[]
 
   @@unique([rule_version, input_hash])
   @@index([status, started_at])
@@ -1144,7 +1145,9 @@ model EventSimilarityEdge {
 
   created_at DateTime @default(now())
 
-  @@unique([rule_version, left_fact_pack_id, right_fact_pack_id])
+  /// **run-scoped**：同一对 pack 在不同 run 里必须能重新计算。
+  /// 旧口径 (rule_version, left, right) 会让一对 pack 一辈子只被评分一次。
+  @@unique([clustering_run_id, left_fact_pack_id, right_fact_pack_id])
   @@index([classification, score])
   @@index([review_status, created_at])
   @@map("event_similarity_edges")
@@ -1176,18 +1179,26 @@ model EventClusterCandidate {
 
   members EventClusterCandidateMember[]
 
-  @@unique([rule_version, candidate_key])
+  /// **run-scoped**：候选是一次 discovery run 的快照。
+  /// 旧口径是 (rule_version, candidate_key)，于是「pack 27 是 singleton」这件事
+  /// 在同一规则版本下只能成立一次 —— 换一批输入重跑时，所有沿用下来的 singleton
+  /// 都会撞上上一次的记录，扩大输入集根本跑不起来。
+  @@unique([clustering_run_id, candidate_key])
   @@index([status, created_at])
   @@index([candidate_type, created_at])
   @@map("event_cluster_candidates")
 }
 
 model EventClusterCandidateMember {
-  id           Int                   @id @default(autoincrement())
-  candidate_id Int
-  candidate    EventClusterCandidate @relation(fields: [candidate_id], references: [id])
-  fact_pack_id Int
-  fact_pack    SourceFactPack        @relation(fields: [fact_pack_id], references: [id])
+  id                Int                   @id @default(autoincrement())
+  candidate_id      Int
+  candidate         EventClusterCandidate @relation(fields: [candidate_id], references: [id])
+  /// 冗余持有 run：约束要的是「同一 run 内一个 pack 只属于一个候选」，
+  /// 只靠 (candidate_id, fact_pack_id) 管不到跨候选的重复
+  clustering_run_id Int
+  clustering_run    EventClusteringRun    @relation(fields: [clustering_run_id], references: [id])
+  fact_pack_id      Int
+  fact_pack         SourceFactPack        @relation(fields: [fact_pack_id], references: [id])
 
   is_anchor        Boolean @default(false)
   /// 凭什么进这个候选：EXACT_DOCUMENT / SINGLETON。fuzzy edge **不**产生成员
@@ -1197,6 +1208,8 @@ model EventClusterCandidateMember {
   created_at DateTime @default(now())
 
   @@unique([candidate_id, fact_pack_id])
+  /// 同一 run 内一个 pack 最多属于一个候选；**不**阻止跨 run 归属
+  @@unique([clustering_run_id, fact_pack_id])
   @@index([fact_pack_id])
   @@map("event_cluster_candidate_members")
 }

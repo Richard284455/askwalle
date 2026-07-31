@@ -23,7 +23,7 @@ import { MIN_PERSISTED_SCORE, RULE_VERSION, type ClusteringInput } from "./types
  */
 
 export type DiscoverResult = {
-  status: "BUILT" | "EXISTING" | "DRY_RUN" | "NO_ELIGIBLE_INPUT" | "INFRA_ERROR";
+  status: "BUILT" | "EXISTING" | "DRY_RUN" | "MISSING_INPUT" | "NO_ELIGIBLE_INPUT" | "INFRA_ERROR";
   runId: number | null;
   ruleVersion: string;
   inputHash: string | null;
@@ -106,6 +106,13 @@ export async function discoverEventCandidates(args: {
   factPackIds: number[];
   ruleVersion?: string;
   apply?: boolean;
+  /**
+   * 允许请求里含库中不存在的 pack id。
+   *
+   * 默认 **fail closed**：静默把 9 个输入缩成 6 个，调用方会以为「这批就是全部」，
+   * 而结论其实建立在残缺输入上 —— 我自己在第一次 Canary 就踩过。
+   */
+  allowMissing?: boolean;
 }): Promise<DiscoverResult> {
   const ruleVersion = args.ruleVersion ?? RULE_VERSION;
   const base: DiscoverResult = {
@@ -124,8 +131,14 @@ export async function discoverEventCandidates(args: {
     // 请求了但库里没有的 id 必须如实报出来。悄悄少算几个 pack，
     // 调用方会以为「这批就是全部」，得出的结论却建立在残缺输入上。
     const found = new Set(packs.map((p) => p.id));
-    for (const id of args.factPackIds) {
-      if (!found.has(id)) base.ineligible.push({ factPackId: id, reason: "NOT_FOUND" });
+    const missing = args.factPackIds.filter((id) => !found.has(id));
+    for (const id of missing) base.ineligible.push({ factPackId: id, reason: "NOT_FOUND" });
+    if (missing.length && !args.allowMissing) {
+      return {
+        ...base,
+        status: "MISSING_INPUT",
+        message: `请求的 ${missing.length} 个 pack 不存在：${missing.join(", ")}。加 --allow-missing 才继续`,
+      };
     }
 
     const eligible: SourceFactPack[] = [];
@@ -243,7 +256,7 @@ export async function discoverEventCandidates(args: {
           const candidate = await tx.eventClusterCandidate.create({
             data: {
               clustering_run_id: run.id,
-              candidate_key: candidateKeyOf(group.type, group.members),
+              candidate_key: candidateKeyOf(group.type, group.members, inputHash),
               candidate_type: group.type,
               status: "PROPOSED",
               anchor_fact_pack_id: anchor,
@@ -261,6 +274,7 @@ export async function discoverEventCandidates(args: {
           await tx.eventClusterCandidateMember.createMany({
             data: group.members.map((id) => ({
               candidate_id: candidate.id,
+              clustering_run_id: run.id,
               fact_pack_id: id,
               is_anchor: id === anchor,
               membership_basis: group.type === "SINGLETON" ? "SINGLETON" : "EXACT_DOCUMENT",

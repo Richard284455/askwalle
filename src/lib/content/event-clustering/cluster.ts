@@ -70,12 +70,27 @@ export function planClusters(packIds: number[], pairs: ScoredPair[]): ClusterPla
   return { exactGroups, singletons: singletons.sort((a, b) => a - b) };
 }
 
-/** 候选键必须只由成员决定 —— 同一批成员在同一规则版本下恒得同一个键 */
-export function candidateKeyOf(type: "SINGLETON" | "EXACT_DOCUMENT_GROUP", members: number[]): string {
+/**
+ * 候选键。
+ *
+ * **必须带 run identity。** 只用「类型 + 成员」当全局身份的话，
+ * 「pack 27 是 singleton」这件事在一个规则版本下就只能成立一次 ——
+ * 换一批输入重跑时，所有沿用下来的 singleton 都会撞上上一次的记录。
+ * 候选是一次 discovery run 的快照，同一个 pack 在不同输入集下落进不同的
+ * 候选结构是正常的观察差异，不是冲突。
+ *
+ * 同一个 run 内，键仍然只由成员决定 —— 顺序无关、可复现。
+ */
+export function candidateKeyOf(
+  type: "SINGLETON" | "EXACT_DOCUMENT_GROUP",
+  members: number[],
+  runFingerprint: string
+): string {
   const ordered = [...members].sort((a, b) => a - b);
-  if (type === "SINGLETON") return `singleton:${ordered[0]}`;
-  const digest = crypto.createHash("sha256").update(ordered.join(",")).digest("hex").slice(0, 24);
-  return `exact:${digest}`;
+  const run = runFingerprint.slice(0, 12);
+  if (type === "SINGLETON") return `singleton:${ordered[0]}@${run}`;
+  const digest = crypto.createHash("sha256").update(ordered.join(",")).digest("hex").slice(0, 16);
+  return `exact:${digest}@${run}`;
 }
 
 /** 时间范围取成员里的最早/最晚；全无时间时返回 null */

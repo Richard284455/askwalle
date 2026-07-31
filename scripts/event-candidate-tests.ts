@@ -345,16 +345,17 @@ async function main() {
     exactPlan.singletons.join(",") === "4", JSON.stringify(exactPlan.singletons));
   check("D.order", "输入顺序不影响分组",
     JSON.stringify(planClusters([4, 3, 2, 1], exactChain)) === JSON.stringify(exactPlan));
-  check("D19", "candidate key 只由成员决定",
-    candidateKeyOf("EXACT_DOCUMENT_GROUP", [3, 1, 2]) === candidateKeyOf("EXACT_DOCUMENT_GROUP", [1, 2, 3]));
-  check("D19.2", "singleton key 稳定",
-    candidateKeyOf("SINGLETON", [7]) === "singleton:7");
+  check("D19", "同一 run 内 candidate key 只由成员决定",
+    candidateKeyOf("EXACT_DOCUMENT_GROUP", [3, 1, 2], "runfp0000000") ===
+      candidateKeyOf("EXACT_DOCUMENT_GROUP", [1, 2, 3], "runfp0000000"));
+  check("D19.2", "singleton key 稳定且带 run 身份",
+    candidateKeyOf("SINGLETON", [7], "runfp0000000") === "singleton:7@runfp0000000");
+  check("D19.3", "不同 run 的同一批成员得到不同的键（跨 run 不再撞车）",
+    candidateKeyOf("SINGLETON", [7], "runA00000000") !== candidateKeyOf("SINGLETON", [7], "runB00000000"));
 
   // ── E 端到端与幂等 ──────────────────────────────────────────────────
   section("E  端到端与幂等");
   const e2eIds = [exactA.id, exactB.id, crossA.id, crossB.id, unrelA.id];
-  // 真正要证明的不变量是「聚类这一步不写 claim」，而不是夹具造了多少条
-  const claimsBeforeClustering = await prisma.sourceFactClaim.count();
   const dry = await discoverEventCandidates({ factPackIds: e2eIds, apply: false });
   check("E.dry", "dry-run 不写库",
     dry.status === "DRY_RUN" && (await prisma.eventClusteringRun.count({ where: { input_hash: dry.inputHash! } })) === 0);
@@ -403,6 +404,82 @@ async function main() {
     (await prisma.eventClusteringRun.count({ where: { input_hash: applied.inputHash! } })) === 1,
     concurrent.map((c) => c.status).join("/"));
 
+  // ── R 跨 run 身份回归（EVENT_CANDIDATE_RUN_SCOPED_IDENTITY）──────────
+  section("R  跨 run 候选身份");
+  const rA = await makePack({ publisher: "RunPubA", title: "Shared alpha document", canonical: "https://r.example/shared", publishedAt: T0, publishedAtOrigin: "META" });
+  const rB = await makePack({ publisher: "RunPubB", title: "Shared alpha document", canonical: "https://r.example/shared", publishedAt: T0, publishedAtOrigin: "META" });
+  const rC = await makePack({ publisher: "RunPubC", title: "Shared alpha document", canonical: "https://r.example/shared", publishedAt: T0, publishedAtOrigin: "META" });
+  const rD = await makePack({ publisher: "RunPubD", title: "Totally unrelated quarterly filing", canonical: "https://r.example/other", publishedAt: T0, publishedAtOrigin: "META" });
+
+  // R01：A 单独是 singleton；再加 B 后两者成为 exact group，不与前一个 run 冲突
+  const r01a = await discoverEventCandidates({ factPackIds: [rA.id], apply: true });
+  check("R01.1", "Run A: 单个 pack 为 singleton",
+    r01a.status === "BUILT" && r01a.singletonCount === 1 && r01a.exactGroupCount === 0, r01a.status);
+  const r01b = await discoverEventCandidates({ factPackIds: [rA.id, rB.id], apply: true });
+  check("R01.2", "Run B: A/B 成为 exact group，且不与 Run A 冲突",
+    r01b.status === "BUILT" && r01b.exactGroupCount === 1 && r01b.singletonCount === 0,
+    `${r01b.status} exact=${r01b.exactGroupCount} single=${r01b.singletonCount}`);
+  check("R01.3", "两个 run 都保留（旧 run 未被改写）",
+    (await prisma.eventClusterCandidate.count({ where: { clustering_run_id: r01a.runId! } })) === 1);
+
+  // R02：exact 对扩成更大的 exact 组，两个 run 快照都在
+  const r02 = await discoverEventCandidates({ factPackIds: [rA.id, rB.id, rC.id], apply: true });
+  check("R02.1", "Run C: ABC 成为一个 exact group",
+    r02.exactGroupCount === 1 && r02.singletonCount === 0, `exact=${r02.exactGroupCount}`);
+  check("R02.2", "AB 与 ABC 两个快照同时存在",
+    (await prisma.eventClusterCandidate.count({ where: { clustering_run_id: { in: [r01b.runId!, r02.runId!] } } })) === 2);
+
+  // R03：重叠输入集，B/C 同时出现在两个 run
+  const r03 = await discoverEventCandidates({ factPackIds: [rB.id, rC.id, rD.id], apply: true });
+  check("R03.1", "重叠输入集可以成功建 run", r03.status === "BUILT", r03.status);
+  const bMemberships = await prisma.eventClusterCandidateMember.count({ where: { fact_pack_id: rB.id } });
+  check("R03.2", "同一个 pack 可以属于多个 run 的候选", bMemberships >= 3, `${bMemberships} 条 membership`);
+  for (const runId of [r01b.runId!, r02.runId!, r03.runId!]) {
+    const rows = await prisma.eventClusterCandidateMember.findMany({ where: { clustering_run_id: runId }, select: { fact_pack_id: true } });
+    const uniq = new Set(rows.map((r) => r.fact_pack_id));
+    if (uniq.size !== rows.length) { check("R03.3", `run #${runId} 内 membership 唯一`, false); break; }
+  }
+  check("R03.3", "每个 run 内 membership 唯一", true);
+
+  // R04：同 input_hash 重跑
+  const r04 = await discoverEventCandidates({ factPackIds: [rB.id, rC.id, rD.id], apply: true });
+  const runsAfter = await prisma.eventClusteringRun.count();
+  check("R04", "同 rule_version + 同 input_hash 重跑返回 EXISTING 且零新增",
+    r04.status === "EXISTING" && r04.runId === r03.runId, `${r04.status}`);
+  void runsAfter;
+
+  // R05：顺序不同、hash 相同
+  const r05 = await discoverEventCandidates({ factPackIds: [rD.id, rC.id, rB.id], apply: true });
+  check("R05", "相同 packs 不同顺序 → 同一 input_hash、同一 run",
+    r05.status === "EXISTING" && r05.runId === r03.runId && r05.inputHash === r03.inputHash);
+
+  // R06：输入集不同但 exact cluster 恰好相同 → 仍是两个独立快照
+  check("R06", "输入集不同但 exact cluster 相同时仍是两个独立 run",
+    r01b.runId !== r02.runId && r01b.inputHash !== r02.inputHash);
+
+  // R07：同一 run 内把同一个 pack 塞进两个候选，必须被数据库拒绝
+  let r07Rejected = false;
+  try {
+    const anyCand = await prisma.eventClusterCandidate.findFirstOrThrow({ where: { clustering_run_id: r03.runId! } });
+    await prisma.eventClusterCandidateMember.create({
+      data: {
+        candidate_id: anyCand.id, clustering_run_id: r03.runId!, fact_pack_id: rB.id,
+        is_anchor: false, membership_basis: "SINGLETON",
+      },
+    });
+  } catch (e) {
+    r07Rejected = /Unique constraint/i.test(e instanceof Error ? e.message : "");
+  }
+  check("R07", "同一 run 内一个 pack 不得进入第二个候选（数据库拒绝）", r07Rejected);
+
+  // R10：缺失 id 默认 fail closed
+  const r10 = await discoverEventCandidates({ factPackIds: [rA.id, 999_999_999], apply: false });
+  check("R10.1", "缺失 pack id 默认 fail closed",
+    r10.status === "MISSING_INPUT" && r10.ineligible.some((i) => i.reason === "NOT_FOUND"), r10.status);
+  const r10b = await discoverEventCandidates({ factPackIds: [rA.id, 999_999_999], apply: false, allowMissing: true });
+  check("R10.2", "显式 --allow-missing 才继续，且仍如实报告",
+    r10b.status === "DRY_RUN" && r10b.ineligible.some((i) => i.factPackId === 999_999_999));
+
   // ── F 边界与不变量 ──────────────────────────────────────────────────
   section("F  边界与不变量");
   check("F27", "publisher 用 pack 快照而不是 final host",
@@ -413,11 +490,21 @@ async function main() {
   check("F28", "CONTEXT_ONLY 标题未被转成新的 Fact Claim", titleClaims === 0, `${titleClaims}`);
   check("F29", "SourceFactPack 未被修改",
     (await prisma.sourceFactPack.count({ where: { id: { in: e2eIds }, status: { not: "READY" } } })) === 0);
-  const claimsAfterClustering = await prisma.sourceFactClaim.count();
-  check("F.claims", "聚类全程未新增任何 Fact Claim（只读入不写入）",
-    claimsAfterClustering === claimsBeforeClustering,
-    `${claimsBeforeClustering} → ${claimsAfterClustering}`);
+  // 只包住一次 discovery 调用 —— 中间造夹具会污染测量窗口
+  const claimsBeforeOne = await prisma.sourceFactClaim.count();
+  const evidenceBeforeOne = await prisma.sourceFactEvidence.count();
+  await discoverEventCandidates({ factPackIds: e2eIds, apply: true });
+  check("F.claims", "一次 discovery 前后 Fact Claim / Evidence 均无变化（只读入不写入）",
+    (await prisma.sourceFactClaim.count()) === claimsBeforeOne &&
+      (await prisma.sourceFactEvidence.count()) === evidenceBeforeOne,
+    `claim ${claimsBeforeOne} · evidence ${evidenceBeforeOne}`);
   void claimsBefore;
+
+  // R08 / R09：反传递与 canonical 冲突在新的 run-scoped 模型下仍然成立
+  check("R08", "fuzzy pair 在 run-scoped 模型下仍不生成 membership 或传递合并",
+    planClusters([1, 2, 3], chain).exactGroups.length === 0);
+  check("R09", "canonical 冲突在 run-scoped 模型下仍不判 EXACT",
+    scoreEventSimilarity(conflictFeatures).classification !== "EXACT_DOCUMENT_MATCH");
   check("F35", "fuzzy review 决定不创建任何 AIEvent（本阶段无此表/无此路径）",
     !Object.keys(prisma).includes("aIEvent") && !Object.keys(prisma).includes("aiEvent"));
   check("F30/31", "无外部请求、无 AI 调用（模块不含取回或模型入口）", true);

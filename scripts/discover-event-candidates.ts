@@ -17,6 +17,8 @@ import { RULE_VERSION } from "@/lib/content/event-clustering/types";
 
 const argv = process.argv.slice(2);
 const APPLY = argv.includes("--apply");
+/** 默认 fail closed：请求里有库中不存在的 pack 就停，不静默缩小输入集 */
+const ALLOW_MISSING = argv.includes("--allow-missing");
 const MAX_PACKS = 200;
 
 function flag(name: string): string | null {
@@ -63,7 +65,11 @@ async function main() {
   console.log(`规则版本: ${RULE_VERSION}`);
   console.log(`目标: ${target.how} · ${target.ids.length} 个 pack\n`);
 
-  const result = await discoverEventCandidates({ factPackIds: target.ids, apply: APPLY });
+  const result = await discoverEventCandidates({
+    factPackIds: target.ids,
+    apply: APPLY,
+    allowMissing: ALLOW_MISSING,
+  });
 
   console.log(`状态          ${result.status}${result.runId ? `  run #${result.runId}` : ""}`);
   console.log(`input_hash    ${result.inputHash?.slice(0, 32) ?? "-"}…`);
@@ -84,7 +90,7 @@ async function main() {
     console.log("注意：0 个跨来源候选也是有效结果 —— 当前来源之间本来就可能没有重叠报道。");
   }
   await prisma.$disconnect();
-  if (result.status === "INFRA_ERROR") process.exitCode = 1;
+  if (result.status === "INFRA_ERROR" || result.status === "MISSING_INPUT") process.exitCode = 1;
 }
 
 main().catch((e) => {
