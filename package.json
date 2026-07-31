@@ -33,7 +33,9 @@
     "factpacks:build": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/build-fact-packs.ts",
     "test:factpack": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/fact-pack-tests.ts",
     "events:candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/discover-event-candidates.ts",
-    "test:event-candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/event-candidate-tests.ts"
+    "test:event-candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/event-candidate-tests.ts",
+    "articles:generate": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/generate-articles.ts",
+    "test:article-gen": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/article-gen-tests.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

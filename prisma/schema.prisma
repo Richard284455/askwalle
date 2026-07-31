@@ -783,6 +783,7 @@ model SourceItem {
   job_items       BulkJobItem[]
   fact_packs      SourceFactPack[]
   fact_evidence   SourceFactEvidence[]
+  articles        GeneratedArticle[]
 
   /// 同一个源里同一篇文章只记一次。**跨源不去重** —— 「两个源都报道了同一件事」
   /// 是真实的溯源信息，合并成事件是下一阶段聚类要做的judgment，不在原始层预判。
@@ -993,6 +994,7 @@ model SourceFactPack {
   edges_right         EventSimilarityEdge[]         @relation("EdgeRight")
   anchored_candidates EventClusterCandidate[]       @relation("CandidateAnchor")
   candidate_members   EventClusterCandidateMember[]
+  GeneratedArticle    GeneratedArticle[]
 
   /// 同一次提取 + 同一个提取器版本只允许一个 pack
   @@unique([enrichment_run_id, extractor_version])
@@ -1236,4 +1238,101 @@ model EventClusterCandidateMember {
   @@unique([clustering_run_id, fact_pack_id])
   @@index([fact_pack_id])
   @@map("event_cluster_candidate_members")
+}
+
+// ---------------------------------------------------------------------------
+// 来源忠实的原创资讯生成（SOURCE_ITEM_TO_ORIGINAL_ARTICLE_PIPELINE）
+//
+// 产品定位的一次转向：系统**不判断信源说的是否客观正确**，只保证生成的文章
+// 忠实于指定信源。事实核查、跨来源印证、事件聚类都不在这条链路上。
+//
+// 因此 SourceFactPack 在这里的语义是 **SOURCE_ASSERTED_FACTS**（信源如此陈述），
+// 不是 VERIFIED_FACTS（已核实）。这个区别必须一路传到文章署名与免责表述上。
+//
+// 每一个合格 SourceItem 都是独立的发布单元：允许不同来源报同一件事各发一篇，
+// 允许同一来源就同一主题多次发布，允许与历史文章内容重复。**不因重复而拒绝**。
+// 唯一要防的是技术性重复 —— 重试不得把同一份生成写两遍。
+// ---------------------------------------------------------------------------
+
+enum ArticleGenerationMode {
+  FULL_SOURCE // 正文抓取成功且分量足够：生成完整原创资讯
+  FEED_ONLY_BRIEF // 只有订阅字段：生成短讯，长度由可用事实自然限制
+}
+
+enum ArticleStatus {
+  SOURCE_READY
+  GENERATION_PENDING
+  DRAFTED
+  FAITHFULNESS_REVIEW
+  READY_TO_PUBLISH
+  PUBLISHED
+  // ── 失败态 ──
+  SOURCE_INSUFFICIENT
+  GENERATION_FAILED
+  FAITHFULNESS_FAILED
+  PUBLICATION_FAILED
+}
+
+/// 只判「是否忠实于来源」，**不判**「来源说的对不对」。
+/// 刻意不设 UNVERIFIED / NEEDS_SECOND_SOURCE / DUPLICATE_EVENT 之类的结论 ——
+/// 那些属于已经从主链路移除的事实核查与去重职责。
+enum FaithfulnessVerdict {
+  PASSED
+  NEEDS_REWRITE
+  BLOCKED_SOURCE_INSUFFICIENT
+}
+
+model GeneratedArticle {
+  id             Int             @id @default(autoincrement())
+  source_item_id Int
+  source_item    SourceItem      @relation(fields: [source_item_id], references: [id])
+  /// 可选：FULL_SOURCE 模式下用到的 fact pack；FEED_ONLY_BRIEF 为 null
+  fact_pack_id   Int?
+  fact_pack      SourceFactPack? @relation(fields: [fact_pack_id], references: [id])
+
+  /// 生成规则版本。规则变了必须显式升版，不得静默混用两代产物
+  generation_version String
+  /// 同一来源可以有多个不同角度的成稿；默认 "default"
+  article_variant    String @default("default")
+
+  mode   ArticleGenerationMode
+  status ArticleStatus         @default(GENERATION_PENDING)
+
+  // ── 来源身份快照（发布时署名用）──
+  source_url_snapshot       String
+  source_publisher_snapshot String
+  source_title_snapshot     String
+  source_published_at       DateTime?
+  source_captured_at        DateTime?
+  /// 生成所依据的来源输入指纹：同输入同版本不重复生成
+  source_input_hash         String
+
+  // ── 生成产物 ──
+  headline          String?
+  short_summary     String?
+  body              String?
+  /// 文章事实 → 来源 claim/evidence 的映射
+  fact_mapping_json Json?
+
+  // ── 忠实度 QA ──
+  qa_verdict     FaithfulnessVerdict?
+  qa_issues_json Json?
+  qa_checked_at  DateTime?
+
+  provider       String?
+  model          String?
+  generated_at   DateTime?
+  published_at   DateTime?
+  failure_reason String?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  /// 技术性去重：重试不得把同一份生成写第二遍。
+  /// **不做业务去重** —— 内容重复不是拒绝理由。
+  @@unique([source_item_id, generation_version, article_variant])
+  @@index([status, created_at])
+  @@index([mode, created_at])
+  @@index([source_input_hash])
+  @@map("generated_articles")
 }
