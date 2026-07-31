@@ -121,6 +121,13 @@ export async function discoverEventCandidates(args: {
       orderBy: { id: "asc" },
     });
 
+    // 请求了但库里没有的 id 必须如实报出来。悄悄少算几个 pack，
+    // 调用方会以为「这批就是全部」，得出的结论却建立在残缺输入上。
+    const found = new Set(packs.map((p) => p.id));
+    for (const id of args.factPackIds) {
+      if (!found.has(id)) base.ineligible.push({ factPackId: id, reason: "NOT_FOUND" });
+    }
+
     const eligible: SourceFactPack[] = [];
     for (const pack of packs) {
       const verdict = evaluateEventClusteringEligibility(pack);

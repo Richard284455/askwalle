@@ -23,6 +23,7 @@ export const WEAK_WINDOW_HOURS = 24 * 7;
 export type TimeReliability = "HIGH" | "MEDIUM" | "LOW" | "FALLBACK";
 
 export type IneligibleReason =
+  | "NOT_FOUND"
   | "NOT_READY"
   | "SUPERSEDED"
   | "REJECTED"
