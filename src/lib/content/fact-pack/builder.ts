@@ -125,6 +125,7 @@ export async function buildSourceFactPack(args: {
           publisher_snapshot: input.publisher,
           source_tier_snapshot: input.sourceTier,
           source_external_key_snapshot: input.sourceExternalKey,
+          source_origin_role_snapshot: input.sourceOriginRole,
           requested_url_snapshot: input.requestedUrl,
           final_url_snapshot: input.finalUrl,
           canonical_url_snapshot: input.canonicalUrl,

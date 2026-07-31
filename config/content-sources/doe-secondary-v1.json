@@ -1,0 +1,15 @@
+[
+  {
+    "external_key": "doe-newsroom",
+    "name": "U.S. Department of Energy Newsroom",
+    "publisher": "U.S. Department of Energy",
+    "source_tier": "OFFICIAL_PRIMARY",
+    "adapter_type": "RSS",
+    "feed_url": "https://www.energy.gov/rss/articles.xml",
+    "language": "en",
+    "fetch_interval_minutes": 180,
+    "article_fetch_policy": "ON_DEMAND",
+    "origin_role": "ORIGINATING_AUTHORITY",
+    "notes": "Official newsroom of a U.S. federal department. ORIGINATING_AUTHORITY because DOE announces its own programs, selections and actions; it is NOT pre-labelled primary or secondary for any given event - that judgement is event-relative and belongs to candidate review. Works of the U.S. federal government are generally public domain. Probed 2026-07-31: robots allow, HTTP 206 with complete Content-Range, RSS, 10 items, published date and guid on 10/10, retention window 2026-07-09 to 2026-07-29, ETag and Last-Modified present, feed summaries median 155 chars. Only this one feed is approved; no other DOE or government endpoint."
+  }
+]

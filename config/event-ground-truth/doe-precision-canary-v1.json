@@ -1,0 +1,53 @@
+{
+  "dataset": "SOURCE_DIVERSITY_DOE_PRECISION_CANARY",
+  "labelled_at": "2026-07-31",
+  "reviewer": "claude-opus-5 (agent); 人工确认待批",
+  "method": "在运行任何 discovery score 或 classification 之前，仅依据两侧文档已捕获的标题、canonical、发布时间与有限摘要作出判断。标注结果先落盘，再跑算法。",
+  "packs": {
+    "openai": [27, 28, 29, 30, 31],
+    "google_deepmind": [32, 33, 34, 35],
+    "doe": [215, 216, 217, 218, 219, 220, 221, 222]
+  },
+  "labels": [
+    {
+      "pair": [32, 220],
+      "label": "RELATED_DIFFERENT_EVENT",
+      "event_definition": "Genesis Mission（美国能源部主导的 AI 加速科研计划）在 2026-07-22 的两则不同公告",
+      "shared_facts": [
+        "同一个计划：Genesis Mission",
+        "同一天发布：2026-07-22",
+        "同一主题域：用 AI 加速科学发现"
+      ],
+      "differing_facts": [
+        "DOE #220 宣布的是 Genesis Mission RFA 下**首批入选研究项目**（选了哪些团队）",
+        "Google #32 宣布的是 Google 自己的**4000 万美元资金承诺**",
+        "行为主体不同：DOE 在遴选，Google 在出资",
+        "两份文档均未表明 Google 的 4000 万属于该 RFA 遴选结果"
+      ],
+      "publisher_independence": "独立。U.S. Department of Energy 是美国联邦部门；Google DeepMind / Google Cloud 是私营企业。无所有权或资金依赖关系。",
+      "rationale": "同一计划下的两个不同动作，不是同一事件。把「项目遴选」和「企业出资」合并会造出一个两份文档都没有断言过的复合事实。这正是本数据集里最有价值的困难负样本：同计划、同日、同主题，但事件不同。",
+      "difficulty": "HARD_NEGATIVE"
+    },
+    {
+      "pair": [33, 34],
+      "label": "RELATED_DIFFERENT_EVENT",
+      "event_definition": "Google DeepMind 2026-07-21 的 Gemini 系列发布，及其中单个模型的专门说明",
+      "shared_facts": [
+        "同一发布日：2026-07-21",
+        "同一发布者：Google DeepMind",
+        "共享产品名：Gemini 3.5 Flash Cyber"
+      ],
+      "differing_facts": [
+        "#33 是三个模型的合并发布公告（3.6 Flash / 3.5 Flash-Lite / 3.5 Flash Cyber）",
+        "#34 是其中单个模型 3.5 Flash Cyber 的专门说明"
+      ],
+      "publisher_independence": "不独立 —— 同一发布者。按硬规则，同 publisher 的多文档不得自动成组。",
+      "rationale": "同一来源对同一次发布的两篇文档。即便主题高度重叠，也不构成多来源事件；此对用于验证 same-publisher auto-group = 0。",
+      "difficulty": "HARD_NEGATIVE"
+    }
+  ],
+  "default_label": "UNRELATED",
+  "default_rationale": "其余全部 DOE × (OpenAI|DeepMind) 跨来源对：DOE 侧为电网调度、核能合作、油气资助、矿业安全、核能园区遴选等能源政策议题，与 OpenAI/DeepMind 侧的模型发布、科研工具、职场研究无共同事件。逐条核对标题与摘要后确认无重叠。",
+  "same_event_count": 0,
+  "same_event_note": "本数据集中**没有**真实的 SAME_EVENT 对。唯一的候选（#32 ↔ #220）经核对材料后判为 RELATED_DIFFERENT_EVENT。因此召回无法测量，只能测精度。"
+}

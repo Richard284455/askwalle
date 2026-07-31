@@ -14,7 +14,7 @@
  */
 import { readFileSync } from "fs";
 
-import type { ArticleFetchPolicy } from "@prisma/client";
+import type { ArticleFetchPolicy, SourceOriginRole } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 import { normalizeUrl } from "@/lib/content/url-normalize";
@@ -22,6 +22,10 @@ import { normalizeUrl } from "@/lib/content/url-normalize";
 type Tier = "OFFICIAL_PRIMARY" | "STRUCTURED_TECHNICAL" | "AUTHORITATIVE_MEDIA" | "COMMUNITY_SIGNAL";
 const TIERS: Tier[] = ["OFFICIAL_PRIMARY", "STRUCTURED_TECHNICAL", "AUTHORITATIVE_MEDIA", "COMMUNITY_SIGNAL"];
 const POLICIES: ArticleFetchPolicy[] = ["FEED_ONLY", "ON_DEMAND", "NEVER_FETCH", "ALWAYS_FETCH"];
+const ORIGIN_ROLES: SourceOriginRole[] = [
+  "ORIGINATING_AUTHORITY", "INDEPENDENT_AUTHORITY", "INDEPENDENT_REPORTING",
+  "SAME_ORIGIN_DIFFERENT_CHANNEL", "UNCLASSIFIED",
+];
 
 /** 定义文件的字段形状（snake_case，与人工维护的 JSON 一致） */
 type SourceDef = {
@@ -40,6 +44,11 @@ type SourceDef = {
   notes?: string;
   /** 正文抓取强度。缺省 FEED_ONLY —— 放宽必须在定义文件里显式写出来 */
   article_fetch_policy?: ArticleFetchPolicy;
+  /**
+   * 发布者相对于它所发布内容的身份关系。**不是** primary/secondary ——
+   * 那个判断相对于具体事件，留在 candidate review 层。
+   */
+  origin_role?: SourceOriginRole;
 };
 
 const APPLY = process.argv.includes("--apply");
@@ -77,6 +86,9 @@ function validate(defs: unknown): SourceDef[] {
     if (d.article_fetch_policy && !POLICIES.includes(d.article_fetch_policy)) {
       throw new Error(`${at}: article_fetch_policy 必须是 ${POLICIES.join(" / ")}`);
     }
+    if (d.origin_role && !ORIGIN_ROLES.includes(d.origin_role)) {
+      throw new Error(`${at}: origin_role 必须是 ${ORIGIN_ROLES.join(" / ")}`);
+    }
     return d;
   });
 }
@@ -109,6 +121,7 @@ async function main() {
       source_tier: def.source_tier,
       declared_format: def.adapter_type,
       article_fetch_policy: def.article_fetch_policy ?? "FEED_ONLY",
+      origin_role: def.origin_role ?? null,
       feed_url: def.feed_url ?? null,
       lang: def.language ?? "en",
       enabled: def.enabled ?? true,
@@ -145,6 +158,7 @@ async function main() {
   };
   console.log(`tier:    ${tally((d) => d.source_tier)}`);
   console.log(`policy:  ${tally((d) => d.article_fetch_policy ?? "FEED_ONLY")}`);
+  console.log(`role:    ${tally((d) => d.origin_role ?? "(未声明)")}`);
   console.log(`adapter: ${tally((d) => d.adapter_type)}`);
   console.log(`发布者:  ${tally((d) => d.publisher)}`);
   console.log(`校验:    external_key 无重复 ✅ · feed_url 无重复 ✅ · publisher/notes 均非空 ✅ · 全程未发网络请求 ✅`);
@@ -176,6 +190,7 @@ async function main() {
       declared_format: p.def.adapter_type,
       source_tier: p.def.source_tier,
       article_fetch_policy: p.def.article_fetch_policy ?? "FEED_ONLY",
+      origin_role: p.def.origin_role ?? null,
       feed_url: p.def.feed_url ?? null,
       homepage: p.def.homepage ?? null,
       publisher: p.def.publisher,

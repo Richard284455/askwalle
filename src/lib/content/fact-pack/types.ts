@@ -1,5 +1,6 @@
 import type {
   ContentSourceTier,
+  SourceOriginRole,
   FactCertainty,
   FactClaimScope,
   FactEvidenceOrigin,
@@ -90,6 +91,8 @@ export type PackInput = {
   publisher: string;
   sourceTier: ContentSourceTier | null;
   sourceExternalKey: string | null;
+  /** 发布者相对于内容的身份关系；未声明为 null */
+  sourceOriginRole: SourceOriginRole | null;
   feedTitle: string;
   feedUrl: string;
   feedAuthor: string | null;

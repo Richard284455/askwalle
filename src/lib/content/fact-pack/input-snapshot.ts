@@ -34,6 +34,7 @@ export function buildPackInput(args: {
     publisher: args.source.publisher,
     sourceTier: args.source.source_tier,
     sourceExternalKey: args.source.external_key,
+    sourceOriginRole: args.source.origin_role,
     feedTitle: args.item.title,
     feedUrl: args.item.url,
     feedAuthor: args.item.author,
