@@ -18,6 +18,7 @@ import {
   selectDueWebsites,
 } from "@/lib/website/tool-lifecycle";
 import { enrichSourceItem, selectEnrichableItems } from "@/lib/content/article-enrich";
+import { buildSourceFactPack } from "@/lib/content/fact-pack/builder";
 import { ingestSource, selectDueSources } from "@/lib/content/ingest";
 import {
   finalizeDirectRewriteBatch,
@@ -61,7 +62,8 @@ export type BulkJobType =
   | "import_excel"
   | "rewrite_direct"
   | "content_ingest"
-  | "content_article_enrich";
+  | "content_article_enrich"
+  | "content_fact_pack_build";
 
 const JOB_TYPES: BulkJobType[] = [
   "health_check",
@@ -71,6 +73,7 @@ const JOB_TYPES: BulkJobType[] = [
   "rewrite_direct",
   "content_ingest",
   "content_article_enrich",
+  "content_fact_pack_build",
 ];
 
 // 可达性探测：每块 20 条。单条约 1–3 秒（HEAD 短路居多），一块 ~1 分钟，
@@ -85,6 +88,7 @@ function chunkSizeFor(type: BulkJobType): number {
   if (type === "health_check") return HEALTH_CHECK_CHUNK_SIZE;
   if (type === "content_ingest") return CONTENT_INGEST_CHUNK_SIZE;
   if (type === "content_article_enrich") return ARTICLE_ENRICH_CHUNK_SIZE;
+  if (type === "content_fact_pack_build") return FACT_PACK_CHUNK_SIZE;
   return type === "rewrite_direct" ? REWRITE_CHUNK_SIZE : CHUNK_SIZE;
 }
 
@@ -451,6 +455,55 @@ export async function createArticleEnrichJob(
   });
   nudgeJobWorker();
   return { ok: true, jobId: job.id, total: itemIds.length };
+}
+
+// ---------------------------------------------------------------------------
+// Fact Pack 生成任务：创建
+// ---------------------------------------------------------------------------
+
+/** 纯库内计算，没有外部请求，块可以开大一些 */
+export const FACT_PACK_CHUNK_SIZE = 20;
+export const FACT_PACK_JOB_MAX = 200;
+
+/**
+ * 建 Fact Pack 生成任务。
+ *
+ * 与其它内容任务同一条纪律：**全局同时只允许一个未终结的 fact-pack 任务**。
+ * 并行只会让同一批条目彼此撞唯一约束，不会更快。
+ */
+export async function createFactPackJob(
+  sourceItemIds: number[]
+): Promise<{ ok: true; jobId: number; total: number } | { ok: false; message: string }> {
+  const running = await prisma.bulkJob.findFirst({
+    where: { type: "content_fact_pack_build", status: { notIn: TERMINAL_JOB_STATUSES } },
+    select: { id: true, status: true },
+  });
+  if (running) {
+    return { ok: false, message: `已有未终结的 Fact Pack 任务 #${running.id}（${running.status}），同时只允许一个` };
+  }
+  const ids = [...new Set(sourceItemIds.filter((id) => Number.isInteger(id) && id > 0))];
+  if (!ids.length) return { ok: false, message: "未指定任何来源条目" };
+  if (ids.length > FACT_PACK_JOB_MAX) {
+    return { ok: false, message: `单次最多 ${FACT_PACK_JOB_MAX} 条` };
+  }
+  const existing = await prisma.sourceItem.findMany({ where: { id: { in: ids } }, select: { id: true } });
+  if (existing.length !== ids.length) {
+    return { ok: false, message: `有 ${ids.length - existing.length} 个条目不存在` };
+  }
+
+  const job = await prisma.bulkJob.create({
+    data: {
+      type: "content_fact_pack_build",
+      status: "queued",
+      total_count: ids.length,
+      params: { sourceItemIds: ids, selectedAt: new Date().toISOString() } as Prisma.InputJsonValue,
+    },
+  });
+  await prisma.bulkJobItem.createMany({
+    data: ids.map((sourceItemId) => ({ job_id: job.id, source_item_id: sourceItemId })),
+  });
+  nudgeJobWorker();
+  return { ok: true, jobId: job.id, total: ids.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +978,37 @@ async function runChunkLocked(
             errorDomain: enriched.errorDomain,
             sourceAtFault: enriched.sourceAtFault,
             visibleTextLength: enriched.visibleTextLength,
+          } as Prisma.InputJsonValue;
+        }
+      } else if (job.type === "content_fact_pack_build") {
+        // 一个 item = 一条来源条目的一次 Fact Pack 生成。
+        //
+        // THIN 是「需要人看一眼」，不是执行失败 —— 记 skipped。
+        // 只有数据库或内部错误才是 failed。
+        if (!item.source_item_id) {
+          itemStatus = "failed";
+          itemError = "缺少 source_item_id";
+        } else {
+          const built = await buildSourceFactPack({ sourceItemId: item.source_item_id });
+          itemStatus =
+            built.status === "BUILT" || built.status === "EXISTING"
+              ? "success"
+              : built.status === "INFRA_ERROR"
+                ? "failed"
+                : "skipped";
+          itemError =
+            itemStatus === "success"
+              ? null
+              : `${built.status}${built.ineligibleReason ? `/${built.ineligibleReason}` : ""}: ${built.message ?? ""}`.slice(0, 300);
+          itemResult = {
+            sourceItemId: built.sourceItemId,
+            enrichmentRunId: built.enrichmentRunId,
+            factPackId: built.factPackId,
+            status: built.status,
+            ineligibleReason: built.ineligibleReason,
+            claimCount: built.claimCount,
+            evidenceCount: built.evidenceCount,
+            inputHash: built.inputHash,
           } as Prisma.InputJsonValue;
         }
       } else if (!item.website_id) {

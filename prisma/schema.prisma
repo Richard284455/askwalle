@@ -760,6 +760,8 @@ model SourceItem {
 
   enrichment_runs SourceItemEnrichmentRun[]
   job_items       BulkJobItem[]
+  fact_packs      SourceFactPack[]
+  fact_evidence   SourceFactEvidence[]
 
   /// 同一个源里同一篇文章只记一次。**跨源不去重** —— 「两个源都报道了同一件事」
   /// 是真实的溯源信息，合并成事件是下一阶段聚类要做的judgment，不在原始层预判。
@@ -835,7 +837,9 @@ model SourceItemEnrichmentRun {
   /// 只放跳转/SSRF/响应/提取元数据。**不存**任何页面正文或凭据。
   evidence_json Json?
 
-  created_at DateTime @default(now())
+  created_at    DateTime             @default(now())
+  fact_packs    SourceFactPack[]
+  fact_evidence SourceFactEvidence[]
 
   /// 同一个 job 里同一条条目只留一条有效 run —— worker 回收或重复驱动不写第二条
   @@unique([job_id, source_item_id])
@@ -844,4 +848,193 @@ model SourceItemEnrichmentRun {
   @@index([error_domain, started_at])
   @@index([content_hash])
   @@map("source_item_enrichment_runs")
+}
+
+// ---------------------------------------------------------------------------
+// Source Fact Pack（C5）
+//
+// 一个 pack = **一篇来源文档的一次确定提取结果**，不是一个事件。
+// 「一篇文章 = 一个事件」是这套系统最容易犯也最贵的错：同一件事会被多个来源
+// 各报一次，标题里的说法也远不等于已确认的事实。合并成事件是下一阶段聚类的
+// judgment，这里只负责把**能确定的东西**固定下来并留下证据链。
+//
+// 本阶段只生成确定性的文档事实与来源身份事实：标题、canonical、时间、作者、
+// 语言、质量、指纹、发布者。**不从正文推断**模型能力、产品功能、价格、性能、
+// 发布日期或行业影响 —— 那些属于后续的语义 claim extraction。
+// ---------------------------------------------------------------------------
+
+enum FactPackStatus {
+  READY // 自动生成完成，等待人工处置
+  APPROVED // 人工确认可用（本阶段不自动进入）
+  REJECTED // 人工否决
+  SUPERSEDED // 同一条目出现了更新的可用提取结果
+}
+
+enum FactClaimScope {
+  DOCUMENT // 关于这篇文档本身
+  SOURCE // 关于发布这篇文档的来源
+  ENTITY // 预留：实体
+  EVENT // 预留：事件
+  PRODUCT // 预留：产品
+}
+
+enum FactObjectType {
+  TEXT
+  NUMBER
+  BOOLEAN
+  DATETIME
+  URL
+  JSON
+}
+
+/// 这条断言的确定程度。本阶段只生成 OBSERVED —— 我们**直接观察到**的字段，
+/// 不是来源主张的内容，更不是推断。
+enum FactCertainty {
+  OBSERVED // 我们自己观察到的（HTTP 响应、页面元数据、配置）
+  SOURCE_ASSERTED // 来源自己声称的
+  INFERRED // 推断得出
+  DISPUTED // 存在冲突证据
+  UNKNOWN
+}
+
+enum FactUsage {
+  CITABLE // 可直接引用
+  CONTEXT_ONLY // 只作上下文，不单独成据
+  REQUIRES_REVIEW // 需人工确认
+  DO_NOT_USE
+}
+
+/// 证据来自哪一层。ARTICLE_TEXT 本阶段禁止使用 —— 正文断言属于语义抽取阶段。
+enum FactEvidenceOrigin {
+  SOURCE_CONFIG
+  FEED
+  JSON_LD
+  OPEN_GRAPH
+  META
+  HTML_TITLE
+  CANONICAL_LINK
+  PAGE
+  HEADING
+  ARTICLE_TEXT
+}
+
+model SourceFactPack {
+  id                Int                     @id @default(autoincrement())
+  source_item_id    Int
+  source_item       SourceItem              @relation(fields: [source_item_id], references: [id])
+  enrichment_run_id Int
+  enrichment_run    SourceItemEnrichmentRun @relation(fields: [enrichment_run_id], references: [id])
+
+  /// 提取器版本。规则变了必须显式升版，不得静默混用两代结果
+  extractor_version String
+  /// 规范化输入的指纹：同输入 → 同 pack，不重复生成
+  input_hash        String
+  status            FactPackStatus @default(READY)
+  /// 通过了哪条资格路径（本阶段只有 AUTO_SUBSTANTIAL）
+  eligibility_basis String
+
+  // ── 来源身份快照 ──
+  // 快照而不是外键读取：ContentSource 的配置后续会变，但历史 pack 的来源身份
+  // 必须停在生成那一刻。否则改一次配置，所有历史证据的含义都跟着变了。
+  publisher_snapshot           String
+  source_tier_snapshot         ContentSourceTier?
+  source_external_key_snapshot String?
+
+  // ── 取回身份快照 ──
+  requested_url_snapshot String
+  final_url_snapshot     String?
+  canonical_url_snapshot String?
+
+  // ── 文档字段快照 ──
+  document_title_snapshot        String?
+  document_author_snapshot       String?
+  document_published_at_snapshot DateTime?
+  language_snapshot              String?
+
+  content_quality_snapshot     String
+  content_hash_snapshot        String?
+  visible_text_length_snapshot Int?
+  /// 实际取回这篇文档的时刻（enrichment run 的 started_at）
+  captured_at                  DateTime
+
+  claim_count    Int @default(0)
+  evidence_count Int @default(0)
+
+  superseded_at DateTime?
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  claims SourceFactClaim[]
+
+  /// 同一次提取 + 同一个提取器版本只允许一个 pack
+  @@unique([enrichment_run_id, extractor_version])
+  @@index([source_item_id, created_at])
+  @@index([status, created_at])
+  @@index([content_hash_snapshot])
+  @@map("source_fact_packs")
+}
+
+model SourceFactClaim {
+  id           Int            @id @default(autoincrement())
+  fact_pack_id Int
+  fact_pack    SourceFactPack @relation(fields: [fact_pack_id], references: [id])
+
+  /// 稳定的断言键，如 `document.title`。同一个 pack 里唯一
+  claim_key   String
+  claim_scope FactClaimScope
+  claim_type  String
+
+  subject     String
+  predicate   String
+  object_type FactObjectType
+
+  // 按 object_type **恰好一个**有值。代码与数据库 CHECK 双重保证
+  object_text     String?
+  object_number   Float?
+  object_boolean  Boolean?
+  object_datetime DateTime?
+  object_url      String?
+  object_json     Json?
+
+  certainty       FactCertainty
+  usage           FactUsage
+  confidence      Float?
+  /// 厂商对自家产品的说法仍是厂商说法，不因为来自官方来源就变成独立验证
+  is_vendor_claim Boolean       @default(false)
+
+  created_at DateTime @default(now())
+
+  evidence SourceFactEvidence[]
+
+  @@unique([fact_pack_id, claim_key])
+  @@index([fact_pack_id, claim_scope])
+  @@index([claim_type])
+  @@map("source_fact_claims")
+}
+
+model SourceFactEvidence {
+  id                Int                     @id @default(autoincrement())
+  claim_id          Int
+  claim             SourceFactClaim         @relation(fields: [claim_id], references: [id])
+  /// 冗余外键：证据必须能独立追溯到条目与那一次具体的取回
+  source_item_id    Int
+  source_item       SourceItem              @relation(fields: [source_item_id], references: [id])
+  enrichment_run_id Int
+  enrichment_run    SourceItemEnrichmentRun @relation(fields: [enrichment_run_id], references: [id])
+
+  origin       FactEvidenceOrigin
+  /// 值在证据里的位置，如 `metadata_json.publishedAtSource`
+  field_path   String
+  /// 至多 500 字符。元数据类证据可以没有 excerpt，但必须有 field_path
+  excerpt      String?
+  excerpt_hash String?
+  source_url   String?
+  captured_at  DateTime
+  created_at   DateTime           @default(now())
+
+  @@unique([claim_id, origin, field_path, excerpt_hash])
+  @@index([claim_id])
+  @@index([source_item_id, captured_at])
+  @@index([enrichment_run_id])
+  @@map("source_fact_evidence")
 }
