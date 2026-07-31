@@ -31,7 +31,9 @@
     "backfill:acquisition": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/backfill-acquisition-derived.ts",
     "test:acquisition-integrity": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/acquisition-integrity-tests.ts",
     "factpacks:build": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/build-fact-packs.ts",
-    "test:factpack": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/fact-pack-tests.ts"
+    "test:factpack": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/fact-pack-tests.ts",
+    "events:candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/discover-event-candidates.ts",
+    "test:event-candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/event-candidate-tests.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

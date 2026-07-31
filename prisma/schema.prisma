@@ -964,7 +964,11 @@ model SourceFactPack {
   created_at    DateTime  @default(now())
   updated_at    DateTime  @updatedAt
 
-  claims SourceFactClaim[]
+  claims              SourceFactClaim[]
+  edges_left          EventSimilarityEdge[]         @relation("EdgeLeft")
+  edges_right         EventSimilarityEdge[]         @relation("EdgeRight")
+  anchored_candidates EventClusterCandidate[]       @relation("CandidateAnchor")
+  candidate_members   EventClusterCandidateMember[]
 
   /// 同一次提取 + 同一个提取器版本只允许一个 pack
   @@unique([enrichment_run_id, extractor_version])
@@ -1037,4 +1041,162 @@ model SourceFactEvidence {
   @@index([source_item_id, captured_at])
   @@index([enrichment_run_id])
   @@map("source_fact_evidence")
+}
+
+// ---------------------------------------------------------------------------
+// 事件候选发现（C6.1）
+//
+// 这里产出的**只是候选**，不是「这两篇讲的是同一件事」的结论。
+//
+// 三条最容易被绕过、也最贵的边界：
+//   1. 标题相似只能产生候选。两家公司同一天发同名功能是常态，
+//      靠标题自动合并会造出一个现实中不存在的「事件」。
+//   2. 订阅日期只是粗时间窗口。它是订阅的说法，不是事件发生时间。
+//   3. 落地域不代表发布者。DeepMind 的条目会跳到 blog.google 与
+//      cloud.google.com，用落地域反推来源身份会直接判错。
+//
+// 传递性合并单独禁止：A≈B、B≈C 但 A≉C 时，不得因为 B 连着两边就把三者
+// 并成一个事件。只有「指向同一份文档」这种确定关系才允许求连通分量。
+// ---------------------------------------------------------------------------
+
+enum ClusteringRunStatus {
+  RUNNING
+  COMPLETED
+  COMPLETED_WITH_WARNINGS
+  FAILED
+}
+
+enum EdgeClassification {
+  EXACT_DOCUMENT_MATCH // 两份 pack 指向同一份文档
+  STRONG_REVIEW_CANDIDATE // 强候选，仍需人工确认
+  WEAK_REVIEW_CANDIDATE // 弱候选
+  NO_MATCH // 不持久化
+}
+
+enum EdgeReviewStatus {
+  PENDING
+  APPROVED_SAME_EVENT
+  REJECTED_DIFFERENT_EVENT
+  UNCLEAR
+}
+
+enum ClusterCandidateType {
+  SINGLETON
+  EXACT_DOCUMENT_GROUP
+}
+
+enum ClusterCandidateStatus {
+  PROPOSED
+  APPROVED
+  REJECTED
+  SUPERSEDED
+}
+
+model EventClusteringRun {
+  id           Int                 @id @default(autoincrement())
+  rule_version String
+  /// 规范化输入的指纹：同一批 pack + 同一套规则 → 同一次 run
+  input_hash   String
+  status       ClusteringRunStatus @default(RUNNING)
+
+  input_pack_count     Int @default(0)
+  eligible_pack_count  Int @default(0)
+  pair_count           Int @default(0)
+  persisted_edge_count Int @default(0)
+  exact_group_count    Int @default(0)
+  singleton_count      Int @default(0)
+
+  started_at  DateTime  @default(now())
+  finished_at DateTime?
+  result_json Json?
+  created_at  DateTime  @default(now())
+
+  edges      EventSimilarityEdge[]
+  candidates EventClusterCandidate[]
+
+  @@unique([rule_version, input_hash])
+  @@index([status, started_at])
+  @@map("event_clustering_runs")
+}
+
+model EventSimilarityEdge {
+  id                Int                @id @default(autoincrement())
+  clustering_run_id Int
+  clustering_run    EventClusteringRun @relation(fields: [clustering_run_id], references: [id])
+
+  /// 恒有 left < right —— 传入顺序不得改变 hash 或分数
+  left_fact_pack_id  Int
+  left_fact_pack     SourceFactPack @relation("EdgeLeft", fields: [left_fact_pack_id], references: [id])
+  right_fact_pack_id Int
+  right_fact_pack    SourceFactPack @relation("EdgeRight", fields: [right_fact_pack_id], references: [id])
+
+  rule_version      String
+  pair_hash         String
+  score             Int
+  classification    EdgeClassification
+  reason_codes_json Json?
+  features_json     Json?
+
+  review_status EdgeReviewStatus @default(PENDING)
+  reviewed_by   String?
+  reviewed_at   DateTime?
+  review_notes  String?
+
+  created_at DateTime @default(now())
+
+  @@unique([rule_version, left_fact_pack_id, right_fact_pack_id])
+  @@index([classification, score])
+  @@index([review_status, created_at])
+  @@map("event_similarity_edges")
+}
+
+model EventClusterCandidate {
+  id                Int                @id @default(autoincrement())
+  clustering_run_id Int
+  clustering_run    EventClusteringRun @relation(fields: [clustering_run_id], references: [id])
+
+  /// 稳定键：同一批成员在同一规则版本下恒得同一个键
+  candidate_key  String
+  candidate_type ClusterCandidateType
+  status         ClusterCandidateStatus @default(PROPOSED)
+
+  anchor_fact_pack_id    Int
+  anchor_fact_pack       SourceFactPack @relation("CandidateAnchor", fields: [anchor_fact_pack_id], references: [id])
+  /// 展示用标题快照。**只是展示**，不是事件事实
+  display_title_snapshot String?
+  event_time_start       DateTime?
+  event_time_end         DateTime?
+  pack_count             Int            @default(1)
+  publisher_count        Int            @default(1)
+
+  rule_version      String
+  reason_codes_json Json?
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
+
+  members EventClusterCandidateMember[]
+
+  @@unique([rule_version, candidate_key])
+  @@index([status, created_at])
+  @@index([candidate_type, created_at])
+  @@map("event_cluster_candidates")
+}
+
+model EventClusterCandidateMember {
+  id           Int                   @id @default(autoincrement())
+  candidate_id Int
+  candidate    EventClusterCandidate @relation(fields: [candidate_id], references: [id])
+  fact_pack_id Int
+  fact_pack    SourceFactPack        @relation(fields: [fact_pack_id], references: [id])
+
+  is_anchor        Boolean @default(false)
+  /// 凭什么进这个候选：EXACT_DOCUMENT / SINGLETON。fuzzy edge **不**产生成员
+  membership_basis String
+  membership_score Int?
+
+  created_at DateTime @default(now())
+
+  @@unique([candidate_id, fact_pack_id])
+  @@index([fact_pack_id])
+  @@map("event_cluster_candidate_members")
 }
