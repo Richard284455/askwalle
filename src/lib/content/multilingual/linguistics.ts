@@ -101,6 +101,9 @@ export function stripDatesAndModels(text: string): string {
   for (const m of modelTokens(t)) t = t.split(m).join(" ");
   const monthAlt = Object.keys(MONTH_LOOKUP).sort((a, b) => b.length - a.length).join("|");
   t = t
+    // 先剥完整 ISO 时间戳，否则 2026-08-01T10:48:20.663Z 会被拆成 01/08/10/48…
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ][\d:]{5,8}(?:\.\d+)?Z?\b/g, " ")
+    .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\b/g, " ")
     .replace(/\b\d{4}-\d{1,2}-\d{1,2}\b/g, " ")
     .replace(/(?:\d{4}\s*年)?\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*[日号])?/g, " ")
     .replace(/\d{4}\s*年/g, " ")

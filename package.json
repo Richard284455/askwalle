@@ -41,7 +41,8 @@
     "test:aihot": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-tests.ts",
     "aihot:verify": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-canary-verify.ts",
     "aihot:publish": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-publish.ts",
-    "test:publish": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/publication-tests.ts"
+    "test:publish": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/publication-tests.ts",
+    "hot:canary": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/hot-topic-canary.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

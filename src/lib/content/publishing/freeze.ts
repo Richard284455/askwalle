@@ -2,6 +2,8 @@ import { Prisma, type DraftLanguage } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 
+import { ML_GENERATION_VERSION } from "../aihot/types";
+
 import { LOCALES, slugify } from "./types";
 
 /**
@@ -29,12 +31,22 @@ export type FreezeResult = {
  * 只接受**全部四种语言都存在且 QA 通过**的单元 —— 半套语言冻进去，
  * 后面 hreflang 必然指向不存在的页面。
  */
-export async function freezeUnit(unitKey: string, opts: { dryRun?: boolean } = {}): Promise<FreezeResult> {
+export async function freezeUnit(
+  unitKey: string, opts: { dryRun?: boolean; generationVersion?: string } = {}
+): Promise<FreezeResult> {
   const base: FreezeResult = {
     unitKey, familyId: null, slug: null, status: "FAILED", created: [], unchanged: [], message: null,
   };
 
-  const drafts = await prisma.multilingualDraft.findMany({ where: { unit_key: unitKey } });
+  /*
+   * 必须限定 generation_version。
+   * 同一 unit_key 下可能并存两代产物，不限定就会把不同规则下生成的
+   * 四种语言混着冻成一个版本 —— 那份 revision 谁也说不清是哪套规则的产物。
+   */
+  const version = opts.generationVersion ?? ML_GENERATION_VERSION;
+  const drafts = await prisma.multilingualDraft.findMany({
+    where: { unit_key: unitKey, generation_version: version },
+  });
   if (!drafts.length) return { ...base, message: "找不到该单元的草稿" };
 
   const byLocale = new Map<DraftLanguage, (typeof drafts)[number]>();
@@ -103,6 +115,7 @@ export async function freezeUnit(unitKey: string, opts: { dryRun?: boolean } = {
       original_source_name: master.original_source_name,
       original_source_url: master.original_source_url,
       category_slug: master.category_slug,
+      hot_topic_mode: master.hot_topic_mode,
       source_published_at: sourcePublishedAt,
     },
     // slug 一旦发布就不能改（改了等于换 URL），所以更新时**不动** slug
@@ -111,6 +124,8 @@ export async function freezeUnit(unitKey: string, opts: { dryRun?: boolean } = {
       attribution_url: master.provider_attribution_url,
       original_source_url: master.original_source_url,
       source_published_at: sourcePublishedAt,
+      // 素材丰富度可能随快照变化，模式要跟着更新
+      hot_topic_mode: master.hot_topic_mode,
     },
   });
 

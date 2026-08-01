@@ -1,4 +1,4 @@
-import type { DraftLanguage } from "@prisma/client";
+import type { DraftLanguage, HotTopicBriefMode } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 
@@ -26,6 +26,8 @@ export type PublishedPage = {
   sections: { label: string; body: string }[] | null;
   contentForm: string;
   categorySlug: string | null;
+  /** 仅热点简报有值。页面据此明示「这是榜单信号，不是完整报道」 */
+  hotTopicMode: HotTopicBriefMode | null;
   /** 归因 */
   attributionName: string;
   attributionUrl: string;
@@ -116,6 +118,7 @@ async function loadByPath(locale: DraftLanguage, path: string): Promise<Publishe
     sections,
     contentForm: family.content_form,
     categorySlug: family.category_slug,
+    hotTopicMode: family.hot_topic_mode,
     attributionName: family.attribution_name,
     attributionUrl: family.attribution_url,
     originalSourceName: family.original_source_name,

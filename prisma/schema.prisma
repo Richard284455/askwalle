@@ -1554,6 +1554,8 @@ model MultilingualDraft {
   original_source_name      String?
   original_source_url       String?
   category_slug             String?
+  /// 仅热点简报使用；其余体裁为 null
+  hot_topic_mode            HotTopicBriefMode?
 
   // ── 生成产物 ──
   headline      String?
@@ -1601,6 +1603,18 @@ model MultilingualDraft {
 // 重新生成必须产生新的 revision，不得静默覆盖已审核过的稿子 ——
 // 否则「审核通过的到底是哪一版」这个问题永远答不清楚。
 // ---------------------------------------------------------------------------
+
+/// 热点简报的两种形态，由**素材丰富度**决定，不由「重不重要」决定。
+///
+/// AI HOT 的 /hot-topics 常常只给标题、排名、来源计数与来源名单。
+/// 产品结论是：素材少照样出简报，但必须**如实说明它是榜单信号**，
+/// 而不是把它写成一篇完整报道 —— 后者只能靠编。
+enum HotTopicBriefMode {
+  /// 只有标题、排名、来源数量/名称、更新时间
+  SIGNAL
+  /// 另有 API 摘要或可精确关联的已入库精选
+  ENRICHED
+}
 
 enum PublishStatus {
   DRAFTED
@@ -1661,6 +1675,8 @@ model ArticleFamily {
   original_source_url  String?
   category_slug        String?
   source_published_at  DateTime?
+  /// 仅热点简报使用；其余体裁为 null
+  hot_topic_mode       HotTopicBriefMode?
 
   translations ArticleTranslation[]
 

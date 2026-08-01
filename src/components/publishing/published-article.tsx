@@ -16,30 +16,39 @@ import { LOCALE_SEGMENT, LOCALES } from "@/lib/content/publishing/types";
 const UI: Record<string, {
   discoveredVia: string; originalSource: string; sourcePublished: string;
   sitePublished: string; readOn: string; languages: string; disclaimer: string;
+  signalBadge: string; signalNotice: string;
 }> = {
   EN_US: {
     discoveredVia: "Discovered via", originalSource: "Original source",
     sourcePublished: "Source published", sitePublished: "Published on AskWalle",
     readOn: "Read on", languages: "Read in other languages",
     disclaimer: "This article was written by AskWalle based on what the source published. Facts are as stated by the source; we do not independently verify them.",
+    signalBadge: "Real-time trending signal",
+    signalNotice: "This is a trending-signal brief, not a full news report. It reflects only what the AI HOT listing provides — the topic title, how many sources are tracking it, and which sources those are. It does not describe event details, and none have been added.",
   },
   ES_ES: {
     discoveredVia: "Descubierto vía", originalSource: "Fuente original",
     sourcePublished: "Publicado por la fuente", sitePublished: "Publicado en AskWalle",
     readOn: "Leer en", languages: "Leer en otros idiomas",
     disclaimer: "Este artículo fue redactado por AskWalle a partir de lo publicado por la fuente. Los hechos son los que declara la fuente; no los verificamos de forma independiente.",
+    signalBadge: "Señal de tendencia en tiempo real",
+    signalNotice: "Este es un resumen de señal de tendencia, no un reportaje completo. Refleja únicamente lo que ofrece el listado de AI HOT: el título del tema, cuántas fuentes lo siguen y cuáles son. No describe detalles del evento ni se ha añadido ninguno.",
   },
   PT_BR: {
     discoveredVia: "Descoberto via", originalSource: "Fonte original",
     sourcePublished: "Publicado pela fonte", sitePublished: "Publicado no AskWalle",
     readOn: "Ler em", languages: "Ler em outros idiomas",
     disclaimer: "Este artigo foi escrito pela AskWalle com base no que a fonte publicou. Os fatos são os declarados pela fonte; não os verificamos de forma independente.",
+    signalBadge: "Sinal de tendência em tempo real",
+    signalNotice: "Este é um resumo de sinal de tendência, não uma reportagem completa. Reflete apenas o que a listagem do AI HOT fornece: o título do tema, quantas fontes o acompanham e quais são. Não descreve detalhes do evento, e nenhum foi acrescentado.",
   },
   JA_JP: {
     discoveredVia: "発見元", originalSource: "一次情報源",
     sourcePublished: "情報源の公開日", sitePublished: "AskWalle 掲載日",
     readOn: "元記事を読む", languages: "他の言語で読む",
     disclaimer: "本記事は情報源が公開した内容に基づき AskWalle が独自に執筆しました。事実関係は情報源の記載に依拠しており、当サイトによる独自検証は行っていません。",
+    signalBadge: "リアルタイム・トレンドシグナル",
+    signalNotice: "本記事はトレンドシグナルの要約であり、完全な報道記事ではありません。AI HOT の掲載情報（話題のタイトル、追跡している情報源の数とその名称）のみを反映しています。出来事の詳細は記載しておらず、補足も行っていません。",
   },
 };
 
@@ -58,9 +67,17 @@ export function PublishedArticle({ page }: { page: PublishedPage }) {
 
   return (
     <article className="mx-auto w-full max-w-3xl px-4 py-10 sm:px-6 lg:py-14">
-      {page.categorySlug ? (
-        <p className="text-sm font-medium uppercase tracking-wide text-primary">{page.categorySlug}</p>
-      ) : null}
+      <div className="flex flex-wrap items-center gap-2">
+        {page.categorySlug ? (
+          <p className="text-sm font-medium uppercase tracking-wide text-primary">{page.categorySlug}</p>
+        ) : null}
+        {/* 热点必须一眼看出是榜单信号，不能被当成完整报道 */}
+        {page.hotTopicMode === "SIGNAL" ? (
+          <span className="rounded-full border border-amber-400/60 bg-amber-50 px-2.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+            {t.signalBadge}
+          </span>
+        ) : null}
+      </div>
 
       <h1 className="mt-2 text-3xl font-semibold leading-tight text-slate-950 dark:text-foreground sm:text-4xl">
         {page.headline}
@@ -129,7 +146,7 @@ export function PublishedArticle({ page }: { page: PublishedPage }) {
       )}
 
       <p className="mt-10 rounded-lg border border-border/70 bg-muted/40 p-4 text-sm leading-6 text-slate-600 dark:text-muted-foreground">
-        {t.disclaimer}
+        {page.hotTopicMode === "SIGNAL" ? t.signalNotice : t.disclaimer}
       </p>
 
       {page.alternates.length > 1 ? (

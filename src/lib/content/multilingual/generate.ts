@@ -5,10 +5,11 @@ import { resolveProviderRuntime, type ProviderKey } from "@/lib/website/ai-provi
 
 import { ML_GENERATION_VERSION } from "../aihot/types";
 
+import { checkHotTopicBrief } from "./hot-topic-qa";
 import { checkMasterFaithfulness, checkTranslationDrift } from "./qa";
 import { assembleDaily, assembleHotTopic, assembleSelected, computeInputHash } from "./unit-input";
 import {
-  bodyLimitFor, LANGUAGE_LABEL, MASTER_LANGUAGE, TRANSLATION_LANGUAGES,
+  bodyLimitFor, HOT_TOPIC_WORD_BAND, LANGUAGE_LABEL, MASTER_LANGUAGE, TRANSLATION_LANGUAGES,
   type ContentUnitInput, type DraftContent, type MlIssue,
 } from "./types";
 
@@ -50,7 +51,9 @@ export type GenerateUnitResult = {
 // ── 提示词 ────────────────────────────────────────────────────────────────
 
 function factLines(input: ContentUnitInput): string {
-  return input.facts.length ? input.facts.map((f) => `- ${f.label}：${f.value}`).join("\n") : "（无）";
+  return input.facts.length
+    ? input.facts.map((f) => `- ${f.label}：${f.value}${f.volatile ? "（会随时间变化，引用时须加时间限定）" : ""}`).join("\n")
+    : "（无）";
 }
 
 function sectionLines(input: ContentUnitInput): string {
@@ -64,14 +67,49 @@ function sectionLines(input: ContentUnitInput): string {
 const FORM_BRIEF: Record<string, string> = {
   MULTILINGUAL_NEWS_BRIEF:
     "写成一条独立的英文短资讯：说清楚发生了什么、涉及谁、有什么可核对的细节。",
-  HOT_TOPIC_BRIEF:
-    `写成一条英文热点简报。可按「这个热点是什么 / 目前有哪些动态 / 为什么受到关注 / 相关精选资讯」组织，
-**但任何一节没有材料支撑就直接略去那一节** —— 宁可只写两句，也不要为了凑结构编内容。
-特别注意：来源数与信号条数是 AI HOT 的统计口径，只能如实转述，不得据此推断影响力、市场反应或趋势。`,
+  HOT_TOPIC_BRIEF: "",
   DAILY_BRIEF:
     `写成一期英文每日简报。**必须保留输入栏目的原始顺序与数量**，但用你自己的语言和版式重新编排，
 不得逐条照搬摘要原文。每个栏目下用一到两句话概括该栏目的条目。`,
 };
+
+/**
+ * 热点简报的体裁说明，按素材丰富度分两套。
+ *
+ * SIGNAL 的关键不是「写短」，而是**如实说明这是榜单信号**。
+ * 一篇没有材料却装成完整报道的简报，比一篇坦白说「信息就这么多」的简报危险得多。
+ */
+function hotTopicBrief(input: ContentUnitInput): string {
+  const ht = input.hotTopic!;
+  if (ht.mode === "SIGNAL") {
+    const band = HOT_TOPIC_WORD_BAND.SIGNAL;
+    return `写成一条英文**实时热点信号简报**（${band.min}–${band.max} 词）。
+
+可用材料**只有**：热点标题、榜单名次、来源数量、来源名称、AI HOT 抓取时间、AI HOT 链接。
+按这个顺序组织：
+  1. 这个热点是什么（只能复述标题所表达的内容，不得展开）
+  2. AI HOT 当前显示的关注度（名次、来源数、信号条数，如实引用）。
+     **名次必须写成「截至某个时间点」的状态**（例如 "as of <抓取日期>, ranked N"），
+     不能写成固定属性 —— 榜单名次每天都在变，不加时间限定的名次很快就会变成假话。
+  3. 哪些来源正在关注（引用来源名单里的名字）
+  4. 当前可确认的信息边界（明确说明可获取的信息仅限于此）
+
+**必须**让读者看出这是榜单信号而不是完整报道。可以直接写类似：
+  "AI HOT currently lists this as a trending topic."
+  "The topic is being tracked across N sources."
+  "The available feed does not include further event details."
+
+**严禁**为了凑篇幅补充：技术细节、商业影响、事件背景、发布时间、产品参数、
+具体事件进展，以及任何 API 没有给出的结论。写不满下限就说明材料确实少 ——
+那就照实少写，不要编。`;
+  }
+  const band = HOT_TOPIC_WORD_BAND.ENRICHED;
+  return `写成一条英文热点简报（${band.min}–${band.max} 词）。
+
+除标题与榜单计数外，本条还有 AI HOT 提供的摘要或可精确关联的精选资讯，可以使用它们。
+仍然**不得**引入这些材料之外的任何事实，不得推断影响力、市场反应或趋势，
+也不得把「上榜」写成「事件已经发生」。计数与名次只能如实引用。`;
+}
 
 export function buildMasterPrompt(input: ContentUnitInput, retryIssues?: MlIssue[]): string {
   const limit = bodyLimitFor(input);
@@ -96,7 +134,7 @@ export function buildMasterPrompt(input: ContentUnitInput, retryIssues?: MlIssue
 8. 输出必须是英文。${retry}
 
 ═══ 体裁 ═══
-${FORM_BRIEF[input.contentForm] ?? ""}
+${input.contentForm === "HOT_TOPIC_BRIEF" && input.hotTopic ? hotTopicBrief(input) : (FORM_BRIEF[input.contentForm] ?? "")}
 
 ═══ AI HOT 材料 ═══
 标题：${input.title}
@@ -242,6 +280,7 @@ async function saveDraft(args: {
     original_source_name: input.originalSourceName,
     original_source_url: input.originalSourceUrl,
     category_slug: input.categorySlug,
+    hot_topic_mode: input.hotTopic?.mode ?? null,
     headline: content?.headline ?? null,
     summary: content?.summary ?? null,
     body: content?.body ?? null,
@@ -333,7 +372,10 @@ export async function generateUnit(args: GenerateUnitArgs): Promise<GenerateUnit
     masterModel = called.model;
 
     const qa = checkMasterFaithfulness(parsed, input);
-    const issues = [...qa.issues, ...checkDailySections(parsed, input)];
+    // 热点另跑专属检查：计数、名单、名次、时间语义、信号自述
+    const hotIssues = input.contentForm === "HOT_TOPIC_BRIEF" && input.hotTopic
+      ? checkHotTopicBrief(parsed, input).issues : [];
+    const issues = [...qa.issues, ...checkDailySections(parsed, input), ...hotIssues];
     master = parsed;
     masterIssues = issues;
     masterFailure = null;

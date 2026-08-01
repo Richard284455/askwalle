@@ -15,7 +15,15 @@
  */
 import type { DraftLanguage } from "@prisma/client";
 
-import { assessHotTopic, HOT_TOPIC_INSUFFICIENT } from "@/lib/content/publishing/eligibility";
+import {
+  hotTopicFactFingerprint, hotTopicUnitKey, loadAllLatestMaterial, loadHotTopicMaterial,
+} from "@/lib/content/publishing/eligibility";
+import { checkHotTopicBrief } from "@/lib/content/multilingual/hot-topic-qa";
+import {
+  HOT_TOPIC_FORBIDDEN_CODES, HOT_TOPIC_WORD_BAND,
+  type ContentUnitInput, type DraftContent,
+} from "@/lib/content/multilingual/types";
+import { listTrendingCards } from "@/lib/content/publishing/trending";
 import { publishedMetadata } from "@/lib/content/publishing/metadata";
 import { preflight, publicationIdempotencyKey, publishTranslation } from "@/lib/content/publishing/publish";
 import {
@@ -153,7 +161,7 @@ async function main() {
     locale, path: publicPath({ locale, contentForm: "MULTILINGUAL_NEWS_BRIEF", slug: "s" }),
     canonical: absoluteUrl(publicPath({ locale, contentForm: "MULTILINGUAL_NEWS_BRIEF", slug: "s" })),
     headline: "H", summary: "S", body: "B", sections: null, contentForm: "MULTILINGUAL_NEWS_BRIEF",
-    categorySlug: "Models", attributionName: "AI HOT", attributionUrl: "https://aihot.virxact.com/items/x",
+    categorySlug: "Models", hotTopicMode: null, attributionName: "AI HOT", attributionUrl: "https://aihot.virxact.com/items/x",
     originalSourceName: "Src", originalSourceUrl: "https://example.com/a",
     sourcePublishedAt: new Date("2026-08-01"), sitePublishedAt: new Date("2026-08-01"),
     alternates: published.map((l) => ({
@@ -347,22 +355,124 @@ async function main() {
     check("H8", "非法日期的日报路径直接返回 null", (await getDailyPage("EN_US", "not-a-date")) === null);
   }
 
-  section("I  热点发布门槛");
+  section("I  热点：不再有信息量门禁");
 
   {
-    const snaps = await prisma.aihotHotTopicSnapshot.findMany({ take: 5, select: { id: true } });
-    if (snaps.length) {
-      const results = await Promise.all(snaps.map((s) => assessHotTopic(s.id)));
-      check("I1", "热点评估返回明确结论", results.every((r) => typeof r.publishable === "boolean"));
-      const blocked = results.filter((r) => !r.publishable);
-      check("I2", "素材只有标题与计数时被拦下并给出专属原因码",
-        blocked.every((r) => r.reason === HOT_TOPIC_INSUFFICIENT), `拦下 ${blocked.length}/${results.length}`);
-      check("I3", "评估附带可复核的证据", results.every((r) => r.evidence.snapshotId > 0));
+    const all = await loadAllLatestMaterial();
+    check("I1", "每个 topic 都能载入素材（不因信息少而失败）", all.length > 0, `${all.length} 个热点`);
+    check("I2", "每个热点都被判定为 SIGNAL 或 ENRICHED",
+      all.every((m) => m.mode === "SIGNAL" || m.mode === "ENRICHED"),
+      all.map((m) => m.mode).join(","));
+    check("I3", "只有标题与计数时判为 SIGNAL 而不是拒绝",
+      all.filter((m) => !m.apiSummary && m.relatedItems.length === 0).every((m) => m.mode === "SIGNAL"));
+    check("I4", "有摘要或关联精选时判为 ENRICHED",
+      all.filter((m) => m.apiSummary || m.relatedItems.length > 0).every((m) => m.mode === "ENRICHED"));
+    check("I5", "身份键按 topic 而非按快照（同一热点始终同一单元）",
+      all.every((m) => hotTopicUnitKey(m.topicId) === `topic:${m.topicId}`)
+      && !hotTopicUnitKey("abc").includes(":", 6 + 3));
+    check("I6", "不存在的快照返回 null（数据缺陷，不是信息量判断）",
+      (await loadHotTopicMaterial(-1)) === null);
+  }
+
+  section("K  热点简报 QA");
+
+  {
+    const material = await loadAllLatestMaterial();
+    const m = material[0];
+    if (!m) {
+      check("K0", "（库中无热点，跳过热点 QA 测试）", true);
     } else {
-      check("I1", "（库中无热点快照，跳过）", true);
+      const base: ContentUnitInput = {
+        contentKind: "HOT_TOPIC", contentForm: "HOT_TOPIC_BRIEF",
+        unitKey: hotTopicUnitKey(m.topicId),
+        selectedItemId: null, hotTopicSnapshotId: m.snapshotId, dailyReportId: null,
+        title: m.title, sourceText: m.title, sections: [],
+        categorySlug: "Trending", sourceSnapshotHash: m.snapshotHash,
+        attributionName: "AI HOT", attributionUrl: m.aihotUrl,
+        originalSourceName: m.representativeSourceName, originalSourceUrl: m.originalUrl,
+        publishedAt: m.latestAt,
+        facts: [{ label: "涉及来源数", value: String(m.sourceCount) }],
+        hotTopic: {
+          mode: "SIGNAL", topicId: m.topicId, rank: m.rank,
+          sourceCount: m.sourceCount, signalCount: m.signalCount,
+          sourceNames: m.sourceNames, capturedAt: m.capturedAt, latestAt: m.latestAt,
+        },
+      };
+      const good: DraftContent = {
+        headline: "Trending signal",
+        summary: `AI HOT currently lists this as a trending topic across ${m.sourceCount} sources.`,
+        body: `AI HOT currently lists this as a trending topic. The topic is being tracked across ${m.sourceCount} sources with ${m.signalCount} signals. The available feed does not include further event details.`,
+      };
+      const r = checkHotTopicBrief(good, base);
+      check("K1", "如实转述计数的 SIGNAL 简报通过", r.verdict === "PASSED",
+        r.issues.map((i) => `${i.code}:${i.detail}`).join(" | ").slice(0, 160));
+
+      const wrongCount = { ...good, body: good.body.replace(String(m.sourceCount), String((m.sourceCount ?? 0) + 7)) };
+      check("K2", "来源计数写错 → HOT_TOPIC_SOURCE_COUNT_MISMATCH",
+        checkHotTopicBrief(wrongCount, base).issues.some((i) => i.code === "HOT_TOPIC_SOURCE_COUNT_MISMATCH"));
+
+      // 用登记过的实体做「凭空冒出来」的样本：普通英文词组成的名字查不到，
+      // 那条边界另有 I5b 记录
+      const invented = { ...good, body: good.body + " Additional coverage came from Nvidia." };
+      check("K3", "编造来源名 → HOT_TOPIC_SOURCE_NAME_MISMATCH",
+        checkHotTopicBrief(invented, base).issues.some((i) => i.code === "HOT_TOPIC_SOURCE_NAME_MISMATCH"));
+
+      const wrongRank = { ...good, body: good.body + ` It is ranked number ${(m.rank ?? 1) + 40} on the board.` };
+      check("K4", "名次写错 → HOT_TOPIC_RANK_MISMATCH",
+        checkHotTopicBrief(wrongRank, base).issues.some((i) => i.code === "HOT_TOPIC_RANK_MISMATCH"));
+
+      const day = m.capturedAt.toISOString().slice(0, 10);
+      const timeWrong = { ...good, body: good.body + ` The product was launched on ${day}.` };
+      check("K5", "把抓取时间写成事件发生时间 → HOT_TOPIC_TIME_MISREPRESENTED",
+        checkHotTopicBrief(timeWrong, base).issues.some((i) => i.code === "HOT_TOPIC_TIME_MISREPRESENTED"));
+
+      const noFraming = { headline: "Major release lands", summary: "A major release landed today.", body: "A major release landed today. It changes the market significantly for everyone involved." };
+      check("K6", "SIGNAL 未自报家门 → HOT_TOPIC_TIME_MISREPRESENTED",
+        checkHotTopicBrief(noFraming, base).issues.some((i) => i.code === "HOT_TOPIC_TIME_MISREPRESENTED"));
+
+      const tooLong = { ...good, body: good.body + " " + "word".repeat(1) + " filler".repeat(HOT_TOPIC_WORD_BAND.SIGNAL.max + 20) };
+      check("K7", "SIGNAL 超出词数带 → HOT_TOPIC_UNSUPPORTED_DETAIL",
+        checkHotTopicBrief(tooLong, base).issues.some((i) => i.code === "HOT_TOPIC_UNSUPPORTED_DETAIL"));
+
+      const extraNum = { ...good, body: good.body + " The model has 671B parameters." };
+      check("K8", "补充 API 没给的参数 → 被拦下",
+        checkHotTopicBrief(extraNum, base).issues.some(
+          (i) => i.code === "HOT_TOPIC_UNSUPPORTED_DETAIL" || i.code === "HOT_TOPIC_SOURCE_COUNT_MISMATCH"));
+
+      const allIssues = [good, wrongCount, invented, wrongRank, timeWrong, noFraming, tooLong, extraNum]
+        .flatMap((d) => checkHotTopicBrief(d, base).issues.map((i) => i.code as string));
+      check("K9", "热点 QA 永不产出已取消的门禁类结论",
+        !allIssues.some((c) => (HOT_TOPIC_FORBIDDEN_CODES as readonly string[]).includes(c)),
+        [...new Set(allIssues)].join(","));
+      check("K10", "空字段 → EMPTY_FIELD",
+        checkHotTopicBrief({ ...good, body: "" }, base).issues.some((i) => i.code === "EMPTY_FIELD"));
     }
-    const none = await assessHotTopic(-1);
-    check("I4", "不存在的快照不放行", !none.publishable);
+  }
+
+  section("L  热点榜单与幂等");
+
+  {
+    const material = await loadAllLatestMaterial();
+    const cards = await listTrendingCards("EN_US");
+    check("L1", "每个最新热点都有一张卡片", cards.length === material.length, `${cards.length}/${material.length}`);
+    check("L2", "卡片字段全部来自 API（计数/来源名/抓取时间齐备）",
+      cards.every((c) => c.sourceNames.length > 0 && c.capturedAt instanceof Date && c.aihotUrl.startsWith("http")));
+    check("L3", "卡片按名次升序", cards.every((c, i) => i === 0 || (cards[i - 1].rank ?? 999) <= (c.rank ?? 999)));
+    check("L4", "未发布的语言不给简报入口（不做死链）",
+      cards.every((c) => c.briefHref === null || c.briefHref.startsWith("/en/")));
+
+    if (material[0]) {
+      const m = material[0];
+      const fp1 = hotTopicFactFingerprint(m);
+      const fp2 = hotTopicFactFingerprint({ ...m, rank: (m.rank ?? 1) + 10 });
+      check("L5", "仅排名变化不改变事实指纹（不触发重写）", fp1 === fp2);
+      const fp3 = hotTopicFactFingerprint({ ...m, sourceCount: (m.sourceCount ?? 0) + 1 });
+      check("L6", "来源数变化改变事实指纹", fp1 !== fp3);
+      const fp4 = hotTopicFactFingerprint({ ...m, sourceNames: [...m.sourceNames, "New Source"] });
+      check("L7", "来源名单变化改变事实指纹", fp1 !== fp4);
+      const fp5 = hotTopicFactFingerprint({ ...m, title: m.title + " 追加" });
+      check("L8", "标题变化改变事实指纹", fp1 !== fp5);
+    }
   }
 
   section("J  产品边界");

@@ -6,7 +6,6 @@ import { prisma } from "@/lib/prisma";
 
 import { httpUrlOrNull } from "../aihot/types";
 
-import { assessHotTopic } from "./eligibility";
 import { LOCALES, publicPath } from "./types";
 
 /**
@@ -83,16 +82,15 @@ export async function preflight(familyId: number): Promise<PreflightResult | nul
     });
   }
 
-  // ── 热点专属门槛 ──
-  if (family.content_form === "HOT_TOPIC_BRIEF") {
-    if (!family.hot_topic_snapshot_id) {
-      issues.push({ code: "HOT_TOPIC_SNAPSHOT_MISSING", detail: "热点 family 未关联快照" });
-    } else {
-      const eligible = await assessHotTopic(family.hot_topic_snapshot_id);
-      if (!eligible.publishable) {
-        issues.push({ code: eligible.reason, detail: eligible.missing.join("；") });
-      }
-    }
+  /*
+   * 热点**没有**素材充分性门禁。
+   *
+   * 早先这里会因为「只有标题与来源计数」拦下整个热点，
+   * 产品规则已经改了：素材少只决定写法（SIGNAL / ENRICHED），不决定发不发。
+   * 这里只确认它确实挂着一个快照 —— 那是数据完整性，不是信息量判断。
+   */
+  if (family.content_form === "HOT_TOPIC_BRIEF" && !family.hot_topic_snapshot_id) {
+    issues.push({ code: "HOT_TOPIC_SNAPSHOT_MISSING", detail: "热点 family 未关联快照" });
   }
 
   if (family.content_form === "DAILY_BRIEF" && !family.report_date) {

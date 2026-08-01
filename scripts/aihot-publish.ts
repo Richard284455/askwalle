@@ -16,7 +16,7 @@
  */
 import type { DraftLanguage, ReviewDecision, ReviewIssueCategory } from "@prisma/client";
 
-import { assessAllHotTopics } from "@/lib/content/publishing/eligibility";
+import { loadAllLatestMaterial } from "@/lib/content/publishing/eligibility";
 import { freezeUnit } from "@/lib/content/publishing/freeze";
 import { preflight, publishFamily } from "@/lib/content/publishing/publish";
 import { familyReviewState, issueTally, recordReview } from "@/lib/content/publishing/review";
@@ -104,17 +104,17 @@ async function cmdShow() {
 }
 
 async function cmdTopics() {
-  const results = await assessAllHotTopics();
-  console.log(`热点发布门槛评估（${results.length} 个）\n`);
-  for (const r of results) {
-    const e = r.evidence;
-    console.log(`  ${r.publishable ? "✅ 可发布" : "❌ 不可发布"}  快照 #${e.snapshotId}  ${e.title}`);
-    console.log(`     API 摘要=${e.hasApiSummary ? "有" : "无"} · source_count=${e.sourceCount} · signal_count=${e.signalCount} · 来源名 ${e.sourceNameCount} 个`);
-    console.log(`     关联条目 ${e.relatedItemIds} 个，其中已入库精选 ${e.matchedSelectedItems} 个 · captured_at ${e.capturedAt.toISOString()}`);
-    if (!r.publishable) console.log(`     ${r.reason}: ${r.missing.join("；")}`);
+  const all = await loadAllLatestMaterial();
+  console.log(`当前热点 ${all.length} 个（每个 topic 取最新快照）\n`);
+  for (const m of all) {
+    console.log(`  [${m.mode}]  #${m.snapshotId}  rank=${m.rank ?? "-"}  ${m.title}`);
+    console.log(`     来源 ${m.sourceCount ?? "-"} 个 · 信号 ${m.signalCount ?? "-"} 条 · 来源名 ${m.sourceNames.length} 个`);
+    console.log(`     API 摘要 ${m.apiSummary ? "有" : "无"} · 关联已入库精选 ${m.relatedItems.length} 条 · captured_at ${m.capturedAt.toISOString()}`);
+    console.log(`     ${m.aihotUrl}`);
   }
-  const blocked = results.filter((r) => !r.publishable).length;
-  console.log(`\n可发布 ${results.length - blocked} · 不可发布 ${blocked}`);
+  const signal = all.filter((m) => m.mode === "SIGNAL").length;
+  console.log(`\nSIGNAL ${signal} · ENRICHED ${all.length - signal}`);
+  console.log("素材少不再是跳过生成的理由 —— 每个热点都必须有四语言简报。");
 }
 
 async function cmdReview() {

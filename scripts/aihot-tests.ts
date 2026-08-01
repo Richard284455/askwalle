@@ -497,10 +497,22 @@ async function main() {
     check("K9", "日报提示词要求输出 sections", /"sections"/.test(p));
   }
   {
-    const topic: ContentUnitInput = { ...UNIT, contentForm: "HOT_TOPIC_BRIEF", contentKind: "HOT_TOPIC" };
-    const p = buildMasterPrompt(topic);
-    check("K10", "热点提示词允许略去无材料的小节", /没有材料支撑就直接略去那一节/.test(p));
-    check("K11", "热点提示词禁止从计数推断影响力", /不得据此推断影响力/.test(p));
+    const ht = {
+      mode: "SIGNAL" as const, topicId: "t1", rank: 2, sourceCount: 14, signalCount: 27,
+      sourceNames: ["A", "B"], capturedAt: new Date("2026-08-01"), latestAt: new Date("2026-08-01"),
+    };
+    const signal: ContentUnitInput = {
+      ...UNIT, contentForm: "HOT_TOPIC_BRIEF", contentKind: "HOT_TOPIC", hotTopic: ht,
+    };
+    const p = buildMasterPrompt(signal);
+    check("K10", "SIGNAL 提示词要求自报「这是榜单信号」", /实时热点信号简报/.test(p) && /trending topic/.test(p));
+    check("K11", "SIGNAL 提示词逐条禁止补充技术/商业/背景细节",
+      /严禁/.test(p) && /技术细节/.test(p) && /商业影响/.test(p) && /事件背景/.test(p));
+    check("K11b", "SIGNAL 提示词给出词数带", /80–180 词/.test(p));
+    const enriched = buildMasterPrompt({ ...signal, hotTopic: { ...ht, mode: "ENRICHED" } });
+    check("K11c", "ENRICHED 提示词用更宽的词数带且仍禁止外推",
+      /150–350 词/.test(enriched) && /不得推断影响力/.test(enriched));
+    check("K11d", "两种模式的提示词不同", p !== enriched);
   }
 
   {
@@ -603,7 +615,12 @@ async function main() {
 
   section("M  产品边界：永不阻断的判断");
 
-  check("M1", "10 个阻断码齐备", BLOCKING_CODES.length === 10);
+  check("M1", "阻断码齐备（10 个通用 + 5 个热点专属）", BLOCKING_CODES.length === 15,
+    String(BLOCKING_CODES.length));
+  check("M1b", "五个热点专属阻断码都在列",
+    ["HOT_TOPIC_UNSUPPORTED_DETAIL", "HOT_TOPIC_SOURCE_COUNT_MISMATCH", "HOT_TOPIC_SOURCE_NAME_MISMATCH",
+     "HOT_TOPIC_RANK_MISMATCH", "HOT_TOPIC_TIME_MISREPRESENTED"]
+      .every((c) => (BLOCKING_CODES as string[]).includes(c)));
   for (const c of NEVER_BLOCKING_CODES) {
     check(`M2-${c}`, `${c} 不阻断`, !isBlocking(c));
   }
