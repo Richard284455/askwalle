@@ -16,7 +16,7 @@ import type { Website } from "@/lib/types";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { motion } from "framer-motion";
-import { Settings, ListFilter, LogOut, BookOpen, Wrench } from "lucide-react";
+import { Settings, ListFilter, LogOut, BookOpen, Wrench, Newspaper} from "lucide-react";
 import { cn } from "@/lib/utils/utils";
 
 export function AdminPageClient({
@@ -104,6 +104,12 @@ export function AdminPageClient({
                 <Link href="/admin/resources" className="flex items-center gap-2">
                   <BookOpen className="w-4 h-4" />
                   资源管理
+                </Link>
+              </TabsTrigger>
+              <TabsTrigger value="content" asChild>
+                <Link href="/admin/content/articles" className="flex items-center gap-2">
+                  <Newspaper className="w-4 h-4" />
+                  资讯审核
                 </Link>
               </TabsTrigger>
               <TabsTrigger value="settings" asChild>

@@ -74,7 +74,39 @@ export async function assembleSourceInput(sourceItemId: number): Promise<Assembl
     }
   }
 
-  // 退到订阅字段。**不**把它包装成 SUBSTANTIAL 的 fact pack
+  // 没有 fact pack 不等于没有正文。
+  //
+  // fact-pack 的资格闸门（SUBSTANTIAL、≥1500 字符）是**事实核实时代**的产物 ——
+  // 它问的是「这份提取能不能支撑事实主张」。新的产品逻辑里我们不做真实性判断，
+  // 只做忠实转述，于是这个闸门就变成了反的：894 字的真实正文严格优于 0 字。
+  //
+  // 更要紧的是安全性 —— 来源文本为空时模型只能从标题扩写，那恰恰是最容易
+  // 编造的场景。所以在退到订阅字段之前，先看有没有成功提取到的正文可用。
+  const usableRun = await prisma.sourceItemEnrichmentRun.findFirst({
+    where: { source_item_id: sourceItemId, outcome: "OK", excerpt: { not: null } },
+    orderBy: [{ started_at: "desc" }, { id: "desc" }],
+  });
+  const runText = (usableRun?.excerpt ?? "").trim();
+  if (usableRun && runText.length >= MIN_SOURCE_CHARS) {
+    return {
+      ok: true,
+      input: {
+        sourceItemId, factPackId: null, mode: "FULL_SOURCE", evidenceMode: "ARTICLE_PAGE",
+        publisher: item.source.publisher,
+        sourceUrl: httpUrlOrNull(usableRun.canonical_url) ?? httpUrlOrNull(usableRun.final_url) ?? item.url,
+        canonicalUrl: httpUrlOrNull(usableRun.canonical_url),
+        title: usableRun.page_title ?? item.title,
+        author: usableRun.author ?? item.author,
+        publishedAt: usableRun.page_published_at ?? item.published_at,
+        capturedAt: usableRun.started_at,
+        sourceText: runText,
+        claims: [],
+        language: usableRun.language ?? item.lang,
+      },
+    };
+  }
+
+  // 最后才退到订阅字段。**不**把它包装成 SUBSTANTIAL 的 fact pack
   const feedText = [item.raw_excerpt, item.raw_content].filter(Boolean).join("\n").trim();
   const available = `${item.title}\n${feedText}`.trim();
   if (available.length < MIN_SOURCE_CHARS) {

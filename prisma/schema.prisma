@@ -1271,6 +1271,9 @@ enum ArticleStatus {
   GENERATION_FAILED
   FAITHFULNESS_FAILED
   PUBLICATION_FAILED
+  /// 人工审核退回。与 FAITHFULNESS_FAILED 分开：那是「偏离了来源」，
+  /// 这是「忠实但编辑不想发」—— 两者的后续处理完全不同
+  REJECTED_BY_REVIEWER
 }
 
 /// 只判「是否忠实于来源」，**不判**「来源说的对不对」。
@@ -1324,6 +1327,13 @@ model GeneratedArticle {
   generated_at   DateTime?
   published_at   DateTime?
   failure_reason String?
+
+  // ── 人工审核痕迹 ──
+  reviewed_by         String?
+  reviewed_at         DateTime?
+  review_notes        String?
+  /// 发布后指向公开内容；未发布为 null
+  resource_content_id Int?
 
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt
