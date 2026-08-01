@@ -35,7 +35,11 @@
     "events:candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/discover-event-candidates.ts",
     "test:event-candidates": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/event-candidate-tests.ts",
     "articles:generate": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/generate-articles.ts",
-    "test:article-gen": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/article-gen-tests.ts"
+    "test:article-gen": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/article-gen-tests.ts",
+    "aihot:ingest": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-ingest.ts",
+    "aihot:generate": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-generate.ts",
+    "test:aihot": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-tests.ts",
+    "aihot:verify": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-canary-verify.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

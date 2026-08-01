@@ -1346,3 +1346,247 @@ model GeneratedArticle {
   @@index([source_input_hash])
   @@map("generated_articles")
 }
+
+// ---------------------------------------------------------------------------
+// AI HOT 内容闭环
+//
+// AI HOT 是一个**聚合信源**。三类内容各自是独立的发布单元，刻意不并进
+// SourceItem / SourceFactPack / event discovery —— 那条链路服务的是订阅抓取
+// 与事实核实，而这里的产品约定是「直接相信信源所陈述的信息」。
+//
+// 系统不判断 AI HOT 说的是否客观正确，只保证生成内容忠实于 AI HOT 的输入。
+// 重复内容**不是**拒绝理由。
+// ---------------------------------------------------------------------------
+
+enum AihotContentKind {
+  SELECTED /// 精选资讯：每条是独立内容单元
+  HOT_TOPIC /// 当前热点：允许持续变化，按内容快照留版本
+  DAILY /// AI 日报：每天一期
+}
+
+/// 生成的内容形式。与 ArticleGenerationMode 分开 —— 那个描述「来源材料有多完整」，
+/// 这个描述「产出是哪一种体裁」。
+enum MultilingualContentForm {
+  MULTILINGUAL_NEWS_BRIEF /// 精选 → 多语言短资讯
+  HOT_TOPIC_BRIEF /// 热点 → 热点简报
+  DAILY_BRIEF /// 日报 → 每日简报
+}
+
+enum DraftLanguage {
+  EN_US
+  ES_ES
+  PT_BR
+  JA_JP
+}
+
+enum MultilingualDraftStatus {
+  DRAFTED /// 已生成且通过 QA
+  QA_FAILED /// 忠实度或翻译漂移未通过，不进入可发布态
+  GENERATION_FAILED
+  SOURCE_INSUFFICIENT
+  /// 人工审核后的状态。本阶段不发布，保留枚举供后续审核链路使用
+  READY_TO_PUBLISH
+  REJECTED_BY_REVIEWER
+  PUBLISHED
+}
+
+/// AI HOT 精选资讯。每条是独立内容单元，一条生成一篇多语言短资讯。
+model AihotSelectedItem {
+  id               Int    @id @default(autoincrement())
+  provider         String @default("AIHOT")
+  /// AI HOT 侧的稳定条目 ID
+  provider_item_id String
+
+  title          String
+  /// 原始语言标题（AI HOT 转述前的原文标题）
+  original_title String?
+  summary        String?
+
+  /// AI HOT 原始分类（ai-models / ai-products / industry / paper / tip）
+  category        String?
+  /// 映射到本站板块后的分类；映射表在代码里，快照存这里便于回溯
+  mapped_category String?
+  score           Int?
+
+  /// 原始来源名称（如 "X：阿易 AI Notes"）
+  source_name  String?
+  /// AI HOT 页面地址 —— 归因必需
+  aihot_url    String
+  /// 原始来源地址；AI HOT 未提供时为 null。**必须是合法 http/https 绝对地址**
+  original_url String?
+
+  published_at  DateTime?
+  discovered_at DateTime?
+  selected      Boolean   @default(true)
+
+  /// 内容指纹。AI HOT 侧内容变化后可据此判断是否需要重新生成
+  source_snapshot_hash String
+
+  first_seen_at DateTime @default(now())
+  last_seen_at  DateTime @default(now())
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  drafts MultilingualDraft[]
+
+  @@unique([provider, provider_item_id])
+  @@index([published_at])
+  @@index([category])
+  @@map("aihot_selected_items")
+}
+
+/// AI HOT 当前热点的一次快照。
+///
+/// 热点允许持续变化，所以身份键带上内容指纹：内容变了就是新版本，
+/// 旧版本保留。**不做事件去重** —— 同一热点的多个版本共存是预期行为。
+model AihotHotTopicSnapshot {
+  id       Int    @id @default(autoincrement())
+  provider String @default("AIHOT")
+  topic_id String
+
+  title   String
+  /// API 目前不返回热点摘要；字段保留，缺失时为 null
+  summary String?
+  /// 榜单名次（1 起）。热度本身 API 未直接给出，用 source/signal 计数表示
+  rank    Int?
+
+  source_count          Int?
+  signal_count          Int?
+  /// 参与该热点的来源名称列表，原样快照
+  source_names_json     Json?
+  /// 关联条目 ID（AI HOT 提供的、可确定的关联，不做推断匹配）
+  related_item_ids_json Json?
+
+  source_name  String?
+  aihot_url    String
+  original_url String?
+
+  latest_at   DateTime?
+  captured_at DateTime  @default(now())
+
+  source_snapshot_hash String
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  drafts MultilingualDraft[]
+
+  /// 技术幂等：同一热点同一份内容不重复入库；内容变了允许新增版本
+  @@unique([provider, topic_id, source_snapshot_hash])
+  @@index([captured_at])
+  @@map("aihot_hot_topic_snapshots")
+}
+
+/// AI HOT 日报。每天一期，整期作为一个内容单元。
+///
+/// **不把日报里的每条内容再当作新的精选导入** —— 那会把同一批事实
+/// 重复计入两条链路。
+model AihotDailyReport {
+  id          Int    @id @default(autoincrement())
+  provider    String @default("AIHOT")
+  /// 报告日期，YYYY-MM-DD。用字符串避免时区把「哪一天」算错
+  report_date String
+
+  title   String?
+  summary String?
+
+  generated_at DateTime?
+  window_start DateTime?
+  window_end   DateTime?
+
+  /// 栏目原始顺序与内容（label + items 的标题/摘要/链接）。
+  /// **不保存第三方完整正文**，只保存 AI HOT 自己给出的摘要字段
+  sections_json          Json
+  /// 日报涵盖的条目 ID，从 links.aihot 路径解析
+  included_item_ids_json Json?
+
+  aihot_url        String
+  attribution_name String
+  attribution_url  String
+
+  captured_at DateTime @default(now())
+
+  source_snapshot_hash String
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  drafts MultilingualDraft[]
+
+  @@unique([provider, report_date])
+  @@index([report_date])
+  @@map("aihot_daily_reports")
+}
+
+/// 一个内容单元在一种语言下的草稿。
+///
+/// 四种语言**不是**各自独立扩写：en-US 是母版，其余三种由母版翻译而来，
+/// 通过 master_draft_id 保留这层关系。这样翻译漂移才有明确的比对基准。
+model MultilingualDraft {
+  id           Int                     @id @default(autoincrement())
+  content_form MultilingualContentForm
+  content_kind AihotContentKind
+
+  /// 业务身份键："selected:<providerItemId>" / "topic:<topicId>:<hash>" / "daily:<date>"
+  unit_key String
+
+  selected_item_id      Int?
+  selected_item         AihotSelectedItem?     @relation(fields: [selected_item_id], references: [id])
+  hot_topic_snapshot_id Int?
+  hot_topic_snapshot    AihotHotTopicSnapshot? @relation(fields: [hot_topic_snapshot_id], references: [id])
+  daily_report_id       Int?
+  daily_report          AihotDailyReport?      @relation(fields: [daily_report_id], references: [id])
+
+  language        DraftLanguage
+  /// 母版（en-US）为 true；三种译文为 false
+  is_master       Boolean       @default(false)
+  /// 译文指向母版草稿；母版自身为 null
+  master_draft_id Int?
+
+  generation_version String
+  status             MultilingualDraftStatus @default(GENERATION_FAILED)
+
+  // ── 来源身份快照（归因用，发布时不再回查）──
+  source_snapshot_hash      String
+  source_input_hash         String
+  provider_attribution_name String
+  provider_attribution_url  String
+  original_source_name      String?
+  original_source_url       String?
+  category_slug             String?
+
+  // ── 生成产物 ──
+  headline      String?
+  summary       String?
+  body          String?
+  /// 分栏产物（日报/热点用），保留原始栏目顺序
+  sections_json Json?
+
+  // ── QA ──
+  qa_verdict     FaithfulnessVerdict?
+  qa_issues_json Json?
+  qa_checked_at  DateTime?
+
+  provider       String?
+  model          String?
+  generated_at   DateTime?
+  failure_reason String?
+
+  // ── 人工审核痕迹（本阶段不发布，字段先备好）──
+  reviewed_by         String?
+  reviewed_at         DateTime?
+  review_notes        String?
+  resource_content_id Int?
+  published_at        DateTime?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  /// 技术性去重：重试不得把同一份生成写第二遍。
+  /// **不做业务去重** —— 内容重复不是拒绝理由。
+  @@unique([unit_key, language, generation_version])
+  @@index([content_form, status])
+  @@index([status, created_at])
+  @@index([source_input_hash])
+  @@map("multilingual_drafts")
+}
