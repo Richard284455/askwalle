@@ -1590,3 +1590,193 @@ model MultilingualDraft {
   @@index([source_input_hash])
   @@map("multilingual_drafts")
 }
+
+// ---------------------------------------------------------------------------
+// 多语言人工审核与受控发布
+//
+// 与生成侧刻意分开：
+//   - MultilingualDraft 是**生成产物**，由 pipeline 反复写；
+//   - ArticleRevision 是**发布快照**，一旦创建就不再改动。
+//
+// 重新生成必须产生新的 revision，不得静默覆盖已审核过的稿子 ——
+// 否则「审核通过的到底是哪一版」这个问题永远答不清楚。
+// ---------------------------------------------------------------------------
+
+enum PublishStatus {
+  DRAFTED
+  IN_REVIEW
+  APPROVED
+  PUBLISHED
+  REJECTED
+  /// 被更新的 revision 取代；历史保留，不删
+  SUPERSEDED
+  PUBLICATION_FAILED
+}
+
+enum ReviewDecision {
+  APPROVED
+  REJECTED
+  NEEDS_REVISION
+}
+
+/// 人工审核发现的问题分类。
+/// 刻意把「真失真」与「QA 误报」「纯风格」分开统计 ——
+/// 混在一起，「确定性 QA 到底漏了多少」这个问题就没法回答。
+enum ReviewIssueCategory {
+  TRUE_FACT_DRIFT
+  TRANSLATION_QUALITY_ISSUE
+  UNSUPPORTED_DETAIL
+  ATTRIBUTION_ERROR
+  SOURCE_INSUFFICIENT
+  /// 确定性 QA 判 PASSED，人工却发现了真实失真
+  QA_FALSE_NEGATIVE
+  STYLE_ONLY
+  NO_ISSUE
+}
+
+/// 一个内容单元的四语言家族。人工批准以它为单位，但逐语言记录审核状态。
+model ArticleFamily {
+  id           Int                     @id @default(autoincrement())
+  unit_key     String                  @unique
+  content_kind AihotContentKind
+  content_form MultilingualContentForm
+
+  selected_item_id      Int?
+  hot_topic_snapshot_id Int?
+  daily_report_id       Int?
+
+  /// 四种语言共用同一个 slug —— 这样 hreflang 只是换 locale 前缀，
+  /// 不必为每种语言各维护一套 slug 映射
+  slug        String
+  /// 日报用日期做路径，不用 slug
+  report_date String?
+
+  status PublishStatus @default(DRAFTED)
+
+  /// 发布时冻结的来源身份，页面署名直接用它，不再回查
+  source_snapshot_hash String
+  attribution_name     String
+  attribution_url      String
+  original_source_name String?
+  original_source_url  String?
+  category_slug        String?
+  source_published_at  DateTime?
+
+  translations ArticleTranslation[]
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@index([status])
+  @@index([content_form])
+  @@map("article_families")
+}
+
+model ArticleTranslation {
+  id        Int           @id @default(autoincrement())
+  family_id Int
+  family    ArticleFamily @relation(fields: [family_id], references: [id], onDelete: Cascade)
+  locale    DraftLanguage
+
+  status PublishStatus @default(DRAFTED)
+
+  /// 最新一版 / 审核通过的那一版 / 已发布的那一版。三者可以不同
+  current_revision_id   Int?
+  approved_revision_id  Int?
+  published_revision_id Int?
+
+  revisions    ArticleRevision[]
+  reviews      TranslationReview[]
+  publications ArticlePublication[]
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@unique([family_id, locale])
+  @@index([status])
+  @@map("article_translations")
+}
+
+/// 一个语言版本的一次内容快照。**创建后不再修改。**
+model ArticleRevision {
+  id              Int                @id @default(autoincrement())
+  translation_id  Int
+  translation     ArticleTranslation @relation(fields: [translation_id], references: [id], onDelete: Cascade)
+  revision_number Int
+
+  headline      String
+  summary       String
+  body          String
+  sections_json Json?
+
+  /// 生成侧的溯源：这一版是从哪个草稿冻结来的
+  origin_draft_id   Int?
+  source_input_hash String
+  qa_verdict        FaithfulnessVerdict?
+  qa_issues_json    Json?
+
+  created_at DateTime @default(now())
+
+  @@unique([translation_id, revision_number])
+  @@index([translation_id])
+  @@map("article_revisions")
+}
+
+/// 一次人工审核的完整记录。
+/// **不是一个 boolean** —— 谁审的、审的哪一版、逐项结论、发现了什么问题，
+/// 都必须留下来，否则事后无法复核。
+model TranslationReview {
+  id             Int                @id @default(autoincrement())
+  translation_id Int
+  translation    ArticleTranslation @relation(fields: [translation_id], references: [id], onDelete: Cascade)
+  revision_id    Int
+
+  reviewer    String
+  reviewed_at DateTime       @default(now())
+  decision    ReviewDecision
+  notes       String?
+
+  /// 十项逐条结论
+  checklist_json        Json
+  /// 命中的问题分类（ReviewIssueCategory[]）
+  issue_categories_json Json
+
+  created_at DateTime @default(now())
+
+  @@index([translation_id, revision_id])
+  @@index([decision])
+  @@map("translation_reviews")
+}
+
+/// 一次发布。
+///
+/// 幂等靠两道锁：业务唯一键 (translation, revision) 与幂等键。
+/// 只有约束能挡住并发重复写 —— 先查后写在超时重试面前不成立。
+model ArticlePublication {
+  id             Int                @id @default(autoincrement())
+  translation_id Int
+  translation    ArticleTranslation @relation(fields: [translation_id], references: [id], onDelete: Cascade)
+  revision_id    Int
+
+  /// 调用方生成、可重放的幂等键。超时重试带同一个键不会写出第二条
+  idempotency_key String @unique
+
+  locale DraftLanguage
+  /// 公开路径，例如 /en/updates/deepseek-v4-flash-0731
+  path   String
+
+  status         PublishStatus @default(PUBLISHED)
+  published_at   DateTime      @default(now())
+  unpublished_at DateTime?
+  failure_reason String?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  /// 同一版内容只能发布一次
+  @@unique([translation_id, revision_id])
+  /// slug 在同一 locale 内唯一
+  @@unique([locale, path])
+  @@index([status, published_at])
+  @@map("article_publications")
+}
