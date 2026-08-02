@@ -123,6 +123,8 @@ async function loadByPath(locale: DraftLanguage, path: string): Promise<Publishe
     sourceNames: await redactionNames(family),
     title: family.slug.replace(/-/g, " "),
     providerName: family.attribution_name,
+    // 中性替换词跟着页面语言走，否则日语正文里会嵌进英文
+    locale,
   };
   // 标题里的实体是事件主体，用真实标题做豁免依据
   ctx.title = `${revision.headline} ${ctx.title}`;
@@ -159,6 +161,82 @@ export function getTrendingPage(locale: DraftLanguage, slug: string) {
 export function getDailyPage(locale: DraftLanguage, date: string) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return Promise.resolve(null);
   return loadByPath(locale, publicPath({ locale, contentForm: "DAILY_BRIEF", slug: "", reportDate: date }));
+}
+
+// ── 列表页 ────────────────────────────────────────────────────────────────
+
+/**
+ * 列表卡片的公开投影。
+ *
+ * 与详情页同一套纪律：**没有** originalSourceName / originalSourceUrl /
+ * attributionName。返回了就会进 RSC payload，靠组件不渲染是拦不住的。
+ */
+export type PublishedCard = {
+  /** 仅用于 React key 与跳转 */
+  path: string;
+  headline: string;
+  summary: string;
+  categorySlug: string | null;
+  hotTopicMode: HotTopicBriefMode | null;
+  sourcePublishedAt: Date | null;
+  sitePublishedAt: Date;
+};
+
+async function listPublished(
+  locale: DraftLanguage, contentForm: string, limit: number
+): Promise<PublishedCard[]> {
+  const pubs = await prisma.articlePublication.findMany({
+    where: { status: "PUBLISHED", locale, translation: { family: { content_form: contentForm as never } } },
+    orderBy: { published_at: "desc" },
+    take: limit,
+    include: { translation: { include: { family: true } } },
+  });
+
+  const cards: PublishedCard[] = [];
+  for (const pub of pubs) {
+    const revision = await prisma.articleRevision.findUnique({
+      where: { id: pub.revision_id }, select: { headline: true, summary: true },
+    });
+    if (!revision) continue;
+    const family = pub.translation.family;
+    /*
+     * 标题与摘要同样过一遍剔除。
+     * 早期生成的稿子里带过发布者名，列表页也是公开面 ——
+     * 只在详情页剔除，等于把同一个名字换个地方展示出去。
+     */
+    const ctx: RedactionContext = {
+      sourceNames: await redactionNames(family),
+      title: `${revision.headline} ${family.slug.replace(/-/g, " ")}`,
+      providerName: family.attribution_name,
+      locale,
+    };
+    cards.push({
+      path: pub.path,
+      headline: redactAttribution(revision.headline, ctx),
+      summary: redactAttribution(revision.summary, ctx),
+      categorySlug: family.category_slug,
+      hotTopicMode: family.hot_topic_mode,
+      sourcePublishedAt: family.source_published_at,
+      sitePublishedAt: pub.published_at,
+    });
+  }
+  return cards;
+}
+
+/** 精选资讯列表 */
+export function listUpdates(locale: DraftLanguage, limit = 50) {
+  return listPublished(locale, "MULTILINGUAL_NEWS_BRIEF", limit);
+}
+
+/** 日报列表。路径里带日期，卡片按发布时间倒序 */
+export function listDailyBriefings(locale: DraftLanguage, limit = 60) {
+  return listPublished(locale, "DAILY_BRIEF", limit);
+}
+
+/** 列表页底部的统一归因。与详情页同一处声明，不逐条挂来源 */
+export async function listingAttribution(providerUrl: string): Promise<PublicAttribution | null> {
+  const mode = (await resolveAttributionMode()).mode;
+  return buildPublicAttribution({ mode, providerUrl, originalSourceUrl: null });
 }
 
 /** sitemap 用：只收已发布页面 */

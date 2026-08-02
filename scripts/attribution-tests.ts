@@ -112,6 +112,29 @@ async function main() {
     check("A17", "删名后不留孤立介词与逗号",
       !/\bde\s*,/.test(out) && /OpenAI utilizó Astra/.test(out), out);
   }
+  {
+    /*
+     * 中性替换词必须跟着语言走。
+     * 以前只有一个英文常量，日语榜单标题里于是出现
+     * 「…：the trending listランキングが強いシグナルを示す」—— 日语句子里嵌着英文。
+     */
+    const base = { sourceNames: [], title: "GPT-5.6", providerName: "AI HOT" };
+    const ja = redactAttribution("GPT-5.6：AI HOTランキングが強いシグナルを示す", { ...base, locale: "JA_JP" });
+    check("A18", "日语不出现英文中性词", !/trending list/i.test(ja) && !/AI\s*HOT/i.test(ja), ja);
+    check("A19", "日语定语用法直接删除品牌词", /^GPT-5\.6：ランキング/.test(ja), ja);
+
+    const es = redactAttribution("El modelo aparece en AI HOT con fuerte señal.", { ...base, locale: "ES_ES" });
+    check("A20", "西语用西语中性词", /la lista de tendencias/.test(es) && !/trending list/i.test(es), es);
+
+    const pt = redactAttribution("O modelo aparece em AI HOT com forte sinal.", { ...base, locale: "PT_BR" });
+    check("A21", "巴葡用巴葡中性词", /a lista de tendências/.test(pt) && !/trending list/i.test(pt), pt);
+
+    const en = redactAttribution("The model appears on AI HOT with a strong signal.", { ...base, locale: "EN_US" });
+    check("A22", "英文仍用英文中性词", /the trending list/.test(en), en);
+
+    const noLocale = redactAttribution("The model appears on AI HOT.", base);
+    check("A23", "不传 locale 时按英文处理", /the trending list/.test(noLocale), noLocale);
+  }
 
   section("B  归因模式与授权闸门");
 

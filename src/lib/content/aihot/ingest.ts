@@ -149,6 +149,12 @@ export async function ingestHotTopics(
 
   const capturedAt = new Date();
 
+  /*
+   * 本轮榜单里出现过的 topic。用**完整**载荷而不是截断后的 items ——
+   * 我们只取前 N 条来生成，不代表第 N+1 条就掉出了榜单。
+   */
+  const presentTopicIds = all.map((d) => d?.id).filter((x): x is string => Boolean(x));
+
   for (let i = 0; i < items.length; i++) {
     const dto = items[i];
     if (!dto?.id || !dto.title?.trim()) {
@@ -219,6 +225,24 @@ export async function ingestHotTopics(
       },
     });
     out.created++;
+  }
+
+  /*
+   * 已经掉出榜单的 topic 必须清掉名次。
+   *
+   * 不清的话，它会永远挂着最后一次上榜时的名次，和当前榜单的名次并列出现 ——
+   * 页面上就会同时看到两个「Rank 1」，而读者没有任何办法分辨哪个是现在的。
+   * 快照本身保留（可追溯、已发布的简报继续有效），只是不再有「当前名次」。
+   *
+   * 只在**确实取到了非空榜单**时执行：304、失败或空载荷时清空，
+   * 等于让一次上游抖动把整个榜单抹平。
+   */
+  if (!args.dryRun && presentTopicIds.length) {
+    const cleared = await prisma.aihotHotTopicSnapshot.updateMany({
+      where: { provider: AIHOT_PROVIDER, rank: { not: null }, topic_id: { notIn: presentTopicIds } },
+      data: { rank: null },
+    });
+    if (cleared.count) out.updated += cleared.count;
   }
 
   return { ...out, status: "OK" };

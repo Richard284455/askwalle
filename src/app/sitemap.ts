@@ -21,14 +21,30 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
     priority: 0.7,
   }));
   /*
-   * 热点榜单是常驻页面，四种语言恒定存在，与「有没有发布过简报」无关 ——
-   * 它展示的是 AI HOT 榜单的实时投影，不是本站的编辑内容。
+   * 三个列表页是常驻的，四种语言恒定存在，与「有没有发布过内容」无关 ——
+   * 空列表页也该可被抓取，否则新内容上线后要等下一次抓取才被发现。
+   *
+   * 榜单变化最快（实时投影），列表页跟随发布节奏。
    */
-  const trending = LOCALES.map((l) => ({
-    url: absoluteUrl(`/${LOCALE_SEGMENT[l]}/trending`),
-    lastModified: new Date(),
-    changeFrequency: "hourly" as const,
-    priority: 0.6,
-  }));
-  return [...trending, ...articles];
+  const listings = LOCALES.flatMap((l) => [
+    {
+      url: absoluteUrl(`/${LOCALE_SEGMENT[l]}/trending`),
+      lastModified: new Date(),
+      changeFrequency: "hourly" as const,
+      priority: 0.6,
+    },
+    {
+      url: absoluteUrl(`/${LOCALE_SEGMENT[l]}/updates`),
+      lastModified: new Date(),
+      changeFrequency: "daily" as const,
+      priority: 0.6,
+    },
+    {
+      url: absoluteUrl(`/${LOCALE_SEGMENT[l]}/briefings/daily`),
+      lastModified: new Date(),
+      changeFrequency: "daily" as const,
+      priority: 0.6,
+    },
+  ]);
+  return [...listings, ...articles];
 }

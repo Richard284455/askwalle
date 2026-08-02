@@ -4,11 +4,14 @@ import { useState } from "react";
 import Link from "next/link";
 import {
   BookOpen,
+  CalendarDays,
+  Flame,
   Folder,
   GraduationCap,
   Menu,
   Newspaper,
   Plus,
+  Radio,
   ScrollText,
   Search,
   Sparkles,
@@ -23,6 +26,13 @@ const mobileNavItems = [
   { href: "/categories", label: "Categories", icon: Folder },
   { href: "/rankings", label: "Rankings", icon: Trophy },
   { href: "/#directory-search", label: "Search", icon: Search },
+];
+
+/** 与桌面导航同一份清单：一律指向 /en，其余语言由文章页的语言互链进入 */
+const newsroomItems = [
+  { href: "/en/trending", label: "Trending", icon: Flame },
+  { href: "/en/updates", label: "AI Updates", icon: Radio },
+  { href: "/en/briefings/daily", label: "Daily Briefing", icon: CalendarDays },
 ];
 
 const resourceItems = [
@@ -61,6 +71,27 @@ export default function MobileMenu() {
             </div>
 
             {mobileNavItems.map(({ href, label, icon: Icon }) => (
+              <Button
+                key={href}
+                asChild
+                variant="ghost"
+                className="h-11 justify-start gap-3 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-200 dark:hover:bg-slate-800 dark:hover:text-white"
+                onClick={() => setIsOpen(false)}
+              >
+                <Link href={href}>
+                  <Icon className="h-4 w-4 text-primary" aria-hidden="true" />
+                  {label}
+                </Link>
+              </Button>
+            ))}
+
+            <div className="my-2 h-px bg-border" />
+
+            <div className="px-3 py-1 text-xs font-semibold uppercase tracking-normal text-muted-foreground">
+              Newsroom
+            </div>
+
+            {newsroomItems.map(({ href, label, icon: Icon }) => (
               <Button
                 key={href}
                 asChild

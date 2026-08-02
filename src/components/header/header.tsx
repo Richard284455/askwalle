@@ -2,10 +2,13 @@ import Link from "next/link";
 import {
   BookOpen,
   BrainCircuit,
+  CalendarDays,
   ChevronDown,
+  Flame,
   GraduationCap,
   Newspaper,
   Plus,
+  Radio,
   ScrollText,
   Search,
   Sparkles,
@@ -24,6 +27,19 @@ const navItems = [
   { href: "/", label: "AI Tools" },
   { href: "/categories", label: "Categories" },
   { href: "/rankings", label: "Rankings" },
+];
+
+/**
+ * 多语言资讯板块。
+ *
+ * 导航一律指向英文前缀 `/en`：主站导航本身就是英文的，其余三种语言
+ * 由文章页顶部的语言互链进入。直接给 `/es` 之类会让英文读者莫名跳到西语页，
+ * 而「按浏览器语言猜」是另一个更大的坑 —— 猜错时读者没有退路。
+ */
+const newsroomItems = [
+  { href: "/en/trending", label: "Trending", icon: Flame },
+  { href: "/en/updates", label: "AI Updates", icon: Radio },
+  { href: "/en/briefings/daily", label: "Daily Briefing", icon: CalendarDays },
 ];
 
 const resourceItems = [
@@ -70,6 +86,36 @@ export default function Header() {
                 </Link>
               </Button>
             ))}
+
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-9 gap-1.5 px-3 text-sm font-medium text-slate-700 hover:bg-slate-100 hover:text-slate-950 dark:text-slate-200 dark:hover:bg-slate-800 dark:hover:text-white"
+                >
+                  <Flame className="h-4 w-4" />
+                  Newsroom
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="end"
+                className="w-52 rounded-lg border-border/80 bg-white/95 p-1.5 shadow-xl shadow-slate-900/10 backdrop-blur-xl dark:bg-card/95"
+              >
+                {newsroomItems.map(({ href, label, icon: Icon }) => (
+                  <DropdownMenuItem key={href} asChild>
+                    <Link
+                      href={href}
+                      className="gap-2 rounded-md px-2.5 py-2 text-sm font-medium"
+                    >
+                      <Icon className="h-4 w-4 text-primary" aria-hidden="true" />
+                      {label}
+                    </Link>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
 
             <DropdownMenu>
               <DropdownMenuTrigger asChild>

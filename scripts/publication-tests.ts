@@ -459,13 +459,35 @@ async function main() {
     const material = await loadAllLatestMaterial();
     const listing = await listTrending("EN_US");
     const cards = listing!.cards;
-    check("L1", "每个最新热点都有一张卡片", cards.length === material.length, `${cards.length}/${material.length}`);
+    /*
+     * 上榜条件是「该语言有已发布简报」，不是「有最新快照」。
+     *
+     * 以前没有简报的话题会退回热点原标题上榜 —— 而那是信源给的中文标题，
+     * 英文榜单上于是混进中文卡片，点进去还是 404。
+     * 公开面上的每一行都该是我们自己产出的、这一语言的内容。
+     */
+    const publishedTopics = await prisma.articleFamily.count({
+      where: {
+        unit_key: { in: material.map((m) => hotTopicUnitKey(m.topicId)) },
+        translations: { some: { locale: "EN_US", publications: { some: { status: "PUBLISHED" } } } },
+      },
+    });
+    check("L1", "有已发布英文简报的热点都上榜", cards.length === publishedTopics,
+      `${cards.length}/${publishedTopics}（最新快照 ${material.length} 个）`);
+    check("L1b", "没有已发布简报的热点不上榜", cards.length <= material.length);
     check("L2", "卡片不含实际来源名与条目地址（公开投影里就没有）",
       cards.every((c) => !("sourceNames" in c) && !("aihotUrl" in c) && !("topicId" in c)
         && c.capturedAt instanceof Date));
-    check("L3", "卡片按名次升序", cards.every((c, i) => i === 0 || (cards[i - 1].rank ?? 999) <= (c.rank ?? 999)));
-    check("L4", "未发布的语言不给简报入口（不做死链）",
-      cards.every((c) => c.briefHref === null || c.briefHref.startsWith("/en/")));
+    check("L3", "在榜的按名次升序，掉榜的排在后面",
+      cards.every((c, i) => {
+        if (i === 0) return true;
+        const prev = cards[i - 1];
+        if (prev.rank !== null && c.rank !== null) return prev.rank <= c.rank;
+        // 有名次的必须排在无名次的前面
+        return !(prev.rank === null && c.rank !== null);
+      }));
+    check("L4", "每张卡片都有可达的简报入口（不做死链）",
+      cards.every((c) => typeof c.briefHref === "string" && c.briefHref.startsWith("/en/")));
     check("L4b", "榜单页有底部归因", listing!.attribution.poweredByLabel === "Powered by AI HOT");
 
     if (material[0]) {

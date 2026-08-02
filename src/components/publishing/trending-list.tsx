@@ -16,34 +16,34 @@ import { AttributionFooter } from "./attribution-footer";
 
 const UI: Record<string, {
   title: string; intro: string; rank: string; sources: string; signals: string;
-  captured: string; readBrief: string; briefPending: string; signalNote: string;
+  captured: string; readBrief: string; empty: string; signalNote: string;
 }> = {
   EN_US: {
     title: "Trending now",
     intro: "A live view of the topics currently drawing the most coverage. Counts reflect how widely each topic is being tracked.",
     rank: "Rank", sources: "sources", signals: "signals", captured: "Updated",
-    readBrief: "Read the brief", briefPending: "Brief not published yet",
+    readBrief: "Read the brief", empty: "No trending briefs published yet.",
     signalNote: "Signal brief — reflects only what the trending feed provides.",
   },
   ES_ES: {
     title: "Tendencias ahora",
     intro: "Vista en vivo de los temas que más cobertura están recibiendo. Los recuentos reflejan con qué amplitud se sigue cada tema.",
     rank: "Puesto", sources: "fuentes", signals: "señales", captured: "Actualizado",
-    readBrief: "Leer el resumen", briefPending: "Resumen aún no publicado",
+    readBrief: "Leer el resumen", empty: "Todavía no hay resúmenes de tendencias publicados.",
     signalNote: "Resumen de señal: refleja únicamente lo que ofrece el listado de tendencias.",
   },
   PT_BR: {
     title: "Em alta agora",
     intro: "Uma visão ao vivo dos temas que mais estão recebendo cobertura. As contagens refletem a amplitude com que cada tema é acompanhado.",
     rank: "Posição", sources: "fontes", signals: "sinais", captured: "Atualizado",
-    readBrief: "Ler o resumo", briefPending: "Resumo ainda não publicado",
+    readBrief: "Ler o resumo", empty: "Ainda não há resumos de tendências publicados.",
     signalNote: "Resumo de sinal: reflete apenas o que a listagem de tendências fornece.",
   },
   JA_JP: {
     title: "現在のトレンド",
     intro: "いま最も広く取り上げられている話題のライブビューです。件数は各話題がどの程度広く追跡されているかを示します。",
     rank: "順位", sources: "ソース", signals: "シグナル", captured: "更新",
-    readBrief: "ブリーフを読む", briefPending: "ブリーフは未公開",
+    readBrief: "ブリーフを読む", empty: "公開済みのトレンドブリーフはまだありません。",
     signalNote: "シグナル要約 — トレンド一覧が提供する情報のみを反映しています。",
   },
 };
@@ -87,15 +87,15 @@ export function TrendingList({ listing, locale }: { listing: TrendingListing; lo
             ) : null}
 
             <div className="mt-4 text-sm">
-              {c.briefHref ? (
-                <a href={c.briefHref} className="font-medium text-primary hover:underline">{t.readBrief} →</a>
-              ) : (
-                <span className="text-slate-400 dark:text-muted-foreground">{t.briefPending}</span>
-              )}
+              <a href={c.briefHref} className="font-medium text-primary hover:underline">{t.readBrief} →</a>
             </div>
           </li>
         ))}
       </ul>
+
+      {listing.cards.length === 0 ? (
+        <p className="mt-10 text-sm text-slate-500 dark:text-muted-foreground">{t.empty}</p>
+      ) : null}
 
       <AttributionFooter attribution={listing.attribution} />
     </div>

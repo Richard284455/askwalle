@@ -1,3 +1,5 @@
+import type { DraftLanguage } from "@prisma/client";
+
 import { prisma } from "@/lib/prisma";
 
 import { httpUrlOrNull } from "../aihot/types";
@@ -70,10 +72,25 @@ export type RedactionContext = {
   /** 内容标题。**出现在标题里的实体是事件主体，必须保留** */
   title: string;
   providerName: string;
+  /**
+   * 正文语言。不传按英文处理。
+   *
+   * 中性替换词**必须跟着语言走**：以前这里只有一个英文常量，
+   * 于是日语页面上出现了「GPT-5.6のコストパフォーマンスフロンティア：
+   * the trending listランキングが…」—— 一句日语里嵌着一段英文。
+   */
+  locale?: DraftLanguage;
 };
 
 /** 榜单的中性说法。品牌名只在底部出现 */
-const NEUTRAL_FEED = "the trending list";
+const NEUTRAL_FEED_BY_LOCALE: Record<DraftLanguage, string> = {
+  EN_US: "the trending list",
+  ES_ES: "la lista de tendencias",
+  PT_BR: "a lista de tendências",
+  JA_JP: "トレンド一覧",
+};
+
+const NEUTRAL_FEED = NEUTRAL_FEED_BY_LOCALE.EN_US;
 
 /**
  * 整句删除的模板归因句式。
@@ -192,7 +209,8 @@ function stripAttributionClauses(text: string, names: string[]): string {
  * （"AI HOT reports that X" → 去掉主语，留下 X），也可能是地点状语
  * （"ranks #1 on AI HOT" → 换成中性说法）。分开处理才不会写出病句。
  */
-function neutralizeProvider(text: string): string {
+function neutralizeProvider(text: string, locale: DraftLanguage = "EN_US"): string {
+  const neutral = NEUTRAL_FEED_BY_LOCALE[locale] ?? NEUTRAL_FEED;
   return text
     // 归因主语：整个「AI HOT 说」去掉，保留后面的事实
     .replace(/\b(?:AI\s*HOT|the trending feed)\s+(?:reports?|reported|states?|stated|says?|said)\s+that\s+/gi, "")
@@ -205,8 +223,8 @@ function neutralizeProvider(text: string): string {
     .replace(/\b(?:AI\s*HOT|the trending feed)\s+lists?\s+/gi, "The trending list features ")
     // 所有格与定冠词
     .replace(/\b(?:AI\s*HOT|the trending feed)['’]s\s+/gi, "the ")
-    .replace(/\bthe\s+(?:AI\s*HOT|trending feed)\s+(?:board|leaderboard|list|feed)\b/gi, NEUTRAL_FEED)
-    .replace(/\b(?:on|in)\s+(?:AI\s*HOT|the trending feed)\b/gi, `on ${NEUTRAL_FEED}`)
+    .replace(/\bthe\s+(?:AI\s*HOT|trending feed)\s+(?:board|leaderboard|list|feed)\b/gi, neutral)
+    .replace(/\b(?:on|in)\s+(?:AI\s*HOT|the trending feed)\b/gi, `on ${neutral}`)
     // 标题式前缀 "AI HOT: xxx"
     .replace(/\bAI\s*HOT\s*[:：]\s*/gi, "")
     /*
@@ -217,8 +235,22 @@ function neutralizeProvider(text: string): string {
      * 它是修饰语，删掉刚好，替换反而坏事。
      */
     .replace(/\bAI\s*HOT\s+(?=[A-Z])/g, "")
+    /*
+     * CJK 里的同一种定语用法（「AI HOTランキング」「AI HOT 日報」）。
+     * 中日韩不写空格也没有大小写，上面那条 [A-Z] 规则一律漏掉，
+     * 于是品牌词掉进英文兜底，日语句子里就嵌进一段英文。
+     * 这里同样直接删：删完是「ランキング」，读着正常；
+     * 换成「トレンド一覧」反而成了「トレンド一覧ランキング」。
+     */
+    /*
+     * 日语的属格「AI HOTの日報」：**连同「の」一起删**。
+     * 只删品牌词会留下「の2026年8月1日デイリーブリーフィングでは…」——
+     * 句子以助词开头，是残句。助词本来就依附于被删掉的那个名字。
+     */
+    .replace(/\bAI\s*HOT\s*の\s*/gi, "")
+    .replace(/\bAI\s*HOT\s*(?=[\u3040-\u30ff\u3400-\u9fff])/gi, "")
     // 兜底
-    .replace(/\bAI\s*HOT\b/gi, NEUTRAL_FEED)
+    .replace(/\bAI\s*HOT\b/gi, neutral)
     .replace(/\bthe the\b/gi, "the");
 }
 
@@ -233,6 +265,8 @@ function dropDanglingLeaders(text: string): string {
     .split("\n")
     .map((line) => line
       .replace(/^\s*(?:によると|によれば|に基づくと)[、,]?\s*/g, "")
+      // 删名字后行首只剩一个助词（「の…」「は…」）—— 助词依附于那个名字，一起走
+      .replace(/^\s*[のはがを]\s*(?=[^\s])/g, "")
       .replace(/^\s*(?:Según|Segundo|De acordo com|Conforme(?:\s+relatado)?(?:\s+pel[ao])?)\s*[,，]?\s*/gi, "")
       .replace(/^\s*(?:According to)\s*[,]?\s*/gi, "")
       .replace(/(^|[.。!?]\s*)(?:によると|によれば)[、,]\s*/g, "$1")
@@ -282,7 +316,7 @@ export function redactAttribution(text: string, ctx: RedactionContext): string {
     if (!line.trim()) return "";
     // 1) 先在句内砍掉归因从句
     let work = stripAttributionClauses(line, tokens);
-    work = neutralizeProvider(work);
+    work = neutralizeProvider(work, ctx.locale);
     // 2) 再删「整句都是归因」的句子
     const sentences = splitSentences(work).filter(
       (s) => !PURE_ATTRIBUTION_SENTENCE.some((re) => re.test(s))

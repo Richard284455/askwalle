@@ -179,6 +179,24 @@ async function main() {
   section("二、租约与并发");
 
   {
+    /*
+     * 前置条件：不能有**外部进程**持着租约。
+     *
+     * 生产服务器起着的时候，它自己的 cron 会正常抢到租约 —— 那是租约在干活，
+     * 不是缺陷。但本节要验证的正是抢占语义，外部持有者会让后面八条断言
+     * 一起变红，看上去像八个 bug。先单独判一次，给出能直接照做的提示。
+     */
+    const foreign = (await residualLeases()).filter((l) => !l.locked_by?.startsWith(TEST_WORKER));
+    check("B0", "无外部进程持有租约（跑测试前请停掉 dev/prod server）",
+      foreign.length === 0,
+      foreign.map((l) => `${l.task_type}@${l.locked_by}`).join(", ") || "无");
+    if (foreign.length) {
+      console.log("\n  ⚠ 检测到外部租约持有者，租约与调度相关断言会失真。");
+      console.log("    请先停掉本地服务（preview_stop / kill 掉 next start）再重跑。\n");
+    }
+  }
+
+  {
     const t: AihotTaskType = "HOT_TOPICS";
     const a = await acquireLease(t, `${TEST_WORKER}-A`, 60_000);
     check("B1", "首个 worker 拿到租约", a.ok);
@@ -593,9 +611,11 @@ async function main() {
     const adminPage = readFileSync("src/app/(admin)/admin/content/aihot/page.tsx", "utf8");
     check("I6", "审核台 noindex", /robots: \{ index: false, follow: false \}/.test(adminPage));
 
-    const sitemap = readFileSync("src/app/sitemap.ts", "utf8");
+    const sitemap = codeOnly(readFileSync("src/app/sitemap.ts", "utf8"));
     check("I7", "sitemap 只收已发布页面", /listPublishedPaths/.test(sitemap));
-    check("I8", "sitemap 含四个榜单页", /\/trending/.test(sitemap) && /LOCALES\.map/.test(sitemap));
+    check("I8", "sitemap 含三个常驻列表页 × 四语言",
+      ["/trending", "/updates", "/briefings/daily"].every((p) => sitemap.includes(p))
+      && /LOCALES\.(?:map|flatMap)/.test(sitemap));
   }
 
   {

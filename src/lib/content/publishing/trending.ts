@@ -30,8 +30,8 @@ export type TrendingCard = {
   signalCount: number | null;
   capturedAt: Date;
   mode: HotTopicBriefMode;
-  /** 简报入口；该语言未发布时为 null */
-  briefHref: string | null;
+  /** 简报入口。该语言没有已发布简报的话题根本不进榜单，所以这里恒非空 */
+  briefHref: string;
 };
 
 export type TrendingListing = {
@@ -84,30 +84,50 @@ export async function listTrending(locale: DraftLanguage): Promise<TrendingListi
   for (const m of material) {
     const fam = byKey.get(hotTopicUnitKey(m.topicId));
     const pub = fam?.translations[0]?.publications[0];
-    let headline = m.title;
-    if (pub) {
-      const rev = await prisma.articleRevision.findUnique({
-        where: { id: pub.revision_id }, select: { headline: true },
-      });
-      if (rev?.headline) {
-        // 标题同样过一遍剔除：早期标题里带过品牌名
-        headline = redactAttribution(rev.headline, {
-          sourceNames: m.sourceNames, title: rev.headline, providerName: "AI HOT",
-        });
-      }
-    }
+    /*
+     * **该语言没有已发布简报的话题不上榜。**
+     *
+     * 以前这里会退回热点本身的标题，而那是 AI HOT 给的原语言（中文）标题 ——
+     * 英文榜单上于是混进中文卡片，点进去还没有页面。
+     * 公开面上的每一行文字都该是我们自己产出的、这一语言的内容；
+     * 拿不到就先不上榜，而不是把信源的原文标题当占位符印出去。
+     *
+     * 这不影响「最新 revision 未发布时卡片仍显示实时数据」：
+     * 那种话题有已发布的旧版，照常上榜，名次与计数取当前快照。
+     */
+    if (!pub) continue;
+
+    const rev = await prisma.articleRevision.findUnique({
+      where: { id: pub.revision_id }, select: { headline: true },
+    });
+    if (!rev?.headline) continue;
+    // 标题同样过一遍剔除：早期标题里带过品牌名
+    const headline = redactAttribution(rev.headline, {
+      sourceNames: m.sourceNames, title: rev.headline, providerName: "AI HOT", locale,
+    });
+
     cards.push({
       key: cardKey(m.topicId),
       headline,
+      // 掉出当前榜单的话题 rank 为 null —— 不显示名次徽标，而不是挂着上次的名次
       rank: m.rank,
       sourceCount: m.sourceCount,
       signalCount: m.signalCount,
       capturedAt: m.capturedAt,
       mode: m.mode,
-      briefHref: pub ? pub.path : null,
+      briefHref: pub.path,
     });
   }
-  cards.sort((a, b) => (a.rank ?? 999) - (b.rank ?? 999));
+  /*
+   * 当前在榜的按名次排，掉出榜单的排在后面、按最近抓取时间倒序。
+   * 把无名次的当成 999 混排会让它们和真实名次交错，看不出哪些是「现在的榜」。
+   */
+  cards.sort((a, b) => {
+    if (a.rank !== null && b.rank !== null) return a.rank - b.rank;
+    if (a.rank !== null) return -1;
+    if (b.rank !== null) return 1;
+    return b.capturedAt.getTime() - a.capturedAt.getTime();
+  });
   return { cards, attribution };
 }
 
