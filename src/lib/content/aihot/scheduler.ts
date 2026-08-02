@@ -7,7 +7,7 @@ import { prisma } from "@/lib/prisma";
 
 import type { AihotRetryEvent, AihotTransport } from "./client";
 import { ingestDaily, ingestHotTopics, type IngestResult } from "./ingest";
-import { syncSelected } from "./sync";
+import { ingestItemsAll, syncSelected } from "./sync";
 import { acquireLease, LEASE_TTL_MS, newWorkerId, releaseLease, startHeartbeat } from "./lease";
 import { ML_GENERATION_VERSION } from "./types";
 
@@ -30,9 +30,16 @@ export const TASK_SCHEDULE: Record<AihotTaskType, { cron: string; everyMs: numbe
   HOT_TOPICS: { cron: "*/5 * * * *", everyMs: 5 * 60_000, label: "当前热点" },
   SELECTED: { cron: "*/10 * * * *", everyMs: 10 * 60_000, label: "精选资讯" },
   DAILY: { cron: "*/30 * * * *", everyMs: 30 * 60_000, label: "AI 日报" },
+  /*
+   * 未筛选流没有增量契约，只能整段重取，而且只覆盖最近 window ——
+   * 掉出窗口的条目就永远补不回来了。所以它必须**在窗口内**定期跑。
+   * 每 6 小时一次、取 24h 窗口：既远小于 7 天的窗口上限（漏不掉），
+   * 又不至于每半小时把两千条重扫一遍。
+   */
+  ITEMS_ALL: { cron: "17 */6 * * *", everyMs: 6 * 60 * 60_000, label: "未筛选条目流" },
 };
 
-export const ALL_TASKS: AihotTaskType[] = ["HOT_TOPICS", "SELECTED", "DAILY"];
+export const ALL_TASKS: AihotTaskType[] = ["HOT_TOPICS", "SELECTED", "DAILY", "ITEMS_ALL"];
 
 /**
  * 单轮生成上限。
@@ -44,6 +51,8 @@ const DEFAULT_MAX_UNITS: Record<AihotTaskType, number> = {
   HOT_TOPICS: 10,
   SELECTED: 8,
   DAILY: 2,
+  // 未筛选流只入库，不出稿 —— 那些条目 AI HOT 自己都没选中
+  ITEMS_ALL: 0,
 };
 
 /**
@@ -132,6 +141,8 @@ export type ScheduledRunResult = {
 
 const KIND_OF: Record<AihotTaskType, "SELECTED" | "HOT_TOPIC" | "DAILY"> = {
   SELECTED: "SELECTED", HOT_TOPICS: "HOT_TOPIC", DAILY: "DAILY",
+  // 只入库不出稿，这个映射用不到；给一个值只为类型完整
+  ITEMS_ALL: "SELECTED",
 };
 
 // ── 候选单元 ──────────────────────────────────────────────────────────────
@@ -223,6 +234,9 @@ async function candidatesFor(
       done, cooling, max
     );
   }
+
+  // 未筛选流不出稿：那些条目 AI HOT 自己没选中，我们也不替它做这个判断
+  if (taskType === "ITEMS_ALL") return [];
 
   if (taskType === "HOT_TOPICS") {
     const ids = await latestSnapshotIds();
@@ -364,6 +378,17 @@ export async function runScheduledTask(
         message: bootstrapped
           ? `水位不可用，已自动回落全量快照（${result.pages} 页）${result.message ? ` — ${result.message}` : ""}`
           : result.message,
+      };
+    } else if (taskType === "ITEMS_ALL") {
+      const r = await ingestItemsAll({ ...fetchOpts, window: "24h" });
+      ingest = {
+        endpoint: "/api/v1/items?mode=all",
+        status: r.status,
+        fetched: r.fetched, created: r.created, updated: r.updated, unchanged: r.unchanged,
+        skipped: [],
+        message: r.status === "OK"
+          ? `${r.pages} 页 · 其中 AI HOT 已入选 ${r.selectedSeen} 条`
+          : r.message,
       };
     } else if (taskType === "HOT_TOPICS") ingest = await ingestHotTopics(fetchOpts);
     else ingest = await ingestDaily(fetchOpts);

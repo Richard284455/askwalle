@@ -229,3 +229,68 @@ export async function backfillDailies(
   }
   return out;
 }
+
+// ── 未筛选条目流（items?mode=all）────────────────────────────────────────
+
+export type AllStreamResult = {
+  status: "OK" | "FAILED";
+  pages: number;
+  fetched: number;
+  created: number;
+  updated: number;
+  unchanged: number;
+  skipped: number;
+  selectedSeen: number;
+  message: string | null;
+};
+
+/**
+ * 拉未筛选的全量条目流。
+ *
+ * 与精选快照是**两回事**，别把它当「更全的全量」：
+ *   - 它只覆盖最近 window（API 最多 7d），更早的条目取不到，
+ *     所以必须在窗口内定期跑，掉出窗口就永远补不回来了；
+ *   - 它**没有增量契约**（没有 cursor、没有 remove），只能整段重取；
+ *   - 里面绝大多数条目 AI HOT 自己没有选中（实测 7 天 1969 条里 1871 条未入选）。
+ *
+ * 未入选的条目照常入库、`selected=false` 且 `deselected_at` 为 null ——
+ * 「从未入选」与「被取消精选」是两种状态，混成一个标记就再也分不开。
+ * 自动生成只覆盖 selected=true，所以这些条目不会自己排队烧 provider 调用。
+ */
+export async function ingestItemsAll(
+  opts: SyncOptions & { window?: string } = {}
+): Promise<AllStreamResult> {
+  const windowSpec = opts.window ?? "7d";
+  const maxPages = opts.maxPages ?? 60;
+  const out: AllStreamResult = {
+    status: "OK", pages: 0, fetched: 0, created: 0, updated: 0,
+    unchanged: 0, skipped: 0, selectedSeen: 0, message: null,
+  };
+
+  let cursor: string | null = null;
+  while (out.pages < maxPages) {
+    const ep = ENDPOINTS.itemsAll(windowSpec, LIMITS.itemsPage, cursor);
+    // 翻页不做条件请求：每页内容不同，共用一个 ETag 键只会互相顶掉
+    const res = await fetchAihot(ep.path, { ...opts, etag: null });
+    if (!res.ok) return { ...out, status: "FAILED", message: res.reason };
+    if (res.status === 304) break;
+
+    const payload = res.data as {
+      items?: AihotItemDto[]; page?: { hasMore?: boolean; nextCursor?: string };
+    } | null;
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    out.pages++;
+    out.fetched += items.length;
+    out.selectedSeen += items.filter((i) => i?.selected).length;
+
+    const w = await upsertSelectedBatch(items, { dryRun: opts.dryRun });
+    out.created += w.created;
+    out.updated += w.updated;
+    out.unchanged += w.unchanged;
+    out.skipped += w.skipped;
+
+    if (!payload?.page?.hasMore || !payload.page.nextCursor) break;
+    cursor = payload.page.nextCursor;
+  }
+  return out;
+}

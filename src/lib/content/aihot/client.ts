@@ -225,6 +225,9 @@ export const ENDPOINTS = {
     return { key: `items-all-${windowSpec}`, path: `/api/v1/items?${qs.toString()}` };
   },
   hotTopics: () => ({ key: "hot-topics", path: "/api/v1/hot-topics" }),
+  /** publicId 必须来自 links.story 末段，**不得自行构造** */
+  story: (publicId: string) =>
+    ({ key: `story-${publicId}`, path: `/api/v1/stories/${encodeURIComponent(publicId)}` }),
   dailyLatest: () => ({ key: "dailies-latest", path: "/api/v1/dailies/latest" }),
   dailyIndex: (limit: number) => ({ key: `dailies-index-${limit}`, path: `/api/v1/dailies?limit=${limit}` }),
   dailyByDate: (date: string) => ({ key: `dailies-${date}`, path: `/api/v1/dailies/${date}` }),

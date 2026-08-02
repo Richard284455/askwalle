@@ -1422,6 +1422,11 @@ model AihotSelectedItem {
   /// 内容指纹。AI HOT 侧内容变化后可据此判断是否需要重新生成
   source_snapshot_hash String
 
+  /// 被取消精选的时刻。**null 且 selected=false 表示「从未入选」**——
+  /// 未筛选流带进来的条目就是这种；两者不区分的话，
+  /// 「这条是被拿下来的还是本来就没选中」永远答不清楚
+  deselected_at DateTime?
+
   first_seen_at DateTime @default(now())
   last_seen_at  DateTime @default(now())
   created_at    DateTime @default(now())
@@ -1463,6 +1468,19 @@ model AihotHotTopicSnapshot {
 
   latest_at   DateTime?
   captured_at DateTime  @default(now())
+
+  // ── story 素材（GET /api/v1/stories/{publicId}）──
+  //
+  // publicId **只能**从 links.story 这个 HTML 地址的末段提取，不得自行拼接；
+  // links.story 缺失时就是没有 story，不去猜一个 id 试。
+  /// 从 links.story 末段提取的 publicId；没有 story 时为 null
+  story_public_id         String?
+  /// AI 摘要。随事件推进会被重写，所以它进内容指纹
+  story_digest            String?
+  story_digest_updated_at DateTime?
+  /// 报道时间线（标题/摘要/来源/时间/链接），不保存第三方完整正文
+  story_reports_json      Json?
+  story_report_count      Int?
 
   source_snapshot_hash String
 
@@ -1801,6 +1819,8 @@ enum AihotTaskType {
   SELECTED
   HOT_TOPICS
   DAILY
+  /// 未筛选的全量条目流（items?mode=all）。只覆盖最近 window，且没有增量契约
+  ITEMS_ALL
 }
 
 enum AihotTaskStatus {

@@ -33,6 +33,10 @@ export type HotTopicMaterial = {
   representativeSourceName: string | null;
   /** API 给出的热点摘要；多数情况下没有 */
   apiSummary: string | null;
+  /** story 的 AI 摘要（GET /api/v1/stories/{publicId}）。有它就够写一篇有内容的简报 */
+  storyDigest: string | null;
+  /** story 的报道时间线，只含 AI HOT 自己给出的标题/摘要字段 */
+  storyReports: { title: string; summary: string | null; sourceName: string | null; publishedAt: string | null }[];
   /** 按**精确条目 ID** 关联上的已入库精选。不按来源名猜 */
   relatedItems: { title: string; summary: string | null; sourceName: string | null; aihotUrl: string | null }[];
   mode: HotTopicBriefMode;
@@ -57,7 +61,15 @@ export async function loadHotTopicMaterial(snapshotId: number): Promise<HotTopic
     : [];
 
   const apiSummary = s.summary && s.summary.trim().length >= MIN_SUMMARY_CHARS ? s.summary.trim() : null;
-  const mode: HotTopicBriefMode = apiSummary || related.length ? "ENRICHED" : "SIGNAL";
+  const storyDigest = s.story_digest && s.story_digest.trim().length >= MIN_SUMMARY_CHARS
+    ? s.story_digest.trim() : null;
+  const storyReports = (Array.isArray(s.story_reports_json) ? s.story_reports_json : []) as unknown as
+    { title: string; summary: string | null; sourceName: string | null; publishedAt: string | null }[];
+  /*
+   * story 的 digest 是真正的事件摘要 —— 有它就不再是「只有标题的榜单信号」。
+   * 素材丰富度决定写法，这一条与 apiSummary、关联精选同级。
+   */
+  const mode: HotTopicBriefMode = apiSummary || storyDigest || related.length ? "ENRICHED" : "SIGNAL";
 
   return {
     snapshotId: s.id, topicId: s.topic_id, title: s.title, rank: s.rank,
@@ -66,6 +78,8 @@ export async function loadHotTopicMaterial(snapshotId: number): Promise<HotTopic
     aihotUrl: s.aihot_url, originalUrl: httpUrlOrNull(s.original_url),
     representativeSourceName: s.source_name,
     apiSummary,
+    storyDigest,
+    storyReports,
     relatedItems: related.map((r) => ({
       title: r.title, summary: r.summary, sourceName: r.source_name, aihotUrl: httpUrlOrNull(r.aihot_url),
     })),
@@ -126,6 +140,8 @@ export function hotTopicFactFingerprint(m: HotTopicMaterial): string {
     m.signalCount ?? "",
     m.sourceNames.join("|"),
     m.apiSummary ?? "",
+    // digest 会随事件被重写，是事实字段，必须进指纹
+    m.storyDigest ?? "",
     m.relatedItems.map((r) => r.title).join("|"),
   ].join("§");
 }

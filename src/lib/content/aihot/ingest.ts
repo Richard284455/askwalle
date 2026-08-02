@@ -6,8 +6,8 @@ import { ENDPOINTS, fetchAihot, loadEtag, saveEtag, type AihotClientOptions } fr
 import {
   AIHOT_ATTRIBUTION_NAME, AIHOT_PROVIDER,
   dailyReportHash, hotTopicHash, httpUrlOrNull, isReportDate, itemIdFromAihotUrl,
-  mapCategory, parseDate, selectedItemHash,
-  type AihotDailyReportDto, type AihotHotTopicDto, type AihotItemDto,
+  mapCategory, parseDate, selectedItemHash, storyPublicIdFromUrl,
+  type AihotDailyReportDto, type AihotHotTopicDto, type AihotItemDto, type AihotStoryDto,
 } from "./types";
 
 /**
@@ -210,7 +210,7 @@ export async function upsertSelectedBatch(
 export async function deselectItem(providerItemId: string): Promise<boolean> {
   const r = await prisma.aihotSelectedItem.updateMany({
     where: { provider: AIHOT_PROVIDER, provider_item_id: providerItemId, selected: true },
-    data: { selected: false, last_seen_at: new Date() },
+    data: { selected: false, deselected_at: new Date(), last_seen_at: new Date() },
   });
   return r.count > 0;
 }
@@ -279,7 +279,27 @@ export async function ingestHotTopics(
       continue;
     }
 
-    const hash = hotTopicHash(dto);
+    /*
+     * story 素材。
+     *
+     * publicId **只能**从 links.story 末段提取 —— 那是 AI HOT 明写的契约：
+     * 「Do not construct story ids when absent」。早先误用 topic.id 去请求
+     * /stories/{id}，拿回的是 404：两者根本不是同一个标识。
+     * links.story 缺失就是没有 story，不去猜。
+     */
+    const storyPublicId = storyPublicIdFromUrl(dto.links?.story);
+    let story: AihotStoryDto | null = null;
+    if (storyPublicId) {
+      const sres = await fetchAihot(ENDPOINTS.story(storyPublicId).path, { ...args, etag: null });
+      if (sres.ok && sres.status === 200) {
+        story = (sres.data as { story?: AihotStoryDto } | null)?.story ?? null;
+      }
+      // story 拿不到不影响热点本身入库：它是加分素材，不是必要条件
+    }
+    const storyDigest = story?.digest?.trim() || null;
+
+    // digest 进内容指纹：它随事件推进被重写，变了就该出新版本
+    const hash = hotTopicHash(dto, storyDigest);
     // AI HOT 只给出代表条目的地址，关联条目 ID 由该地址解析而来 ——
     // **不做名称模糊匹配**：那是推断，不是信源给的事实
     const representativeItemId = itemIdFromAihotUrl(aihotUrl);
@@ -333,6 +353,18 @@ export async function ingestHotTopics(
         original_url: httpUrlOrNull(dto.links?.original),
         latest_at: parseDate(dto.latestAt),
         captured_at: capturedAt,
+        story_public_id: storyPublicId,
+        story_digest: storyDigest,
+        story_digest_updated_at: parseDate(story?.digestUpdatedAt),
+        // 只保留 AI HOT 自己给出的标题/摘要字段，**不保存第三方完整正文**
+        story_reports_json: ((story?.reports ?? []).map((r) => ({
+          title: r.title?.trim() ?? "",
+          summary: r.summary?.trim() || null,
+          sourceName: r.source?.name?.trim() || null,
+          publishedAt: r.publishedAt ?? null,
+          aihotUrl: httpUrlOrNull(r.links?.aihot),
+        })).filter((r) => r.title)) as unknown as Prisma.InputJsonValue,
+        story_report_count: typeof story?.reportCount === "number" ? story.reportCount : null,
         source_snapshot_hash: hash,
       },
     });

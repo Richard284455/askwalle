@@ -6,12 +6,13 @@
  *   npm run aihot:backfill -- --selected       # 只做精选全量快照
  *   npm run aihot:backfill -- --dailies        # 只补日报
  *   npm run aihot:backfill -- --incremental    # 只走增量（水位失效会自动回落全量）
+ *   npm run aihot:backfill -- --all-stream     # 未筛选条目流（items?mode=all，仅最近 7 天）
  *   npm run aihot:backfill -- --status         # 看当前水位与库存
  *
  * 只走 API v1，不抓网页。**只写来源表，不生成内容、不发布。**
  */
 import { loadSelectedCursor } from "@/lib/content/aihot/client";
-import { backfillDailies, backfillSelected, syncSelected } from "@/lib/content/aihot/sync";
+import { backfillDailies, backfillSelected, ingestItemsAll, syncSelected } from "@/lib/content/aihot/sync";
 import { prisma } from "@/lib/prisma";
 
 const argv = process.argv.slice(2);
@@ -23,18 +24,20 @@ const DRY = has("--dry-run");
 async function stock() {
   const selected = await prisma.aihotSelectedItem.count();
   const active = await prisma.aihotSelectedItem.count({ where: { selected: true } });
+  const deselected = await prisma.aihotSelectedItem.count({ where: { deselected_at: { not: null } } });
   const dailies = await prisma.aihotDailyReport.count();
   const topics = await prisma.aihotHotTopicSnapshot.count();
   const cursor = await loadSelectedCursor();
-  console.log(`库存：精选 ${selected}（在选 ${active} · 已取消 ${selected - active}） · 日报 ${dailies} · 热点快照 ${topics}`);
+  console.log(`库存：条目 ${selected}（在选 ${active} · 被取消精选 ${deselected} · 从未入选 ${selected - active - deselected}） · 日报 ${dailies} · 热点快照 ${topics}`);
   console.log(`同步水位：${cursor ? `${cursor.slice(0, 24)}…（长度 ${cursor.length}）` : "（无，下次会做全量）"}`);
 }
 
 async function main() {
   if (has("--status")) { await stock(); return; }
 
-  const wantSelected = has("--selected") || (!has("--dailies") && !has("--incremental"));
-  const wantDailies = has("--dailies") || (!has("--selected") && !has("--incremental"));
+  const only = has("--dailies") || has("--incremental") || has("--all-stream") || has("--selected");
+  const wantSelected = has("--selected") || !only;
+  const wantDailies = has("--dailies") || !only;
 
   console.log(`AI HOT 回填${DRY ? "（dry-run）" : ""}\n`);
   await stock();
@@ -65,6 +68,16 @@ async function main() {
     const r = await backfillDailies({ dryRun: DRY, days: val("--days") ? Number(val("--days")) : undefined, force: has("--force") });
     console.log(`  ${r.status === "OK" ? "✅" : "❌"} ${r.status} · 索引 ${r.indexed} 天`);
     console.log(`     新建 ${r.created} · 更新 ${r.updated} · 已有跳过 ${r.unchanged} · 失败 ${r.failed}`);
+    if (r.message) console.log(`     ${r.message}`);
+    if (r.status === "FAILED") process.exitCode = 1;
+  }
+
+  if (has("--all-stream")) {
+    console.log("── 未筛选条目流（items?mode=all）──");
+    const r = await ingestItemsAll({ dryRun: DRY, window: val("--window") ?? "7d" });
+    console.log(`  ${r.status === "OK" ? "✅" : "❌"} ${r.status} · ${r.pages} 页 · 取回 ${r.fetched}`);
+    console.log(`     新建 ${r.created} · 更新 ${r.updated} · 未变 ${r.unchanged} · 跳过 ${r.skipped}`);
+    console.log(`     其中 AI HOT 已入选 ${r.selectedSeen} 条，其余 ${r.fetched - r.selectedSeen} 条未入选（不会自动出稿）`);
     if (r.message) console.log(`     ${r.message}`);
     if (r.status === "FAILED") process.exitCode = 1;
   }

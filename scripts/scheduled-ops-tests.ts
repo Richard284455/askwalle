@@ -21,7 +21,7 @@ import {
   acquireLease, releaseLease, renewLease, residualLeases,
 } from "@/lib/content/aihot/lease";
 import { runScheduledTask, runAllScheduledTasks, TASK_SCHEDULE, ALL_TASKS } from "@/lib/content/aihot/scheduler";
-import { hotTopicHash, type AihotHotTopicDto } from "@/lib/content/aihot/types";
+import { hotTopicHash, storyPublicIdFromUrl, type AihotHotTopicDto } from "@/lib/content/aihot/types";
 import { hotTopicFactFingerprint, type HotTopicMaterial } from "@/lib/content/publishing/eligibility";
 import { diffProtectedState, type ProtectedState } from "@/lib/content/publishing/protected-baseline";
 import { buildComparison, tabOf, QUEUE_TABS, type LocaleContent, type QueueRow } from "@/lib/content/publishing/queue";
@@ -255,6 +255,40 @@ async function main() {
   }
 
   {
+    // publicId 只能从 links.story 末段取，**绝不自行拼接**
+    check("S18", "从 links.story 末段提取 publicId",
+      storyPublicIdFromUrl("https://aihot.virxact.com/story/dcda0e3a-e856-44a8-b502-17fa0707ef51")
+        === "dcda0e3a-e856-44a8-b502-17fa0707ef51");
+    check("S19", "links.story 缺失时不猜 id", storyPublicIdFromUrl(null) === null
+      && storyPublicIdFromUrl(undefined) === null);
+    check("S20", "条目页地址不是 story 地址（早先误用 topic.id 拿到 404）",
+      storyPublicIdFromUrl("https://aihot.virxact.com/items/cmsa77lmk02tcrox0gfhj3rcq") === null);
+
+    const dto: AihotHotTopicDto = {
+      id: "t", title: "T", sourceCount: 3, signalCount: 5, sourceNames: ["A"],
+      links: { aihot: "https://aihot.virxact.com/items/abcdefgh" }, latestAt: "2026-08-01T00:00:00Z",
+    };
+    check("S21", "story digest 进内容指纹（digest 被重写就该出新版本）",
+      hotTopicHash(dto, "digest-v1") !== hotTopicHash(dto, "digest-v2"));
+    check("S22", "没有 digest 时指纹与旧口径一致", hotTopicHash(dto, null) === hotTopicHash(dto));
+
+    check("S23", "未筛选流是独立任务类型", ALL_TASKS.includes("ITEMS_ALL"));
+    check("S24", "未筛选流的调度周期在 7 天窗口内（掉出窗口就补不回来）",
+      TASK_SCHEDULE.ITEMS_ALL.everyMs < 7 * 24 * 60 * 60_000,
+      TASK_SCHEDULE.ITEMS_ALL.cron);
+
+    const g = fakeGenerate("OK");
+    const r = await runScheduledTask("ITEMS_ALL", {
+      workerId: `${TEST_WORKER}-all`,
+      transport: scripted([{ status: 200, body: { items: [], page: { hasMore: false } } }]).transport,
+      generate: g.fn, freeze: fakeFreeze,
+    });
+    check("S25", "未筛选流只入库、不出稿", r.unitsConsidered === 0 && g.seen.length === 0 && r.providerCalls === 0,
+      `候选 ${r.unitsConsidered} · 生成 ${g.seen.length}`);
+    check("S26", "未筛选流同样零发布", r.publicationsCreated === 0);
+  }
+
+  {
     const src = codeOnly(readFileSync("src/lib/content/aihot/sync.ts", "utf8"));
     check("S12", "取消精选不删行（已发布内容的追溯链不能断）",
       !/aihotSelectedItem\.delete/.test(src)
@@ -263,7 +297,9 @@ async function main() {
     check("S13", "deselect 只标记 selected=false", /selected: false/.test(ingest) && !/aihotSelectedItem\.delete/.test(ingest));
 
     const sched = codeOnly(readFileSync("src/lib/content/aihot/scheduler.ts", "utf8"));
-    check("S14", "精选定时任务改走水位增量", /syncSelected/.test(sched) && !/window: "24h"/.test(sched));
+    // 精选那条走水位；window 只剩未筛选流在用（它没有增量契约，只能按窗口重取）
+    check("S14", "精选定时任务改走水位增量",
+      /syncSelected\(fetchOpts\)/.test(sched) && !/ingestSelected/.test(sched));
     check("S15", "自动生成只覆盖时效窗口内的条目", /SELECTED_RECENCY_MS/.test(sched));
     check("S16", "已取消精选的条目不再排队生成", /selected: true/.test(sched));
   }
@@ -433,7 +469,7 @@ async function main() {
       workerId: `${TEST_WORKER}-d`, transport, wait: rec.wait, dryRun: true,
     });
     const byType = new Map(rs.map((r) => [r.taskType, r]));
-    check("D1", "三类都跑到了", rs.length === 3);
+    check("D1", "每一类都跑到了", rs.length === ALL_TASKS.length, `${rs.length}/${ALL_TASKS.length}`);
     check("D2", "热点失败", byType.get("HOT_TOPICS")!.status === "FAILED");
     check("D3", "精选不受影响", byType.get("SELECTED")!.status === "NOT_MODIFIED");
     check("D4", "日报不受影响", byType.get("DAILY")!.status === "NOT_MODIFIED");
@@ -441,8 +477,8 @@ async function main() {
   }
 
   {
-    check("D6", "三类调度周期互不相同",
-      new Set(ALL_TASKS.map((t) => TASK_SCHEDULE[t].cron)).size === 3,
+    check("D6", "各类调度周期互不相同",
+      new Set(ALL_TASKS.map((t) => TASK_SCHEDULE[t].cron)).size === ALL_TASKS.length,
       ALL_TASKS.map((t) => `${t}=${TASK_SCHEDULE[t].cron}`).join(" "));
     check("D7", "热点 5 分钟", TASK_SCHEDULE.HOT_TOPICS.cron === "*/5 * * * *");
     check("D8", "精选 10 分钟", TASK_SCHEDULE.SELECTED.cron === "*/10 * * * *");
@@ -537,7 +573,7 @@ async function main() {
       snapshotId: 1, topicId: "t", title: "标题", rank: 1, sourceCount: 3, signalCount: 5,
       sourceNames: ["A"], capturedAt: new Date(), latestAt: null,
       aihotUrl: "https://aihot.virxact.com/items/abcdefgh", originalUrl: null,
-      representativeSourceName: null, apiSummary: null, relatedItems: [],
+      representativeSourceName: null, apiSummary: null, storyDigest: null, storyReports: [], relatedItems: [],
       mode: "SIGNAL", attributionUrlValid: true, snapshotHash: "h",
     };
     check("E8", "事实指纹排除名次",
@@ -556,7 +592,9 @@ async function main() {
   {
     const src = readFileSync("src/lib/content/publishing/eligibility.ts", "utf8");
     check("F1", "不存在信息不足门禁", !/HOT_TOPIC_INSUFFICIENT_FOR_PUBLICATION/.test(src));
-    check("F2", "模式由素材决定", /apiSummary \|\| related\.length \? "ENRICHED" : "SIGNAL"/.test(src));
+    // 素材有三种来源：API 摘要、story digest、可精确关联的已入库精选
+    check("F2", "模式由素材决定",
+      /apiSummary \|\| storyDigest \|\| related\.length \? "ENRICHED" : "SIGNAL"/.test(src));
     const pre = readFileSync("src/lib/content/publishing/publish.ts", "utf8");
     check("F3", "preflight 不含素材充分性门禁", !/INSUFFICIENT/.test(pre));
   }
