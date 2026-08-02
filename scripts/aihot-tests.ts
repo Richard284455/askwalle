@@ -175,8 +175,20 @@ async function main() {
     const r = await fetchAihot("/api/public/items", { transport, wait: noWait });
     check("A15", "拒绝非 v1 端点（旧 /api/public/* 不可用）", !r.ok && calls() === 0);
   }
-  check("A16", "Retry-After 支持 HTTP 日期",
-    parseRetryAfter(new Date(Date.now() + 5000).toUTCString(), Date.now())! >= 4000);
+  {
+    /*
+     * 用**固定**的 now，不用 Date.now()。
+     * HTTP 日期只精确到秒，toUTCString() 会把毫秒截掉；now 取实时值时，
+     * 跨过秒边界就会少算最多 999ms —— 这条断言因此会偶发性变红，
+     * 而偶发变红的测试最终等于没有测试。
+     */
+    const now = Date.parse("2026-08-02T00:00:00.000Z");
+    const at = new Date(now + 5000).toUTCString();
+    check("A16", "Retry-After 支持 HTTP 日期", parseRetryAfter(at, now) === 5000,
+      String(parseRetryAfter(at, now)));
+    check("A16b", "HTTP 日期已过期时按 0 处理（不出现负等待）",
+      parseRetryAfter(new Date(now - 10_000).toUTCString(), now) === 0);
+  }
   check("A17", "Retry-After 缺失返回 null", parseRetryAfter(undefined) === null);
 
   section("B  链接与标识");

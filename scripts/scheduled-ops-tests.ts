@@ -21,7 +21,9 @@ import {
   acquireLease, releaseLease, renewLease, residualLeases,
 } from "@/lib/content/aihot/lease";
 import { runScheduledTask, runAllScheduledTasks, TASK_SCHEDULE, ALL_TASKS } from "@/lib/content/aihot/scheduler";
-import { hotTopicHash, storyPublicIdFromUrl, type AihotHotTopicDto } from "@/lib/content/aihot/types";
+import { hotTopicHash, storyPublicIdFromUrl, textSimilarity, type AihotHotTopicDto } from "@/lib/content/aihot/types";
+import { decideDigest } from "@/lib/content/aihot/ingest";
+import { resolveNewsroomModel, saveNewsroomModel } from "@/lib/content/multilingual/model-settings";
 import { hotTopicFactFingerprint, type HotTopicMaterial } from "@/lib/content/publishing/eligibility";
 import { diffProtectedState, type ProtectedState } from "@/lib/content/publishing/protected-baseline";
 import { buildComparison, tabOf, QUEUE_TABS, type LocaleContent, type QueueRow } from "@/lib/content/publishing/queue";
@@ -286,6 +288,56 @@ async function main() {
     check("S25", "未筛选流只入库、不出稿", r.unitsConsidered === 0 && g.seen.length === 0 && r.providerCalls === 0,
       `候选 ${r.unitsConsidered} · 生成 ${g.seen.length}`);
     check("S26", "未筛选流同样零发布", r.publicationsCreated === 0);
+  }
+
+  {
+    // ── digest 重写节流 ──
+    const long = "OpenAI 宣布其下一代模型 Astra 解决了数学与理论计算机科学领域的十项重大开放问题，总成本约两千美元。";
+    // 纯排版改动：只动标点与空格，归一化后逐字相同
+    const cosmetic = "OpenAI 宣布其下一代模型 Astra 解决了数学与理论计算机科学领域的十项重大开放问题、总成本约两千美元";
+    // 换了写法但意思一样 —— 这种**算**实质变化，一天最多重写一次已经够克制了
+    const reworded = "OpenAI 宣布其下一代模型 Astra 解决了数学与理论计算机科学领域的十项重大开放问题，总成本约 2000 美元。";
+    const rewritten = "苹果发布新款芯片，性能较上一代提升四成，将于第四季度随新机型出货，售价维持不变。";
+    const dayAgo = new Date(Date.now() - 25 * 60 * 60_000);
+    const hourAgo = new Date(Date.now() - 60 * 60_000);
+
+    check("T1", "首次拿到 digest 直接采纳",
+      decideDigest({ incoming: long, stored: null, storedAt: null }).adopted);
+    check("T2", "纯排版改动不触发重写",
+      decideDigest({ incoming: cosmetic, stored: long, storedAt: dayAgo }).adopted === false,
+      `相似度 ${textSimilarity(cosmetic, long).toFixed(3)}`);
+    check("T2b", "换写法算实质变化（隔天才会被采纳，不会当天连改）",
+      decideDigest({ incoming: reworded, stored: long, storedAt: dayAgo }).reason === "MATERIAL_CHANGE"
+      && decideDigest({ incoming: reworded, stored: long, storedAt: hourAgo }).reason === "TOO_SOON",
+      `相似度 ${textSimilarity(reworded, long).toFixed(3)}`);
+    check("T3", "改动够大且隔了一天才采纳",
+      decideDigest({ incoming: rewritten, stored: long, storedAt: dayAgo }).reason === "MATERIAL_CHANGE");
+    check("T4", "改动够大但当天已采纳过 —— 压到明天",
+      decideDigest({ incoming: rewritten, stored: long, storedAt: hourAgo }).reason === "TOO_SOON");
+    check("T5", "未采纳时沿用旧 digest（不丢素材）",
+      decideDigest({ incoming: rewritten, stored: long, storedAt: hourAgo }).digest === long);
+    check("T6", "本轮没取到 digest 时不清空已有素材",
+      decideDigest({ incoming: null, stored: long, storedAt: hourAgo }).digest === long);
+    check("T7", "逐字相同直接判未变", decideDigest({ incoming: long, stored: long, storedAt: dayAgo }).reason === "UNCHANGED");
+    check("T8", "相似度自身可用", textSimilarity("abc", "abc") === 1 && textSimilarity("abc", "xyz") === 0);
+    check("T9", "未采纳的 digest 不进指纹（指纹用的是采纳值）",
+      hotTopicHash({ id: "t", title: "T", links: {} }, decideDigest({
+        incoming: rewritten, stored: long, storedAt: hourAgo,
+      }).digest) === hotTopicHash({ id: "t", title: "T", links: {} }, long));
+
+    // ── Newsroom 模型设置 ──
+    const gen = codeOnly(readFileSync("src/lib/content/multilingual/generate.ts", "utf8"));
+    check("T10", "生成不再写死 provider", !/args\.provider \?\? "deepseek"/.test(gen) && /resolveNewsroomModel/.test(gen));
+    check("T11", "provider 不可用时如实失败，不悄悄换一个",
+      /configured && !configured\.available/.test(gen) && /GENERATION_FAILED/.test(gen));
+    const route = codeOnly(readFileSync("src/app/api/admin/settings/newsroom-model/route.ts", "utf8"));
+    check("T12", "模型设置接口要求管理员", /requireAdmin/.test(route));
+
+    const current = await resolveNewsroomModel();
+    check("T13", "能解析出当前生效的模型", Boolean(current.provider),
+      `${current.provider}${current.model ? ` · ${current.model}` : "（默认模型）"} · ${current.source}`);
+    const bad = await saveNewsroomModel({ provider: "not-a-provider" });
+    check("T14", "未知 provider 被拒", !bad.ok);
   }
 
   {

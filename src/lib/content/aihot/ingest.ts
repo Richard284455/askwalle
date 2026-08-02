@@ -6,7 +6,7 @@ import { ENDPOINTS, fetchAihot, loadEtag, saveEtag, type AihotClientOptions } fr
 import {
   AIHOT_ATTRIBUTION_NAME, AIHOT_PROVIDER,
   dailyReportHash, hotTopicHash, httpUrlOrNull, isReportDate, itemIdFromAihotUrl,
-  mapCategory, parseDate, selectedItemHash, storyPublicIdFromUrl,
+  mapCategory, parseDate, selectedItemHash, storyPublicIdFromUrl, textSimilarity,
   type AihotDailyReportDto, type AihotHotTopicDto, type AihotItemDto, type AihotStoryDto,
 } from "./types";
 
@@ -244,6 +244,73 @@ export async function ingestSelected(
 
 // ── B. 当前热点 ───────────────────────────────────────────────────────────
 
+/**
+ * story 摘要的重写节流。
+ *
+ * digest 是 AI HOT 侧随事件推进**持续重写**的文本：一个活跃事件一天能改好几次，
+ * 而改动往往只是换几个词。若逐字比对就当成内容变化，每次都会造出新快照 →
+ * 新 revision → 重新生成四语言 —— 一天为同一条热点烧掉几轮 provider 调用，
+ * 换来的是读者几乎看不出差别的措辞调整。
+ *
+ * 两道闸门，都要过才算「值得重写」：
+ *   1. **改得够多**：相似度低于阈值才算实质变化；
+ *   2. **隔得够久**：距上次采纳该热点的 digest 至少一天。
+ *
+ * 没过闸门时**沿用已存的 digest** 参与指纹计算 —— 不是丢弃新文本，
+ * 而是这一轮不采纳它；下一轮到点了自然会取到当时的最新版本。
+ * 存一个不参与指纹的 digest 会让「库里的摘要」和「简报依据的摘要」对不上。
+ */
+const DIGEST_SIMILARITY_THRESHOLD = 0.9;
+const DIGEST_MIN_INTERVAL_MS = 24 * 60 * 60_000;
+
+export type DigestDecision = {
+  /** 本轮实际采纳、参与指纹计算的 digest */
+  digest: string | null;
+  adopted: boolean;
+  reason: "NEW" | "MATERIAL_CHANGE" | "TOO_SIMILAR" | "TOO_SOON" | "NO_DIGEST" | "UNCHANGED";
+  similarity: number | null;
+};
+
+/**
+ * 决定是否采纳新的 story 摘要。
+ *
+ * 纯函数，便于直接测试各条分支 —— 节流规则要是只能靠跑真实调度来验证，
+ * 那它实际上就没有被验证过。
+ */
+export function decideDigest(args: {
+  incoming: string | null;
+  stored: string | null;
+  storedAt: Date | null;
+  now?: Date;
+  similarityThreshold?: number;
+  minIntervalMs?: number;
+}): DigestDecision {
+  const threshold = args.similarityThreshold ?? DIGEST_SIMILARITY_THRESHOLD;
+  const minInterval = args.minIntervalMs ?? DIGEST_MIN_INTERVAL_MS;
+  const now = args.now ?? new Date();
+
+  // 这一轮没取到 digest：沿用已存的，绝不把已有素材清空
+  if (!args.incoming) {
+    return { digest: args.stored, adopted: false, reason: "NO_DIGEST", similarity: null };
+  }
+  if (!args.stored) {
+    return { digest: args.incoming, adopted: true, reason: "NEW", similarity: null };
+  }
+
+  const similarity = textSimilarity(args.incoming, args.stored);
+  if (similarity === 1) {
+    return { digest: args.stored, adopted: false, reason: "UNCHANGED", similarity };
+  }
+  if (similarity >= threshold) {
+    return { digest: args.stored, adopted: false, reason: "TOO_SIMILAR", similarity };
+  }
+  const elapsed = args.storedAt ? now.getTime() - args.storedAt.getTime() : Number.POSITIVE_INFINITY;
+  if (elapsed < minInterval) {
+    return { digest: args.stored, adopted: false, reason: "TOO_SOON", similarity };
+  }
+  return { digest: args.incoming, adopted: true, reason: "MATERIAL_CHANGE", similarity };
+}
+
 export async function ingestHotTopics(
   args: { limit?: number } & IngestOptions = {}
 ): Promise<IngestResult> {
@@ -296,9 +363,31 @@ export async function ingestHotTopics(
       }
       // story 拿不到不影响热点本身入库：它是加分素材，不是必要条件
     }
-    const storyDigest = story?.digest?.trim() || null;
+    /*
+     * 节流：只有「改得够多**且**隔得够久」才采纳新 digest。
+     * 比对基准是该 topic **最近一次快照**采纳过的那份摘要。
+     */
+    const prev = await prisma.aihotHotTopicSnapshot.findFirst({
+      where: { provider: AIHOT_PROVIDER, topic_id: dto.id },
+      orderBy: [{ captured_at: "desc" }, { id: "desc" }],
+      select: { story_digest: true, captured_at: true, story_reports_json: true, story_report_count: true },
+    });
+    const decision = decideDigest({
+      incoming: story?.digest?.trim() || null,
+      stored: prev?.story_digest ?? null,
+      storedAt: prev?.captured_at ?? null,
+      now: capturedAt,
+    });
+    const storyDigest = decision.digest;
+    if (!decision.adopted && decision.reason !== "NEW") {
+      out.skipped.push({
+        reason: `story 摘要本轮未采纳（${decision.reason}${
+          decision.similarity !== null ? ` 相似度 ${decision.similarity.toFixed(2)}` : ""}）`,
+        ref: dto.id,
+      });
+    }
 
-    // digest 进内容指纹：它随事件推进被重写，变了就该出新版本
+    // 采纳的那份 digest 进内容指纹：变了就该出新版本
     const hash = hotTopicHash(dto, storyDigest);
     // AI HOT 只给出代表条目的地址，关联条目 ID 由该地址解析而来 ——
     // **不做名称模糊匹配**：那是推断，不是信源给的事实
@@ -355,7 +444,8 @@ export async function ingestHotTopics(
         captured_at: capturedAt,
         story_public_id: storyPublicId,
         story_digest: storyDigest,
-        story_digest_updated_at: parseDate(story?.digestUpdatedAt),
+        // 未采纳新摘要时，时间戳也不能跳到新的那一版，否则「这段摘要是什么时候的」就错了
+        story_digest_updated_at: decision.adopted ? parseDate(story?.digestUpdatedAt) : prev?.captured_at ?? null,
         // 只保留 AI HOT 自己给出的标题/摘要字段，**不保存第三方完整正文**
         story_reports_json: ((story?.reports ?? []).map((r) => ({
           title: r.title?.trim() ?? "",

@@ -1,8 +1,11 @@
+import Link from "next/link";
+
 import { AihotQueueClient } from "@/components/admin/aihot-queue-client";
 import { resolveAttributionMode } from "@/lib/content/publishing/attribution";
 import { listQueue, queueCounts } from "@/lib/content/publishing/queue";
 import { recentRuns } from "@/lib/content/aihot/scheduler";
 import { residualLeases } from "@/lib/content/aihot/lease";
+import { resolveNewsroomModel } from "@/lib/content/multilingual/model-settings";
 
 /**
  * AI HOT 编辑审核队列。
@@ -19,6 +22,7 @@ export const metadata = { title: "AI HOT 编辑审核队列", robots: { index: f
 
 export default async function AihotQueuePage() {
   const mode = await resolveAttributionMode();
+  const model = await resolveNewsroomModel();
   const [rows, counts, runs, residual] = await Promise.all([
     listQueue({ tab: "NEEDS_REVIEW" }),
     queueCounts(),
@@ -41,6 +45,15 @@ export default async function AihotQueuePage() {
       />
 
       <div className="mx-auto w-full max-w-[1400px] px-4 pb-10">
+        <div className="mb-6 rounded-md border border-border/70 p-3 text-sm">
+          改写 / 翻译 / 摘要使用的模型：
+          <strong>{model.provider}{model.model ? ` · ${model.model}` : "（服务商默认模型）"}</strong>
+          {model.available ? null : (
+            <span className="ml-2 text-red-600">不可用：{model.unavailableReason}</span>
+          )}
+          <Link href="/admin/settings/newsroom-model" className="ml-2 underline">修改</Link>
+        </div>
+
         <h2 className="text-lg font-semibold">定时任务运行审计</h2>
         <p className="mt-1 text-sm text-muted-foreground">
           三类任务各自独立调度与租约：热点 5 分钟、精选 10 分钟、日报 30 分钟。

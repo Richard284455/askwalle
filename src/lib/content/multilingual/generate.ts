@@ -3,6 +3,8 @@ import { Prisma, type DraftLanguage, type MultilingualDraftStatus } from "@prism
 import { prisma } from "@/lib/prisma";
 import { resolveProviderRuntime, type ProviderKey } from "@/lib/website/ai-provider-config";
 
+import { resolveNewsroomModel } from "./model-settings";
+
 import { ML_GENERATION_VERSION } from "../aihot/types";
 
 import { checkHotTopicBrief } from "./hot-topic-qa";
@@ -361,7 +363,26 @@ export async function generateUnit(args: GenerateUnitArgs): Promise<GenerateUnit
     return { ...base, message: `dry-run：体裁 ${input.contentForm}，来源文本 ${input.sourceText.length} 字符，栏目 ${input.sections.length} 个，事实 ${input.facts.length} 条` };
   }
 
-  const provider = args.provider ?? "deepseek";
+  /*
+   * 模型来自后台设置，不再写死在代码里。
+   * 显式传入的 args.provider 优先（脚本/测试用），其余一律走设置 ——
+   * 「线上到底在用哪个模型」必须能在一个地方回答清楚。
+   */
+  const configured = args.provider ? null : await resolveNewsroomModel();
+  if (configured && !configured.available) {
+    /*
+     * 配置的 provider 用不了：**如实失败**，不悄悄换一个。
+     * 换掉意味着某天的稿子是另一个模型写的，而审计里看不出任何痕迹。
+     */
+    return { ...base, status: "GENERATION_FAILED", providerCalls: 0,
+      message: `Newsroom 模型不可用：${configured.unavailableReason}` };
+  }
+  const provider = args.provider ?? configured!.provider;
+  /*
+     * 变量名带 configured 前缀：翻译循环里另有一个 `model`，
+     * 装的是 provider **返回的**模型名。两者同名会让人以为是同一个东西。
+     */
+  const configuredModel: string | undefined = args.model ?? configured?.model ?? undefined;
   let providerCalls = 0;
 
   // ── 1. 英文母版 ──
@@ -371,7 +392,7 @@ export async function generateUnit(args: GenerateUnitArgs): Promise<GenerateUnit
   let masterFailure: string | null = null;
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const called = await callProvider(provider, args.model, buildMasterPrompt(input, attempt > 1 ? masterIssues : undefined));
+    const called = await callProvider(provider, configuredModel, buildMasterPrompt(input, attempt > 1 ? masterIssues : undefined));
     providerCalls++;
     if (!called.ok) { masterFailure = called.message; continue; }
     const parsed = parseDraft(called.content);
@@ -439,7 +460,7 @@ export async function generateUnit(args: GenerateUnitArgs): Promise<GenerateUnit
     let failure: string | null = null;
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const called = await callProvider(provider, args.model, buildTranslationPrompt(master, language, input, attempt > 1 ? issues : undefined));
+      const called = await callProvider(provider, configuredModel, buildTranslationPrompt(master, language, input, attempt > 1 ? issues : undefined));
       providerCalls++;
       if (!called.ok) { failure = called.message; continue; }
       const parsed = parseDraft(called.content);
