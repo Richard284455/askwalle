@@ -190,11 +190,68 @@ export async function saveEtag(endpointKey: string, etag: string | null): Promis
 
 // ── 端点封装 ──────────────────────────────────────────────────────────────
 
+/** API 侧的上限，写死在这里免得调用方各猜一个 */
+export const LIMITS = {
+  /** /selected/snapshot 每页最多 1000 */
+  snapshotPage: 1000,
+  /** /selected/changes 每页最多 100 */
+  changesPage: 100,
+  /** /dailies 索引最多 180 天 */
+  dailyIndex: 180,
+  /** /items 每页最多 100 */
+  itemsPage: 100,
+} as const;
+
 export const ENDPOINTS = {
   selectedRecent: (windowSpec: string, limit: number) =>
     ({ key: `items-selected-${windowSpec}-${limit}`, path: `/api/v1/items?mode=selected&window=${encodeURIComponent(windowSpec)}&limit=${limit}` }),
+  /**
+   * 全量同步的起点。分页用 `page`（不是 cursor）——
+   * cursor 是**增量水位**，两者不是一回事，混用会让增量从错误的位置开始。
+   */
+  selectedSnapshot: (args: { limit: number; page?: string | null; fields?: "default" | "minimal" }) => {
+    const qs = new URLSearchParams({ fields: args.fields ?? "default", limit: String(args.limit) });
+    if (args.page) qs.set("page", args.page);
+    // 分页请求不做条件请求：每页内容不同，共用一个 ETag 键只会互相顶掉
+    return { key: `selected-snapshot`, path: `/api/v1/selected/snapshot?${qs.toString()}` };
+  },
+  /** 增量。cursor 必填，来自 snapshot 或上一页 changes */
+  selectedChanges: (cursor: string, limit: number) =>
+    ({ key: "selected-changes", path: `/api/v1/selected/changes?cursor=${encodeURIComponent(cursor)}&limit=${limit}` }),
+  /** 未筛选的全量条目流。只覆盖最近 window，且没有增量契约 */
+  itemsAll: (windowSpec: string, limit: number, cursor?: string | null) => {
+    const qs = new URLSearchParams({ mode: "all", window: windowSpec, limit: String(limit) });
+    if (cursor) qs.set("cursor", cursor);
+    return { key: `items-all-${windowSpec}`, path: `/api/v1/items?${qs.toString()}` };
+  },
   hotTopics: () => ({ key: "hot-topics", path: "/api/v1/hot-topics" }),
   dailyLatest: () => ({ key: "dailies-latest", path: "/api/v1/dailies/latest" }),
   dailyIndex: (limit: number) => ({ key: `dailies-index-${limit}`, path: `/api/v1/dailies?limit=${limit}` }),
   dailyByDate: (date: string) => ({ key: `dailies-${date}`, path: `/api/v1/dailies/${date}` }),
 } as const;
+
+// ── 增量水位（cursor）持久化 ──────────────────────────────────────────────
+
+const CURSOR_KEY = "aihot:selected-cursor";
+
+/**
+ * cursor 是**流水账水位**，不是会话票据：存几天也不会过期，
+ * 客户端离线再上线仍能从同一位置续上。所以它必须落库，不能只放内存。
+ */
+export async function loadSelectedCursor(): Promise<string | null> {
+  const row = await prisma.setting.findUnique({ where: { key: CURSOR_KEY } });
+  return row?.value?.trim() || null;
+}
+
+export async function saveSelectedCursor(cursor: string | null): Promise<void> {
+  if (!cursor) return;
+  await prisma.setting.upsert({
+    where: { key: CURSOR_KEY },
+    create: { key: CURSOR_KEY, value: cursor },
+    update: { value: cursor },
+  });
+}
+
+export async function clearSelectedCursor(): Promise<void> {
+  await prisma.setting.deleteMany({ where: { key: CURSOR_KEY } });
+}

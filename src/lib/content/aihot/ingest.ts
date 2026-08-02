@@ -57,6 +57,164 @@ async function fetchWithEtag(
 
 // ── A. 精选资讯 ───────────────────────────────────────────────────────────
 
+export type UpsertOutcome = "created" | "updated" | "unchanged" | "skipped";
+
+/**
+ * 写入一条精选条目。
+ *
+ * 抽出来是因为它有**三个**调用方：24 小时窗口的常规抓取、全量快照回填、
+ * 增量 changes。三处各写一遍映射，迟早会有一处漏字段 ——
+ * 而漏掉的那个字段只会在页面上以「少了一段」的形式暴露出来。
+ */
+export async function upsertSelectedItem(
+  dto: AihotItemDto, opts: { dryRun?: boolean } = {}
+): Promise<{ outcome: UpsertOutcome; reason?: string }> {
+  if (!dto?.id || !dto.title?.trim()) return { outcome: "skipped", reason: "缺少 id 或 title" };
+
+  // 归因链接是硬要求：AI HOT 页面地址点不开的条目不入库
+  const aihotUrl = httpUrlOrNull(dto.links?.aihot) ?? httpUrlOrNull(dto.attribution?.url);
+  if (!aihotUrl) return { outcome: "skipped", reason: "缺少合法的 AI HOT 归因链接" };
+
+  const hash = selectedItemHash(dto);
+  const data = {
+    title: dto.title.trim(),
+    original_title: dto.originalTitle?.trim() || null,
+    summary: dto.summary?.trim() || null,
+    category: dto.category?.trim() || null,
+    mapped_category: mapCategory(dto.category),
+    score: typeof dto.score === "number" ? Math.round(dto.score) : null,
+    source_name: dto.source?.name?.trim() || null,
+    aihot_url: aihotUrl,
+    // 原始来源链接可以缺失（AI HOT 未提供），但**不能是非法地址**
+    original_url: httpUrlOrNull(dto.links?.original),
+    published_at: parseDate(dto.publishedAt),
+    discovered_at: parseDate(dto.discoveredAt),
+    selected: dto.selected !== false,
+    source_snapshot_hash: hash,
+    last_seen_at: new Date(),
+  };
+
+  if (opts.dryRun) return { outcome: "created" };
+
+  const existing = await prisma.aihotSelectedItem.findUnique({
+    where: { provider_provider_item_id: { provider: AIHOT_PROVIDER, provider_item_id: dto.id } },
+    select: { id: true, source_snapshot_hash: true },
+  });
+  if (!existing) {
+    await prisma.aihotSelectedItem.create({
+      data: { provider: AIHOT_PROVIDER, provider_item_id: dto.id, ...data },
+    });
+    return { outcome: "created" };
+  }
+  if (existing.source_snapshot_hash !== hash) {
+    await prisma.aihotSelectedItem.update({ where: { id: existing.id }, data });
+    return { outcome: "updated" };
+  }
+  // 内容没变只更新「最近见到」，不动内容字段
+  await prisma.aihotSelectedItem.update({
+    where: { id: existing.id }, data: { last_seen_at: new Date() },
+  });
+  return { outcome: "unchanged" };
+}
+
+/**
+ * 批量写入一页快照。
+ *
+ * 逐条 upsert 在全量回填时是不可接受的：每条要两趟远程往返
+ * （查一次、写一次），三千条就是六千趟 —— 实测要一个多小时，
+ * 而整页数据其实一次就能查完、一次就能插完。
+ *
+ * 这里把「查」压成一次 findMany、把「插」压成一次 createMany，
+ * 只有**内容真的变了**的行才逐条 update（那是少数）。
+ * 语义与逐条版本逐字一致，区别只在往返次数。
+ */
+export async function upsertSelectedBatch(
+  dtos: AihotItemDto[], opts: { dryRun?: boolean } = {}
+): Promise<{ created: number; updated: number; unchanged: number; skipped: number }> {
+  const out = { created: 0, updated: 0, unchanged: 0, skipped: 0 };
+
+  type Prepared = { id: string; hash: string; data: Record<string, unknown> };
+  const prepared: Prepared[] = [];
+  for (const dto of dtos) {
+    if (!dto?.id || !dto.title?.trim()) { out.skipped++; continue; }
+    const aihotUrl = httpUrlOrNull(dto.links?.aihot) ?? httpUrlOrNull(dto.attribution?.url);
+    if (!aihotUrl) { out.skipped++; continue; }
+    const hash = selectedItemHash(dto);
+    prepared.push({
+      id: dto.id,
+      hash,
+      data: {
+        title: dto.title.trim(),
+        original_title: dto.originalTitle?.trim() || null,
+        summary: dto.summary?.trim() || null,
+        category: dto.category?.trim() || null,
+        mapped_category: mapCategory(dto.category),
+        score: typeof dto.score === "number" ? Math.round(dto.score) : null,
+        source_name: dto.source?.name?.trim() || null,
+        aihot_url: aihotUrl,
+        original_url: httpUrlOrNull(dto.links?.original),
+        published_at: parseDate(dto.publishedAt),
+        discovered_at: parseDate(dto.discoveredAt),
+        selected: dto.selected !== false,
+        source_snapshot_hash: hash,
+        last_seen_at: new Date(),
+      },
+    });
+  }
+  if (!prepared.length) return out;
+  if (opts.dryRun) { out.created = prepared.length; return out; }
+
+  const existing = await prisma.aihotSelectedItem.findMany({
+    where: { provider: AIHOT_PROVIDER, provider_item_id: { in: prepared.map((p) => p.id) } },
+    select: { id: true, provider_item_id: true, source_snapshot_hash: true },
+  });
+  const byItemId = new Map(existing.map((e) => [e.provider_item_id, e]));
+
+  const toCreate = prepared.filter((p) => !byItemId.has(p.id));
+  const toUpdate = prepared.filter((p) => {
+    const e = byItemId.get(p.id);
+    return e && e.source_snapshot_hash !== p.hash;
+  });
+  out.unchanged = prepared.length - toCreate.length - toUpdate.length;
+
+  if (toCreate.length) {
+    /*
+     * skipDuplicates：同一页里可能出现重复 id，并发回填也可能撞上。
+     * 唯一约束已经挡住重复，这里让它安静跳过而不是把整页写入炸掉。
+     */
+    const r = await prisma.aihotSelectedItem.createMany({
+      data: toCreate.map((p) => ({
+        provider: AIHOT_PROVIDER, provider_item_id: p.id, ...p.data,
+      })) as never,
+      skipDuplicates: true,
+    });
+    out.created = r.count;
+    out.unchanged += toCreate.length - r.count;
+  }
+  for (const p of toUpdate) {
+    await prisma.aihotSelectedItem.update({
+      where: { id: byItemId.get(p.id)!.id }, data: p.data as never,
+    });
+    out.updated++;
+  }
+  return out;
+}
+
+/**
+ * 条目被取消精选。
+ *
+ * **不删行。** 它可能已经被生成过、审核过、发布过 ——
+ * 删掉会让已发布页面的来源凭空消失，追溯链断在这里。
+ * 只标记 selected=false，之后不再作为新内容候选。
+ */
+export async function deselectItem(providerItemId: string): Promise<boolean> {
+  const r = await prisma.aihotSelectedItem.updateMany({
+    where: { provider: AIHOT_PROVIDER, provider_item_id: providerItemId, selected: true },
+    data: { selected: false, last_seen_at: new Date() },
+  });
+  return r.count > 0;
+}
+
 export async function ingestSelected(
   args: { window?: string; limit?: number } & IngestOptions = {}
 ): Promise<IngestResult> {
@@ -74,57 +232,11 @@ export async function ingestSelected(
   out.fetched = items.length;
 
   for (const dto of items) {
-    if (!dto?.id || !dto.title?.trim()) {
-      out.skipped.push({ reason: "缺少 id 或 title", ref: String(dto?.id ?? "?") });
-      continue;
-    }
-    // 归因链接是硬要求：AI HOT 页面地址点不开的条目不入库
-    const aihotUrl = httpUrlOrNull(dto.links?.aihot) ?? httpUrlOrNull(dto.attribution?.url);
-    if (!aihotUrl) {
-      out.skipped.push({ reason: "缺少合法的 AI HOT 归因链接", ref: dto.id });
-      continue;
-    }
-
-    const hash = selectedItemHash(dto);
-    const data = {
-      title: dto.title.trim(),
-      original_title: dto.originalTitle?.trim() || null,
-      summary: dto.summary?.trim() || null,
-      category: dto.category?.trim() || null,
-      mapped_category: mapCategory(dto.category),
-      score: typeof dto.score === "number" ? Math.round(dto.score) : null,
-      source_name: dto.source?.name?.trim() || null,
-      aihot_url: aihotUrl,
-      // 原始来源链接可以缺失（AI HOT 未提供），但**不能是非法地址**
-      original_url: httpUrlOrNull(dto.links?.original),
-      published_at: parseDate(dto.publishedAt),
-      discovered_at: parseDate(dto.discoveredAt),
-      selected: dto.selected !== false,
-      source_snapshot_hash: hash,
-      last_seen_at: new Date(),
-    };
-
-    if (args.dryRun) { out.created++; continue; }
-
-    const existing = await prisma.aihotSelectedItem.findUnique({
-      where: { provider_provider_item_id: { provider: AIHOT_PROVIDER, provider_item_id: dto.id } },
-      select: { id: true, source_snapshot_hash: true },
-    });
-    if (!existing) {
-      await prisma.aihotSelectedItem.create({
-        data: { provider: AIHOT_PROVIDER, provider_item_id: dto.id, ...data },
-      });
-      out.created++;
-    } else if (existing.source_snapshot_hash !== hash) {
-      await prisma.aihotSelectedItem.update({ where: { id: existing.id }, data });
-      out.updated++;
-    } else {
-      // 内容没变只更新「最近见到」，不动内容字段
-      await prisma.aihotSelectedItem.update({
-        where: { id: existing.id }, data: { last_seen_at: new Date() },
-      });
-      out.unchanged++;
-    }
+    const r = await upsertSelectedItem(dto, { dryRun: args.dryRun });
+    if (r.outcome === "skipped") out.skipped.push({ reason: r.reason ?? "跳过", ref: String(dto?.id ?? "?") });
+    else if (r.outcome === "created") out.created++;
+    else if (r.outcome === "updated") out.updated++;
+    else out.unchanged++;
   }
 
   return { ...out, status: "OK" };

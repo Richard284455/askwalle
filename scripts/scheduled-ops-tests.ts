@@ -12,7 +12,11 @@
  */
 import type { AihotTaskType } from "@prisma/client";
 
-import { fetchAihot, type AihotTransport } from "@/lib/content/aihot/client";
+import {
+  clearSelectedCursor, ENDPOINTS, fetchAihot, LIMITS, loadSelectedCursor, saveSelectedCursor,
+  type AihotTransport,
+} from "@/lib/content/aihot/client";
+import { backfillSelected, syncSelectedChanges } from "@/lib/content/aihot/sync";
 import {
   acquireLease, releaseLease, renewLease, residualLeases,
 } from "@/lib/content/aihot/lease";
@@ -173,6 +177,95 @@ async function main() {
     const { transport, calls } = scripted([{ status: 200, body: {} }]);
     const r = await fetchAihot("/api/public/items", { transport });
     check("A12", "非 v1 端点被拒（不碰已废弃的 /api/public/*）", !r.ok && calls() === 0);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  section("一之二、全量回填与增量水位");
+
+  {
+    // 端点契约：分页用 page，增量用 cursor —— 混用会让增量从错误位置开始
+    const snap = ENDPOINTS.selectedSnapshot({ limit: 1000, page: "P1" });
+    check("S1", "snapshot 用 page 翻页", /[?&]page=P1/.test(snap.path) && !/cursor=/.test(snap.path), snap.path);
+    check("S2", "snapshot 默认取完整字段（minimal 没有 summary，取了也生成不了）",
+      /fields=default/.test(ENDPOINTS.selectedSnapshot({ limit: 10 }).path));
+    const ch = ENDPOINTS.selectedChanges("C1", 100);
+    check("S3", "changes 用 cursor 续传", /[?&]cursor=C1/.test(ch.path) && !/page=/.test(ch.path), ch.path);
+    check("S4", "分页上限与 API 一致", LIMITS.snapshotPage === 1000 && LIMITS.changesPage === 100 && LIMITS.dailyIndex === 180);
+  }
+
+  {
+    // 全量：翻到 hasMore=false 为止，逐页累计
+    const page1 = {
+      cursor: "cur-1", hasMore: true, nextPage: "p2",
+      items: [{ id: "s-1", title: "T1", summary: "x".repeat(60), links: { aihot: "https://aihot.virxact.com/items/aaaaaaaa" } }],
+    };
+    const page2 = {
+      cursor: "cur-2", hasMore: false,
+      items: [{ id: "s-2", title: "T2", summary: "y".repeat(60), links: { aihot: "https://aihot.virxact.com/items/bbbbbbbb" } }],
+    };
+    const { transport, calls } = scripted([
+      { status: 200, body: page1 }, { status: 200, body: page2 },
+    ]);
+    const r = await backfillSelected({ transport, dryRun: true });
+    check("S5", "全量翻完所有页", r.status === "OK" && r.pages === 2 && calls() === 2, `${r.pages} 页 / ${calls()} 次请求`);
+    check("S6", "取回条数累计", r.fetched === 2, String(r.fetched));
+    check("S7", "水位取最后一页的 cursor", r.cursor === "cur-2", String(r.cursor));
+  }
+
+  /*
+   * 本节会动到**生产的同步水位**。
+   * 不还原的话，下一次定时任务会以为从没全量过，白白重拉三千条快照 ——
+   * 测试的副作用不该变成运行时的成本。
+   */
+  const savedCursor = await loadSelectedCursor();
+
+  {
+    // 增量：没有水位时必须明说要全量，绝不能偷偷改成「拉最近 24 小时」
+    await clearSelectedCursor();
+    const r = await syncSelectedChanges({ transport: scripted([{ status: 200, body: {} }]).transport, dryRun: true });
+    check("S8", "无水位时要求先做全量", r.status === "SNAPSHOT_REQUIRED", r.message ?? "");
+  }
+
+  {
+    await saveSelectedCursor("cur-test");
+    const body = {
+      cursor: "cur-next", hasMore: false,
+      changes: [
+        { op: "upsert", changedAt: "2026-08-02T00:00:00Z",
+          item: { id: "s-3", title: "T3", summary: "z".repeat(60), links: { aihot: "https://aihot.virxact.com/items/cccccccc" } } },
+        { op: "remove", changedAt: "2026-08-02T00:00:00Z", id: "s-gone" },
+      ],
+    };
+    const r = await syncSelectedChanges({ transport: scripted([{ status: 200, body }]).transport, dryRun: true });
+    check("S9", "增量能处理 upsert", r.status === "OK" && r.created + r.updated + r.unchanged === 1, JSON.stringify(r));
+    check("S10", "增量能处理 remove（取消精选）", r.removed === 1, String(r.removed));
+
+    // 409 = 水位失效，唯一正确反应是重做全量，不是继续用旧水位
+    const r409 = await syncSelectedChanges({ transport: scripted([{ status: 409 }]).transport, dryRun: true });
+    check("S11", "409 要求重做全量", r409.status === "SNAPSHOT_REQUIRED", r409.message ?? "");
+  }
+
+  {
+    // 还原生产水位，并核对确实还原了
+    await clearSelectedCursor();
+    if (savedCursor) await saveSelectedCursor(savedCursor);
+    check("S17", "测试没有破坏生产同步水位",
+      (await loadSelectedCursor()) === savedCursor,
+      savedCursor ? `已还原（长度 ${savedCursor.length}）` : "本来就没有水位");
+  }
+
+  {
+    const src = codeOnly(readFileSync("src/lib/content/aihot/sync.ts", "utf8"));
+    check("S12", "取消精选不删行（已发布内容的追溯链不能断）",
+      !/aihotSelectedItem\.delete/.test(src)
+      && /deselectItem/.test(src));
+    const ingest = codeOnly(readFileSync("src/lib/content/aihot/ingest.ts", "utf8"));
+    check("S13", "deselect 只标记 selected=false", /selected: false/.test(ingest) && !/aihotSelectedItem\.delete/.test(ingest));
+
+    const sched = codeOnly(readFileSync("src/lib/content/aihot/scheduler.ts", "utf8"));
+    check("S14", "精选定时任务改走水位增量", /syncSelected/.test(sched) && !/window: "24h"/.test(sched));
+    check("S15", "自动生成只覆盖时效窗口内的条目", /SELECTED_RECENCY_MS/.test(sched));
+    check("S16", "已取消精选的条目不再排队生成", /selected: true/.test(sched));
   }
 
   // ────────────────────────────────────────────────────────────────────────

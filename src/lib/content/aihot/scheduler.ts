@@ -6,7 +6,8 @@ import { freezeUnit, type FreezeResult } from "@/lib/content/publishing/freeze";
 import { prisma } from "@/lib/prisma";
 
 import type { AihotRetryEvent, AihotTransport } from "./client";
-import { ingestDaily, ingestHotTopics, ingestSelected, type IngestResult } from "./ingest";
+import { ingestDaily, ingestHotTopics, type IngestResult } from "./ingest";
+import { syncSelected } from "./sync";
 import { acquireLease, LEASE_TTL_MS, newWorkerId, releaseLease, startHeartbeat } from "./lease";
 import { ML_GENERATION_VERSION } from "./types";
 
@@ -57,6 +58,19 @@ const DEFAULT_MAX_UNITS: Record<AihotTaskType, number> = {
  * 冷却期内跳过；输入一变（指纹变了）立刻重新入选，不受冷却影响。
  */
 const FAILURE_COOLDOWN_MS = 6 * 60 * 60_000;
+
+/**
+ * 精选内容的生成时效窗口。
+ *
+ * 库里有三千多条历史精选（全量回填的结果）。它们**该留着** ——
+ * 热点的关联匹配、追溯、后台按需生成都要用。但它们不该被自动排队生成：
+ * 三千条 × 每条约 5 次 provider 调用，是一笔没人批准过的开销，
+ * 而且几个月前的条目也早就不是「资讯」了。
+ *
+ * 自动链路只覆盖这个窗口内的新内容；更早的历史条目要出稿，
+ * 由人在审核台上显式触发。
+ */
+const SELECTED_RECENCY_MS = 7 * 24 * 60 * 60_000;
 
 export type ScheduledRunOptions = {
   workerId?: string;
@@ -194,6 +208,12 @@ async function candidatesFor(
 
   if (taskType === "SELECTED") {
     const rows = await prisma.aihotSelectedItem.findMany({
+      where: {
+        // 已取消精选的不再出稿
+        selected: true,
+        // 只覆盖时效窗口内的新内容；历史条目留库，但要出稿得人工触发
+        published_at: { gte: new Date(Date.now() - SELECTED_RECENCY_MS) },
+      },
       orderBy: [{ published_at: "desc" }, { id: "desc" }],
       take: Math.max(max * 5, 50),
       select: { id: true, provider_item_id: true, source_snapshot_hash: true },
@@ -315,8 +335,37 @@ export async function runScheduledTask(
     };
 
     let ingest: IngestResult;
-    if (taskType === "SELECTED") ingest = await ingestSelected({ window: "24h", limit: 100, ...fetchOpts });
-    else if (taskType === "HOT_TOPICS") ingest = await ingestHotTopics(fetchOpts);
+    if (taskType === "SELECTED") {
+      /*
+       * 精选走**水位增量**，不再按「最近 24 小时」抓。
+       *
+       * 时间窗口有两个躲不掉的毛病：源端补录一条三天前的内容就永远看不到；
+       * 而每轮都把窗口内的全部条目重取一遍，绝大多数是已经入库的。
+       * 水位是流水账位置，只给「上次之后真正变化过的」，
+       * 还能告诉我们哪些条目被取消了精选 —— 时间窗口表达不了「删除」。
+       */
+      const { result, bootstrapped } = await syncSelected(fetchOpts);
+      /*
+       * 水位查完一轮、一条变更都没有 —— 语义上就是「源端未变化」，
+       * 与另外两类的 304 同义。记成 OK 会让审计里满屏「成功」，
+       * 分不清哪一轮真的带回了东西。
+       */
+      const nothingChanged = result.status === "OK" && result.fetched === 0
+        && result.created === 0 && result.updated === 0 && result.removed === 0;
+      ingest = {
+        endpoint: bootstrapped ? "/api/v1/selected/snapshot" : "/api/v1/selected/changes",
+        status: result.status !== "OK" ? "FAILED" : nothingChanged ? "NOT_MODIFIED" : "OK",
+        fetched: result.fetched,
+        created: result.created,
+        // 取消精选算一次内容变更，计入 updated（它确实改了库里的行）
+        updated: result.updated + result.removed,
+        unchanged: result.unchanged,
+        skipped: [],
+        message: bootstrapped
+          ? `水位不可用，已自动回落全量快照（${result.pages} 页）${result.message ? ` — ${result.message}` : ""}`
+          : result.message,
+      };
+    } else if (taskType === "HOT_TOPICS") ingest = await ingestHotTopics(fetchOpts);
     else ingest = await ingestDaily(fetchOpts);
 
     out.endpoint = ingest.endpoint;

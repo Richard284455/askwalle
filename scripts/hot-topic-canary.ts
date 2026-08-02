@@ -8,6 +8,8 @@
  * 期望返回 EXISTING 且 provider 调用为 0。探针不写内容、不发布。
  */
 import { generateUnit } from "@/lib/content/multilingual/generate";
+import { assembleHotTopic, computeInputHash } from "@/lib/content/multilingual/unit-input";
+import { ML_GENERATION_VERSION } from "@/lib/content/aihot/types";
 import { HOT_TOPIC_FORBIDDEN_CODES } from "@/lib/content/multilingual/types";
 import { loadAllLatestMaterial, hotTopicUnitKey } from "@/lib/content/publishing/eligibility";
 import {
@@ -35,7 +37,7 @@ async function main() {
     where: { unit_key: { in: unitKeys } },
     select: {
       unit_key: true, language: true, status: true, qa_issues_json: true,
-      hot_topic_mode: true, source_snapshot_hash: true,
+      hot_topic_mode: true, source_snapshot_hash: true, source_input_hash: true,
     },
   });
   const families = await prisma.articleFamily.findMany({
@@ -77,16 +79,27 @@ async function main() {
    *   2. 当前快照指纹与草稿当时的指纹**一致** —— 源端已经变了的话，
    *      重新生成正是应有行为，把它算成「幂等破了」是冤枉的。
    */
-  const probeable = new Set(
-    [...new Set(drafts.map((d) => d.unit_key))].filter((k) => {
-      const ds = drafts.filter((d) => d.unit_key === k);
-      if (ds.length !== LOCALES.length || !ds.every((d) => d.status === "DRAFTED")) return false;
-      const hashes = new Set(ds.map((d) => d.source_snapshot_hash));
-      if (hashes.size !== 1) return false;
-      const m = material.find((x) => hotTopicUnitKey(x.topicId) === k);
-      return Boolean(m && m.snapshotHash === [...hashes][0]);
-    })
-  );
+  const probeable = new Set<string>();
+  for (const k of new Set(drafts.map((d) => d.unit_key))) {
+    const ds = drafts.filter((d) => d.unit_key === k);
+    if (ds.length !== LOCALES.length || !ds.every((d) => d.status === "DRAFTED")) continue;
+    const inputHashes = new Set(ds.map((d) => d.source_input_hash));
+    if (inputHashes.size !== 1) continue;
+    const m = material.find((x) => hotTopicUnitKey(x.topicId) === k);
+    if (!m) continue;
+    /*
+     * 比的是**完整输入指纹**，不只是快照指纹。
+     *
+     * 热点的输入还包含「按条目 ID 关联上的已入库精选」——
+     * 精选全量回填之后，同一个热点会突然匹配上新的关联条目，
+     * 输入随之变化、模式从 SIGNAL 升到 ENRICHED，重新生成是**应有行为**。
+     * 只比快照指纹会把这种正常升级误判成「幂等破了」。
+     */
+    const assembled = await assembleHotTopic(m.snapshotId);
+    if (!assembled.ok) continue;
+    if (computeInputHash(assembled.input, ML_GENERATION_VERSION) !== [...inputHashes][0]) continue;
+    probeable.add(k);
+  }
   let probeCalls = 0;
   const probeStatuses: string[] = [];
   let probeSkipped = 0;
