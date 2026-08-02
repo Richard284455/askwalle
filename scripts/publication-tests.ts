@@ -23,7 +23,7 @@ import {
   HOT_TOPIC_FORBIDDEN_CODES, HOT_TOPIC_WORD_BAND,
   type ContentUnitInput, type DraftContent,
 } from "@/lib/content/multilingual/types";
-import { listTrendingCards } from "@/lib/content/publishing/trending";
+import { listTrending } from "@/lib/content/publishing/trending";
 import { publishedMetadata } from "@/lib/content/publishing/metadata";
 import { preflight, publicationIdempotencyKey, publishTranslation } from "@/lib/content/publishing/publish";
 import {
@@ -161,8 +161,11 @@ async function main() {
     locale, path: publicPath({ locale, contentForm: "MULTILINGUAL_NEWS_BRIEF", slug: "s" }),
     canonical: absoluteUrl(publicPath({ locale, contentForm: "MULTILINGUAL_NEWS_BRIEF", slug: "s" })),
     headline: "H", summary: "S", body: "B", sections: null, contentForm: "MULTILINGUAL_NEWS_BRIEF",
-    categorySlug: "Models", hotTopicMode: null, attributionName: "AI HOT", attributionUrl: "https://aihot.virxact.com/items/x",
-    originalSourceName: "Src", originalSourceUrl: "https://example.com/a",
+    categorySlug: "Models", hotTopicMode: null,
+    attribution: {
+      poweredByLabel: "Powered by AI HOT" as const,
+      providerUrl: "https://aihot.virxact.com/items/x", originalHref: "https://example.com/a",
+    },
     sourcePublishedAt: new Date("2026-08-01"), sitePublishedAt: new Date("2026-08-01"),
     alternates: published.map((l) => ({
       locale: l, hreflang: LOCALE_HREFLANG[l],
@@ -345,8 +348,9 @@ async function main() {
       (await getUpdatePage("ES_ES", family.slug)) === null);
     check("H4", "公开数据里不含 QA / 内部字段",
       page !== null && !("qaIssues" in page) && !("sourceInputHash" in page) && !("originDraftId" in page));
-    check("H5", "归因字段齐备",
-      Boolean(page!.attributionName && page!.attributionUrl && page!.originalSourceName && page!.originalSourceUrl));
+    check("H5", "底部归因齐备且不含实际来源名",
+      Boolean(page!.attribution?.providerUrl) && page!.attribution.poweredByLabel === "Powered by AI HOT"
+      && !("originalSourceName" in page!) && !("attributionName" in page!));
     check("H6", "sitemap 只收已发布路径", (await listPublishedPaths()).some((p) => p.path.includes(family.slug)));
 
     const drafted = await makeFamily();
@@ -453,13 +457,16 @@ async function main() {
 
   {
     const material = await loadAllLatestMaterial();
-    const cards = await listTrendingCards("EN_US");
+    const listing = await listTrending("EN_US");
+    const cards = listing!.cards;
     check("L1", "每个最新热点都有一张卡片", cards.length === material.length, `${cards.length}/${material.length}`);
-    check("L2", "卡片字段全部来自 API（计数/来源名/抓取时间齐备）",
-      cards.every((c) => c.sourceNames.length > 0 && c.capturedAt instanceof Date && c.aihotUrl.startsWith("http")));
+    check("L2", "卡片不含实际来源名与条目地址（公开投影里就没有）",
+      cards.every((c) => !("sourceNames" in c) && !("aihotUrl" in c) && !("topicId" in c)
+        && c.capturedAt instanceof Date));
     check("L3", "卡片按名次升序", cards.every((c, i) => i === 0 || (cards[i - 1].rank ?? 999) <= (c.rank ?? 999)));
     check("L4", "未发布的语言不给简报入口（不做死链）",
       cards.every((c) => c.briefHref === null || c.briefHref.startsWith("/en/")));
+    check("L4b", "榜单页有底部归因", listing!.attribution.poweredByLabel === "Powered by AI HOT");
 
     if (material[0]) {
       const m = material[0];

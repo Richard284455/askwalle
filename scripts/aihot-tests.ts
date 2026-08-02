@@ -97,10 +97,11 @@ const UNIT: ContentUnitInput = {
   facts: [{ label: "原始来源", value: "X：阿易 AI Notes (@AYi_AInotes)" }, { label: "AI HOT 分类", value: "ai-models" }],
 };
 
+/** 母版**不带发布者归因** —— 出处只在页面底部声明 */
 const MASTER: DraftContent = {
   headline: "Google DeepMind Ships Lyria 3.5 Music Model",
-  summary: "Google DeepMind released Lyria 3.5 on July 31, 2026, according to AYi_AInotes.",
-  body: "Google DeepMind released Lyria 3.5 on July 31, 2026, according to AYi_AInotes. The model was trained on 40 million tracks. AYi_AInotes reported that the team plans to open API access to developers in the third quarter.",
+  summary: "Google DeepMind released Lyria 3.5 on July 31, 2026.",
+  body: "Google DeepMind released Lyria 3.5 on July 31, 2026. The model was trained on 40 million tracks. The team plans to open API access to developers in the third quarter.",
 };
 
 const clone = (d: DraftContent, patch: Partial<DraftContent>): DraftContent => ({ ...d, ...patch });
@@ -317,10 +318,15 @@ async function main() {
       !plain.issues.some((i) => i.code === "ENTITY_MISMATCH"));
   }
   {
+    // 规则已反转：正文里出现发布者归因才是问题，缺少归因反而是正确的
     const r = checkMasterFaithfulness(
-      clone(MASTER, { summary: "A music model shipped.", body: "A music model shipped on July 31, 2026. It was trained on 40 million tracks." }), UNIT);
+      clone(MASTER, { body: MASTER.body + " According to AYi_AInotes, more details are coming." }), UNIT);
     recordCodes(r.issues);
-    check("I6", "丢失来源归属 → ATTRIBUTION_MISMATCH", r.issues.some((i) => i.code === "ATTRIBUTION_MISMATCH"));
+    check("I6", "正文出现发布者归因 → ATTRIBUTION_MISMATCH",
+      r.issues.some((i) => i.code === "ATTRIBUTION_MISMATCH"));
+    const clean = checkMasterFaithfulness(MASTER, UNIT);
+    check("I6b", "不带发布者归因的母版通过", clean.verdict === "PASSED",
+      clean.issues.map((i) => i.code).join(","));
   }
   {
     const planUnit: ContentUnitInput = { ...UNIT, sourceText: "谷歌 DeepMind 计划在 9 月发布 Lyria 4.0。" };
@@ -335,7 +341,7 @@ async function main() {
       !r.issues.some((i) => i.code === "MODALITY_UPGRADE"));
   }
   {
-    const r = checkMasterFaithfulness(clone(MASTER, { body: "x".repeat(1300) + " AYi_AInotes" }), UNIT);
+    const r = checkMasterFaithfulness(clone(MASTER, { body: "x".repeat(1300) }), UNIT);
     recordCodes(r.issues);
     check("I9", "正文超长 → UNSUPPORTED_DETAIL", r.issues.some((i) => i.code === "UNSUPPORTED_DETAIL"));
   }
@@ -389,8 +395,8 @@ async function main() {
 
   const ES: DraftContent = {
     headline: "Google DeepMind lanza Lyria 3.5",
-    summary: "Google DeepMind lanzó Lyria 3.5 el 31 de julio de 2026, según AYi_AInotes.",
-    body: "Google DeepMind lanzó Lyria 3.5 el 31 de julio de 2026, según AYi_AInotes. El modelo se entrenó con 40 millones de pistas. AYi_AInotes informó que el equipo planea abrir el acceso a la API en el tercer trimestre.",
+    summary: "Google DeepMind lanzó Lyria 3.5 el 31 de julio de 2026.",
+    body: "Google DeepMind lanzó Lyria 3.5 el 31 de julio de 2026. El modelo se entrenó con 40 millones de pistas. El equipo planea abrir el acceso a la API en el tercer trimestre.",
   };
   {
     const r = checkTranslationDrift(MASTER, ES, "ES_ES", UNIT);
@@ -400,8 +406,8 @@ async function main() {
   {
     const JA: DraftContent = {
       headline: "Google DeepMindがLyria 3.5を公開",
-      summary: "Google DeepMindは2026年7月31日にLyria 3.5を公開したとAYi_AInotesが伝えた。",
-      body: "Google DeepMindは2026年7月31日にLyria 3.5を公開したとAYi_AInotesが伝えた。このモデルは4000万曲で学習された。AYi_AInotesによると、第3四半期に開発者向けAPIを公開する計画だ。",
+      summary: "Google DeepMindは2026年7月31日にLyria 3.5を公開した。",
+      body: "Google DeepMindは2026年7月31日にLyria 3.5を公開した。このモデルは4000万曲で学習された。第3四半期に開発者向けAPIを公開する計画だ。",
     };
     const r = checkTranslationDrift(MASTER, JA, "JA_JP", UNIT);
     recordCodes(r.issues);
@@ -433,11 +439,12 @@ async function main() {
     check("J6", "日期被改 → TRANSLATION_FACT_DRIFT", r.issues.some((i) => i.code === "TRANSLATION_FACT_DRIFT"));
   }
   {
-    const strip = (t: string) => t.replace("según AYi_AInotes.", "").replace("AYi_AInotes informó que el", "El").replace(", según AYi_AInotes", "");
-    const bad = clone(ES, { summary: strip(ES.summary), body: strip(ES.body) });
+    // 规则已反转：译者自行补上的发布者归因才是问题
+    const bad = clone(ES, { body: ES.body + " Según AYi_AInotes, hay más detalles." });
     const r = checkTranslationDrift(MASTER, bad, "ES_ES", UNIT);
     recordCodes(r.issues);
-    check("J7", "归属在翻译中丢失 → ATTRIBUTION_MISMATCH", r.issues.some((i) => i.code === "ATTRIBUTION_MISMATCH"));
+    check("J7", "译文添加发布者归因 → ATTRIBUTION_MISMATCH",
+      r.issues.some((i) => i.code === "ATTRIBUTION_MISMATCH"));
   }
   {
     const bad = clone(ES, { body: ES.body + " El proyecto también contó con Nvidia." });

@@ -1,6 +1,7 @@
 import type { DraftLanguage } from "@prisma/client";
 
 import { httpUrlOrNull } from "../aihot/types";
+import { findSourceLeaks } from "../publishing/attribution";
 
 import { aliasesOf, entityPresent, normalizeForEntityMatch } from "./entity-alias";
 import {
@@ -200,20 +201,33 @@ export function checkMasterFaithfulness(
   // ── 情态：来源标成「计划」的事，母版不得写成已完成 ──
   issues.push(...checkModality(article, corpus));
 
-  // ── 归因：正文必须能追溯到原始来源或 AI HOT ──
-  const attributionNames = [input.originalSourceName, input.attributionName].filter(Boolean) as string[];
-  const articleEntityNorm = normalizeForEntityMatch(article);
-  const hasAttribution = attributionNames.some((n) => {
-    if (entityPresent(n, articleEntityNorm)) return true;
-    // 来源名常是 "X：阿易 AI Notes (@AYi_AInotes)" 这种复合串，取其中的
-    // 拉丁字母片段做匹配，避免因为括号与前缀而误判为「没有归因」
-    const latin = n.match(/[A-Za-z][A-Za-z0-9._-]{2,}/g) ?? [];
-    return latin.some((frag) => articleEntityNorm.includes(normalizeForEntityMatch(frag)));
+  /*
+   * 归因：正文里**不得**出现发布者归因。
+   *
+   * 这条规则是反过来的 —— 早先要求正文必须写明来源，现在要求正文不许写。
+   * 出处由页面底部统一声明；正文里带发布者名字，等于替信源在我们的页面上署名。
+   *
+   * 只查**发布者身份**，不查事件主体：来源名叫「X：OpenAI 官方博客」时，
+   * 出现在标题里的 OpenAI 是新闻主体，必须留；而「据 OpenAI 官方博客」是归因，必须去。
+   */
+  const publisherNames = [input.originalSourceName, input.attributionName].filter(Boolean) as string[];
+  const leaked = findSourceLeaks(article, {
+    sourceNames: publisherNames,
+    title: input.title,
+    providerName: input.attributionName,
   });
-  if (!hasAttribution) {
+  if (leaked.length) {
     issues.push({
       code: "ATTRIBUTION_MISMATCH",
-      detail: `正文未提及来源（${attributionNames.join(" / ") || "无"}）`,
+      detail: `正文出现发布者归因「${leaked.slice(0, 3).join("、")}」—— 出处应只在页面底部声明`,
+      snippet: leaked[0],
+    });
+  }
+  if (/\baccording to\b|\bas reported by\b|据[^，。]{0,12}报道/i.test(article)) {
+    issues.push({
+      code: "ATTRIBUTION_MISMATCH",
+      detail: "正文含「据…报道」式的发布者归因句式",
+      snippet: (article.match(/[^.。]*\b(?:according to|as reported by)\b[^.。]*/i)?.[0] ?? "").slice(0, 90),
     });
   }
 
@@ -311,16 +325,22 @@ export function checkTranslationDrift(
     issues.push({ code: "ENTITY_MISMATCH", detail: `译文出现母版没有的专名「${p}」`, snippet: p, language });
   }
 
-  // ── 归因必须活过翻译 ──
-  const attributionNames = [input.originalSourceName, input.attributionName].filter(Boolean) as string[];
-  const transEntityNorm = normalizeForEntityMatch(transText);
-  const kept = attributionNames.some((n) => {
-    if (entityPresent(n, transEntityNorm)) return true;
-    const latin = n.match(/[A-Za-z][A-Za-z0-9._-]{2,}/g) ?? [];
-    return latin.some((frag) => transEntityNorm.includes(normalizeForEntityMatch(frag)));
+  /*
+   * 归因：译文同样**不得**添加发布者归因。
+   *
+   * 译者最容易「好心」补一句 "según X" / "によると" —— 那是把母版没有的
+   * 发布者署名塞进公开页。出处只在页面底部声明。
+   */
+  const publisherNames = [input.originalSourceName, input.attributionName].filter(Boolean) as string[];
+  const addedAttribution = findSourceLeaks(transText, {
+    sourceNames: publisherNames, title: input.title, providerName: input.attributionName,
   });
-  if (!kept) {
-    issues.push({ code: "ATTRIBUTION_MISMATCH", detail: "译文未保留来源归属", language });
+  if (addedAttribution.length) {
+    issues.push({
+      code: "ATTRIBUTION_MISMATCH",
+      detail: `译文添加了发布者归因「${addedAttribution.slice(0, 3).join("、")}」`,
+      snippet: addedAttribution[0], language,
+    });
   }
 
   // ── 篇幅：西语/巴葡天然比英文长，放宽到 1.5 倍再判 ──

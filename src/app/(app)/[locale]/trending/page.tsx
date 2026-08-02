@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 
 import { TrendingList } from "@/components/publishing/trending-list";
-import { listTrendingCards } from "@/lib/content/publishing/trending";
+import { listTrending } from "@/lib/content/publishing/trending";
 import {
   absoluteUrl, localeFromSegment, LOCALES, LOCALE_HREFLANG, LOCALE_SEGMENT,
 } from "@/lib/content/publishing/types";
@@ -13,9 +13,10 @@ export const revalidate = 0;
 
 type Props = { params: Promise<{ locale: string }> };
 
+// 标题里不带品牌名 —— 出处只在底部声明
 const TITLE: Record<string, string> = {
-  EN_US: "Trending on AI HOT", ES_ES: "Tendencias en AI HOT",
-  PT_BR: "Em alta no AI HOT", JA_JP: "AI HOT トレンド",
+  EN_US: "Trending now", ES_ES: "Tendencias ahora",
+  PT_BR: "Em alta agora", JA_JP: "現在のトレンド",
 };
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
@@ -38,6 +39,8 @@ export default async function TrendingPage({ params }: Props) {
   const { locale } = await params;
   const l = localeFromSegment(locale);
   if (!l) notFound();
-  const cards = await listTrendingCards(l);
-  return <TrendingList cards={cards} locale={l} />;
+  const listing = await listTrending(l);
+  // 归因不可用（AI HOT 链接非法）时不呈现榜单：没有合法出处就不该对外发
+  if (!listing) notFound();
+  return <TrendingList listing={listing} locale={l} />;
 }

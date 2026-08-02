@@ -1,54 +1,50 @@
-import { ArrowUpRight } from "lucide-react";
-
 import type { PublishedPage } from "@/lib/content/publishing/query";
 import { LOCALE_SEGMENT, LOCALES } from "@/lib/content/publishing/types";
+
+import { AttributionFooter } from "./attribution-footer";
 
 /**
  * 已发布多语言内容的公开渲染。
  *
- * 归因是硬要求，不是装饰：读者必须能看到内容从哪来、原始来源是谁、
- * 以及「本站只做忠实转述，不为信源的事实背书」。
+ * 页面**不展示实际信源名称**，顶部也不做来源归因。
+ * 出处只由底部的 AttributionFooter 统一声明。
  *
- * 这个组件**只接收已经过滤好的公开字段** —— QA 详情、prompt、
- * provider 载荷根本不在 PublishedPage 里，所以没有泄露的可能。
+ * 这个组件拿到的 PublishedPage 里根本没有实际来源字段 ——
+ * 不是「有但不渲染」，是投影层就没放进来，所以 HTML、RSC payload、
+ * 序列化 props 里都不会带出去。
  */
 
 const UI: Record<string, {
-  discoveredVia: string; originalSource: string; sourcePublished: string;
-  sitePublished: string; readOn: string; languages: string; disclaimer: string;
-  signalBadge: string; signalNotice: string;
+  published: string; sourceDate: string; languages: string;
+  disclaimer: string; signalBadge: string; signalNotice: string;
 }> = {
   EN_US: {
-    discoveredVia: "Discovered via", originalSource: "Original source",
-    sourcePublished: "Source published", sitePublished: "Published on AskWalle",
-    readOn: "Read on", languages: "Read in other languages",
-    disclaimer: "This article was written by AskWalle based on what the source published. Facts are as stated by the source; we do not independently verify them.",
+    published: "Published", sourceDate: "Original publication date",
+    languages: "Read in other languages",
+    disclaimer: "This article was written by AskWalle based on publicly reported information. Facts are as stated by the underlying report; we do not independently verify them.",
     signalBadge: "Real-time trending signal",
-    signalNotice: "This is a trending-signal brief, not a full news report. It reflects only what the AI HOT listing provides — the topic title, how many sources are tracking it, and which sources those are. It does not describe event details, and none have been added.",
+    signalNotice: "This is a trending-signal brief, not a full news report. It reflects only what the trending feed provides — the topic and how widely it is being tracked. It does not describe event details, and none have been added.",
   },
   ES_ES: {
-    discoveredVia: "Descubierto vía", originalSource: "Fuente original",
-    sourcePublished: "Publicado por la fuente", sitePublished: "Publicado en AskWalle",
-    readOn: "Leer en", languages: "Leer en otros idiomas",
-    disclaimer: "Este artículo fue redactado por AskWalle a partir de lo publicado por la fuente. Los hechos son los que declara la fuente; no los verificamos de forma independiente.",
+    published: "Publicado", sourceDate: "Fecha de publicación original",
+    languages: "Leer en otros idiomas",
+    disclaimer: "Este artículo fue redactado por AskWalle a partir de información publicada. Los hechos son los que declara el informe subyacente; no los verificamos de forma independiente.",
     signalBadge: "Señal de tendencia en tiempo real",
-    signalNotice: "Este es un resumen de señal de tendencia, no un reportaje completo. Refleja únicamente lo que ofrece el listado de AI HOT: el título del tema, cuántas fuentes lo siguen y cuáles son. No describe detalles del evento ni se ha añadido ninguno.",
+    signalNotice: "Este es un resumen de señal de tendencia, no un reportaje completo. Refleja únicamente lo que ofrece el listado de tendencias: el tema y con qué amplitud se está siguiendo. No describe detalles del evento ni se ha añadido ninguno.",
   },
   PT_BR: {
-    discoveredVia: "Descoberto via", originalSource: "Fonte original",
-    sourcePublished: "Publicado pela fonte", sitePublished: "Publicado no AskWalle",
-    readOn: "Ler em", languages: "Ler em outros idiomas",
-    disclaimer: "Este artigo foi escrito pela AskWalle com base no que a fonte publicou. Os fatos são os declarados pela fonte; não os verificamos de forma independente.",
+    published: "Publicado", sourceDate: "Data de publicação original",
+    languages: "Ler em outros idiomas",
+    disclaimer: "Este artigo foi escrito pela AskWalle com base em informações publicadas. Os fatos são os declarados pelo relato subjacente; não os verificamos de forma independente.",
     signalBadge: "Sinal de tendência em tempo real",
-    signalNotice: "Este é um resumo de sinal de tendência, não uma reportagem completa. Reflete apenas o que a listagem do AI HOT fornece: o título do tema, quantas fontes o acompanham e quais são. Não descreve detalhes do evento, e nenhum foi acrescentado.",
+    signalNotice: "Este é um resumo de sinal de tendência, não uma reportagem completa. Reflete apenas o que a listagem de tendências fornece: o tema e a amplitude com que está sendo acompanhado. Não descreve detalhes do evento, e nenhum foi acrescentado.",
   },
   JA_JP: {
-    discoveredVia: "発見元", originalSource: "一次情報源",
-    sourcePublished: "情報源の公開日", sitePublished: "AskWalle 掲載日",
-    readOn: "元記事を読む", languages: "他の言語で読む",
-    disclaimer: "本記事は情報源が公開した内容に基づき AskWalle が独自に執筆しました。事実関係は情報源の記載に依拠しており、当サイトによる独自検証は行っていません。",
+    published: "掲載日", sourceDate: "元の公開日",
+    languages: "他の言語で読む",
+    disclaimer: "本記事は公開された情報に基づき AskWalle が独自に執筆しました。事実関係は元の報道の記載に依拠しており、当サイトによる独自検証は行っていません。",
     signalBadge: "リアルタイム・トレンドシグナル",
-    signalNotice: "本記事はトレンドシグナルの要約であり、完全な報道記事ではありません。AI HOT の掲載情報（話題のタイトル、追跡している情報源の数とその名称）のみを反映しています。出来事の詳細は記載しておらず、補足も行っていません。",
+    signalNotice: "本記事はトレンドシグナルの要約であり、完全な報道記事ではありません。トレンド一覧が提供する情報（話題と、それがどの程度広く追跡されているか）のみを反映しています。出来事の詳細は記載しておらず、補足も行っていません。",
   },
 };
 
@@ -85,51 +81,25 @@ export function PublishedArticle({ page }: { page: PublishedPage }) {
 
       <p className="mt-4 text-lg leading-8 text-slate-600 dark:text-muted-foreground">{page.summary}</p>
 
+      {/* 日期不带来源名：只说「原文发布于何时」与「本站何时发布」 */}
       <dl className="mt-6 flex flex-wrap gap-x-6 gap-y-2 border-y border-border/70 py-4 text-sm text-slate-600 dark:text-muted-foreground">
-        <div className="flex gap-2">
-          <dt className="font-medium">{t.discoveredVia}:</dt>
-          <dd>
-            <a href={page.attributionUrl} target="_blank" rel="noopener noreferrer"
-               className="inline-flex items-center gap-1 text-primary hover:underline">
-              {page.attributionName}
-              <ArrowUpRight className="h-3.5 w-3.5" />
-            </a>
-          </dd>
-        </div>
-        {page.originalSourceName ? (
-          <div className="flex gap-2">
-            <dt className="font-medium">{t.originalSource}:</dt>
-            <dd>
-              {page.originalSourceUrl ? (
-                <a href={page.originalSourceUrl} target="_blank" rel="noopener noreferrer"
-                   className="inline-flex items-center gap-1 text-primary hover:underline">
-                  {page.originalSourceName}
-                  <ArrowUpRight className="h-3.5 w-3.5" />
-                </a>
-              ) : (
-                <span>{page.originalSourceName}</span>
-              )}
-            </dd>
-          </div>
-        ) : null}
         {page.sourcePublishedAt ? (
           <div className="flex gap-2">
-            <dt className="font-medium">{t.sourcePublished}:</dt>
+            <dt className="font-medium">{t.sourceDate}:</dt>
             <dd>{fmt(page.sourcePublishedAt, page.locale)}</dd>
           </div>
         ) : null}
         <div className="flex gap-2">
-          <dt className="font-medium">{t.sitePublished}:</dt>
+          <dt className="font-medium">{t.published}:</dt>
           <dd>{fmt(page.sitePublishedAt, page.locale)}</dd>
         </div>
       </dl>
 
-      {/* 日报按 AI HOT 的原始栏目顺序渲染；顺序是信源的编辑判断，不重排 */}
+      {/* 日报按原始栏目顺序渲染；顺序是信源的编辑判断，不重排 */}
       {page.sections?.length ? (
         <div className="mt-8 space-y-8">
           {page.sections.map((s, i) => (
             <section key={`${i}-${s.label}`}>
-              {/* 导语没有栏目名，此时不该凭空造一个空标题 */}
               {s.label ? (
                 <h2 className="text-xl font-semibold text-slate-950 dark:text-foreground">{s.label}</h2>
               ) : null}
@@ -167,6 +137,8 @@ export function PublishedArticle({ page }: { page: PublishedPage }) {
           </ul>
         </nav>
       ) : null}
+
+      <AttributionFooter attribution={page.attribution} />
     </article>
   );
 }

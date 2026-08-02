@@ -85,19 +85,20 @@ function hotTopicBrief(input: ContentUnitInput): string {
     const band = HOT_TOPIC_WORD_BAND.SIGNAL;
     return `写成一条英文**实时热点信号简报**（${band.min}–${band.max} 词）。
 
-可用材料**只有**：热点标题、榜单名次、来源数量、来源名称、AI HOT 抓取时间、AI HOT 链接。
+可用材料**只有**：热点标题、榜单名次、来源数量、信号条数、抓取日期。
 按这个顺序组织：
   1. 这个热点是什么（只能复述标题所表达的内容，不得展开）
-  2. AI HOT 当前显示的关注度（名次、来源数、信号条数，如实引用）。
+  2. 当前的关注广度（名次、来源数、信号条数，如实引用）。
      **名次必须写成「截至某个时间点」的状态**（例如 "as of <抓取日期>, ranked N"），
      不能写成固定属性 —— 榜单名次每天都在变，不加时间限定的名次很快就会变成假话。
-  3. 哪些来源正在关注（引用来源名单里的名字）
-  4. 当前可确认的信息边界（明确说明可获取的信息仅限于此）
+  3. 当前可确认的信息边界（明确说明可获取的信息仅限于此）
 
 **必须**让读者看出这是榜单信号而不是完整报道。可以直接写类似：
-  "AI HOT currently lists this as a trending topic."
+  "This is currently listed as a trending topic."
   "The topic is being tracked across N sources."
   "The available feed does not include further event details."
+
+**不得列举来源名称**，也不得出现聚合方的品牌名 —— 出处由页面底部统一声明。
 
 **严禁**为了凑篇幅补充：技术细节、商业影响、事件背景、发布时间、产品参数、
 具体事件进展，以及任何 API 没有给出的结论。写不满下限就说明材料确实少 ——
@@ -125,11 +126,16 @@ export function buildMasterPrompt(input: ContentUnitInput, retryIssues?: MlIssue
 ═══ 硬性约束（违反任何一条即为不合格）═══
 1. 不得引入材料中没有的任何事实、数字、日期、人名、机构名、产品名或结论。
 2. 数字、金额、百分比、日期、型号与版本号必须与材料**完全对应**，不得换算成不同的量、取整或改写。
-3. 保留观点归属：材料里的主张、预测、声明必须写明是谁说的（例如「${input.originalSourceName ?? input.attributionName} reported」）。
+3. 保留**事件内部**的观点归属：材料里的主张、预测、声明写明是**事件当事人**说的
+   （例如「OpenAI said」「the company expects」）。
    **不得把计划、预期写成已经完成的事实。**
 4. 不得逐句翻译或照搬材料的摘要原文，要重新组织结构与表达。
 5. 不得推断材料未声明的因果关系，不得为凑篇幅编造细节。
-6. 正文必须提及来源「${input.originalSourceName ?? input.attributionName}」。
+6. **不得出现任何发布者归因**：不写「据 X 报道」「according to <媒体>」「来自 AI HOT」，
+   不写发布者名称、不写原始来源地址、不写 AI HOT 地址、不写来源元数据。
+   出处由页面底部统一声明，不由正文承担。
+   注意区分：作为**新闻主体**的公司/人物/产品必须保留
+   （"OpenAI announced…" 里的 OpenAI 是事件主体，不是来源标签）。
 7. 正文长度不超过 ${limit} 字符。
 8. 输出必须是英文。${retry}
 
@@ -170,7 +176,8 @@ export function buildTranslationPrompt(
    注意：西班牙语的 billón 是 10^12，10^9 要写 mil millones；巴西葡萄牙语的 bilhão 才是 10^9。
 3. 日期必须指向同一天，可以改写法（August 1, 2026 / 1 de agosto de 2026 / 2026年8月1日）。
 4. 型号与版本号（GPT-5.6、v1.2.3 这类）**原样保留，不翻译、不改写**。
-5. 必须保留来源归属「${input.originalSourceName ?? input.attributionName}」。
+5. **不得添加任何发布者归因**（"según <媒体>"、"によると" 之类都不行）。
+   英文原文里作为**事件主体**的公司、人物、产品名照译保留。
 6. 不得引入英文原文里没有出现的机构名、产品名或人名。${retry}
 
 ═══ 英文原文 ═══

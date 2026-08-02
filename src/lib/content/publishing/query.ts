@@ -2,18 +2,22 @@ import type { DraftLanguage, HotTopicBriefMode } from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 
-import { httpUrlOrNull } from "../aihot/types";
-
+import {
+  buildPublicAttribution, redactAttribution, resolveAttributionMode,
+  type PublicAttribution, type RedactionContext,
+} from "./attribution";
 import { absoluteUrl, LOCALE_HREFLANG, LOCALES, publicPath, type ChecklistKey } from "./types";
 
 /**
  * 公开页的数据读取。
  *
- * **只返回真正已发布的内容。** 草稿、退回稿、未批准稿一律读不到 ——
- * 「不可公开访问」不能靠前端不加链接来实现，得让查询本身取不到。
+ * 两条硬约束：
+ *   1. **只返回真正已发布的内容。** 草稿、退回稿、未批准稿一律读不到 ——
+ *      「不可公开访问」不能靠前端不加链接来实现，得让查询本身取不到。
+ *   2. **返回值里没有实际来源名称与地址。** 不是「有但不渲染」，是根本不放进来。
+ *      放进来再靠组件不显示，名字仍会出现在 RSC payload、序列化 props 与页面源码里。
  *
- * 也**只**返回页面要展示的字段：QA 详情、prompt、provider 载荷、
- * 内部状态一概不出现在返回值里，从源头上杜绝泄露。
+ * QA 详情、prompt、provider 载荷、内部状态同样一概不出现。
  */
 
 export type PublishedPage = {
@@ -26,16 +30,12 @@ export type PublishedPage = {
   sections: { label: string; body: string }[] | null;
   contentForm: string;
   categorySlug: string | null;
-  /** 仅热点简报有值。页面据此明示「这是榜单信号，不是完整报道」 */
   hotTopicMode: HotTopicBriefMode | null;
-  /** 归因 */
-  attributionName: string;
-  attributionUrl: string;
-  originalSourceName: string | null;
-  originalSourceUrl: string | null;
+  /** 本站发布时间。**来源发布时间不带来源名**，只是一个日期 */
   sourcePublishedAt: Date | null;
   sitePublishedAt: Date;
-  /** 四语言互链：只包含**同样已发布**的语言 */
+  /** 底部统一归因。这是页面上唯一的出处声明 */
+  attribution: PublicAttribution;
   alternates: { locale: DraftLanguage; hreflang: string; href: string }[];
   xDefault: string | null;
 };
@@ -49,11 +49,8 @@ async function buildAlternates(familyId: number) {
   const alternates = LOCALES.filter((l) => published.has(l)).map((locale) => ({
     locale,
     hreflang: LOCALE_HREFLANG[locale],
-    href: absoluteUrl(
-      pubs.find((p) => p.locale === locale)!.path
-    ),
+    href: absoluteUrl(pubs.find((p) => p.locale === locale)!.path),
   }));
-  // x-default 指向 en-US；英文没发布就不给 x-default，而不是随便指一个
   const en = pubs.find((p) => p.locale === "EN_US");
   return { alternates, xDefault: en ? absoluteUrl(en.path) : null };
 }
@@ -62,13 +59,11 @@ async function buildAlternates(familyId: number) {
  * 从正文里还原 `## 栏目名` 结构。
  *
  * 只在正文确实带这种标记时才生效；没有标记就返回 null，走整段正文渲染。
- * 导语（第一个 `##` 之前的部分）会并进第一个栏目之前单独保留 —— 丢掉它
- * 等于把日报的开场白吞了。
+ * 导语（第一个 `##` 之前的部分）单独保留 —— 丢掉它等于把日报的开场白吞了。
  */
 export function deriveSections(body: string): { label: string; body: string }[] | null {
   if (!/^##\s+\S/m.test(body)) return null;
   const parts = body.split(/^##\s+(.+)$/m);
-  // split 后形如 [导语, 标题1, 正文1, 标题2, 正文2, …]
   const lead = parts[0]?.trim();
   const out: { label: string; body: string }[] = [];
   for (let i = 1; i + 1 < parts.length; i += 2) {
@@ -79,6 +74,29 @@ export function deriveSections(body: string): { label: string; body: string }[] 
   if (!out.length) return null;
   if (lead) out.unshift({ label: "", body: lead });
   return out;
+}
+
+/**
+ * 收集该内容单元的**实际**来源名称。
+ *
+ * 只用于渲染层剔除，**不进返回值**。热点还要带上榜单的来源名单 ——
+ * 那份名单整段出现在早期生成的正文里。
+ */
+async function redactionNames(family: {
+  original_source_name: string | null; hot_topic_snapshot_id: number | null;
+}): Promise<string[]> {
+  const names = new Set<string>();
+  if (family.original_source_name) names.add(family.original_source_name);
+  if (family.hot_topic_snapshot_id) {
+    const snap = await prisma.aihotHotTopicSnapshot.findUnique({
+      where: { id: family.hot_topic_snapshot_id },
+      select: { source_names_json: true, source_name: true },
+    });
+    if (snap?.source_name) names.add(snap.source_name);
+    const list = Array.isArray(snap?.source_names_json) ? (snap!.source_names_json as string[]) : [];
+    for (const n of list) if (n) names.add(n);
+  }
+  return [...names];
 }
 
 async function loadByPath(locale: DraftLanguage, path: string): Promise<PublishedPage | null> {
@@ -92,40 +110,40 @@ async function loadByPath(locale: DraftLanguage, path: string): Promise<Publishe
   if (!revision) return null;
 
   const family = pub.translation.family;
-  const { alternates, xDefault } = await buildAlternates(family.id);
+  const mode = (await resolveAttributionMode()).mode;
+  const attribution = buildPublicAttribution({
+    mode,
+    providerUrl: family.attribution_url,
+    originalSourceUrl: family.original_source_url,
+  });
+  // AI HOT 链接不合法 → 没有合法出处可声明，这一页不该对外呈现
+  if (!attribution) return null;
 
-  const stored = Array.isArray(revision.sections_json)
-    ? (revision.sections_json as unknown as { label: string; body: string }[])
-    : null;
-  /*
-   * 译文侧没有独立的 sections：翻译时输入的是母版正文，产出也是一整段正文，
-   * 里面的 `## 栏目名` 是母版留下的标记。不还原它，四种语言里就只有英文
-   * 有栏目结构，其余三种会把 "## Noticias de la industria" 当普通文字印出来。
-   *
-   * 正文才是权威内容，栏目是它的呈现方式，所以在读取层还原而不是回头改
-   * revision —— revision 一旦冻结就不该再动。
-   */
-  // 正文优先：它同时含导语与全部栏目，是完整产出。
-  // 只用 sections_json 的话，英文页会把导语整段丢掉（导语不在 sections 里）
-  const sections = deriveSections(revision.body) ?? (stored?.length ? stored : null);
+  const ctx: RedactionContext = {
+    sourceNames: await redactionNames(family),
+    title: family.slug.replace(/-/g, " "),
+    providerName: family.attribution_name,
+  };
+  // 标题里的实体是事件主体，用真实标题做豁免依据
+  ctx.title = `${revision.headline} ${ctx.title}`;
+
+  const headline = redactAttribution(revision.headline, ctx);
+  const summary = redactAttribution(revision.summary, ctx);
+  const body = redactAttribution(revision.body, ctx);
+
+  const { alternates, xDefault } = await buildAlternates(family.id);
 
   return {
     locale, path,
     canonical: absoluteUrl(path),
-    headline: revision.headline,
-    summary: revision.summary,
-    body: revision.body,
-    sections,
+    headline, summary, body,
+    sections: deriveSections(body),
     contentForm: family.content_form,
     categorySlug: family.category_slug,
     hotTopicMode: family.hot_topic_mode,
-    attributionName: family.attribution_name,
-    attributionUrl: family.attribution_url,
-    originalSourceName: family.original_source_name,
-    // 再验一次链接：数据库里存的是发布当时合法的值，渲染前仍要确认
-    originalSourceUrl: httpUrlOrNull(family.original_source_url),
     sourcePublishedAt: family.source_published_at,
     sitePublishedAt: pub.published_at,
+    attribution,
     alternates, xDefault,
   };
 }
