@@ -119,6 +119,15 @@ export function redactionTokens(ctx: RedactionContext): string[] {
     const cleaned = name.trim();
     if (cleaned.length >= 3) tokens.add(cleaned);
     for (const m of cleaned.matchAll(/@[A-Za-z0-9_]{3,}/g)) tokens.add(m[0]);
+    /*
+     * 中日文来源名必须单独抽出来。
+     * 「IT之家（RSS）」在正文里会写成「IT之家 (RSS)」—— 全角括号变半角、
+     * 还多了个空格，整串精确匹配对不上。只按拉丁片段抽取则完全漏掉它，
+     * 结果是西语/日语正文里赫然留着中文来源名。
+     */
+    for (const m of cleaned.matchAll(/[A-Za-z]*[\u4e00-\u9fff]+[A-Za-z]*/g)) {
+      if (m[0].length >= 2) tokens.add(m[0]);
+    }
     for (const m of cleaned.matchAll(/[A-Z][A-Za-z0-9.''-]{2,}(?:\s+[A-Z][A-Za-z0-9.''-]{2,})*/g)) {
       const frag = m[0].trim();
       if (frag.length >= 4) tokens.add(frag);
@@ -141,10 +150,20 @@ export function redactionTokens(ctx: RedactionContext): string[] {
 function stripAttributionClauses(text: string, names: string[]): string {
   let out = text;
 
-  // 通用引导语（带或不带具体名字）
+  /*
+   * 通用引导语。**四种语言都要覆盖** ——
+   * 只处理英文的话，西语 "Según X," 与日文「Xによると、」会把来源名原样留在正文里。
+   */
   out = out
     .replace(/\baccording to (?:a |the )?(?:post|report|update|announcement|statement)[^,.]{0,60}[,]\s*/gi, "")
     .replace(/\baccording to [^,.]{0,60}[,]\s*/gi, "")
+    // 西语 / 巴葡
+    .replace(/\b(?:Según|Segundo)\s+[^,.]{0,60}[,]\s*/gi, "")
+    .replace(/\b(?:De acordo com|Conforme (?:relatado )?(?:pel[ao]|com))\s+[^,.]{0,60}[,]\s*/gi, "")
+    .replace(/,\s*(?:según|segundo|conforme)\s+[^,.]{0,60}(?=[.。])/gi, "")
+    // 日文：「Xによると、」「Xによれば、」「Xが伝えた」
+    .replace(/[^、。\n]{0,40}(?:によると|によれば|に基づくと)[、]?\s*/g, "")
+    .replace(/と[^、。\n]{0,30}(?:が伝えた|が報じた|は伝えている)/g, "")
     .replace(/,\s*according to [^,.]{0,60}(?=[.。])/gi, "")
     .replace(/,\s*as (?:reported|stated|noted) (?:by|in) [^,.]{0,60}(?=[.。])/gi, "")
     .replace(/\bas (?:reported|stated|noted) (?:by|in) [^,.]{0,60}[,]\s*/gi, "")
@@ -188,12 +207,40 @@ function neutralizeProvider(text: string): string {
     .replace(/\b(?:AI\s*HOT|the trending feed)['’]s\s+/gi, "the ")
     .replace(/\bthe\s+(?:AI\s*HOT|trending feed)\s+(?:board|leaderboard|list|feed)\b/gi, NEUTRAL_FEED)
     .replace(/\b(?:on|in)\s+(?:AI\s*HOT|the trending feed)\b/gi, `on ${NEUTRAL_FEED}`)
-    // 标题式前缀 "AI HOT: xxx" / "AI HOT Daily Briefing"
+    // 标题式前缀 "AI HOT: xxx"
     .replace(/\bAI\s*HOT\s*[:：]\s*/gi, "")
-    .replace(/\bAI\s*HOT\s+(?=Daily|Briefing|Trending)/gi, "")
+    /*
+     * 标题里的定语用法（"AI HOT Ranking Shows…"、"AI HOT Daily Briefing"）：
+     * 直接删掉品牌词，不做替换。
+     * 换成中性名词会写出「the trending list Ranking Shows Strong Signal」
+     * 这种既不通顺、大小写也不对的标题 —— 标题里品牌词后面跟着大写词时，
+     * 它是修饰语，删掉刚好，替换反而坏事。
+     */
+    .replace(/\bAI\s*HOT\s+(?=[A-Z])/g, "")
     // 兜底
     .replace(/\bAI\s*HOT\b/gi, NEUTRAL_FEED)
     .replace(/\bthe the\b/gi, "the");
+}
+
+/**
+ * 清掉删名字之后留下的悬空引导词。
+ *
+ * 「IT之家（RSS）によると、欧州連合の…」删掉名字后会变成「によると、欧州連合の…」——
+ * 句子以助词开头，读起来是残句。引导词本来就依附于那个名字，名字没了它也该走。
+ */
+function dropDanglingLeaders(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => line
+      .replace(/^\s*(?:によると|によれば|に基づくと)[、,]?\s*/g, "")
+      .replace(/^\s*(?:Según|Segundo|De acordo com|Conforme(?:\s+relatado)?(?:\s+pel[ao])?)\s*[,，]?\s*/gi, "")
+      .replace(/^\s*(?:According to)\s*[,]?\s*/gi, "")
+      .replace(/(^|[.。!?]\s*)(?:によると|によれば)[、,]\s*/g, "$1")
+      .replace(/(^|[.!?]\s+)(?:Según|Segundo|De acordo com)\s*[,]\s*/gi, "$1")
+      // "una publicación en X de, OpenAI …" 这类删名后留下的孤立介词
+      .replace(/\s+(?:de|por|em|by|from)\s*,\s*/gi, ", ")
+    )
+    .join("\n");
 }
 
 function tidy(text: string): string {
@@ -251,7 +298,7 @@ export function redactAttribution(text: string, ctx: RedactionContext): string {
     return kept.join(" ");
   });
 
-  return recapitalize(tidy(lines.join("\n")));
+  return recapitalize(tidy(dropDanglingLeaders(lines.join("\n"))));
 }
 
 /** 公开文本里是否仍残留实际来源名。测试与发布前检查都用它 */

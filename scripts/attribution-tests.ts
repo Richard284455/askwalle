@@ -86,6 +86,33 @@ async function main() {
     check("A12", "Read original source 整句删除", !/original source/i.test(out), out);
   }
 
+  {
+    /*
+     * 多语言归因引导语。
+     * 只处理英文的话，西语 "Según X," 与日文「Xによると、」会把来源名原样留在正文里 ——
+     * 首次上线时 ES/PT/JA 三个语言的正文都赫然带着中文来源名。
+     */
+    const ctx: RedactionContext = { sourceNames: ["IT之家（RSS）"], title: "EU AI Act", providerName: "AI HOT" };
+    const es = redactAttribution("Según IT之家 (RSS), la Ley de IA aplicará nuevos requisitos.", ctx);
+    check("A13", "西语 Según 归因去掉且不留来源名",
+      !/Según/i.test(es) && !/之家/.test(es) && /La Ley de IA aplicará/.test(es), es);
+    const pt = redactAttribution("De acordo com IT之家 (RSS), a Lei de IA aplicará novos requisitos.", ctx);
+    check("A14", "巴葡 De acordo com 归因去掉且不留来源名",
+      !/De acordo com/i.test(pt) && !/之家/.test(pt) && /A Lei de IA aplicará/.test(pt), pt);
+    const ja = redactAttribution("IT之家（RSS）によると、欧州連合のAI法は8月2日から施行する。", ctx);
+    check("A15", "日文「によると」归因去掉，不留悬空助词",
+      !/によると/.test(ja) && !/之家/.test(ja) && /^欧州連合のAI法/.test(ja), ja);
+    check("A16", "中文来源名被列入屏蔽词（CJK 段落）",
+      redactionTokens(ctx).some((t) => t.includes("之家")), redactionTokens(ctx).join(","));
+  }
+  {
+    // 删名字后留下的孤立介词："una publicación en X de, OpenAI …"
+    const ctx: RedactionContext = { sourceNames: ["X：Greg Brockman (@gdb)"], title: "Astra", providerName: "AI HOT" };
+    const out = redactAttribution("Según una publicación en X de Greg Brockman (@gdb), OpenAI utilizó Astra.", ctx);
+    check("A17", "删名后不留孤立介词与逗号",
+      !/\bde\s*,/.test(out) && /OpenAI utilizó Astra/.test(out), out);
+  }
+
   section("B  归因模式与授权闸门");
 
   {
