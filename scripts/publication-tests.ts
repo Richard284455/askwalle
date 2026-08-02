@@ -120,7 +120,7 @@ async function makeFamily(opts: { form?: "MULTILINGUAL_NEWS_BRIEF" | "DAILY_BRIE
 async function approveAll(created: { locale: DraftLanguage; translationId: number; revisionId: number }[]) {
   for (const c of created) {
     await recordReview({
-      translationId: c.translationId, revisionId: c.revisionId, reviewer: "test",
+      translationId: c.translationId, revisionId: c.revisionId, reviewer: { type: "AGENT", id: "publication-tests", name: "publication tests" },
       decision: "APPROVED", checklist: ALL_CHECKS_PASS, issueCategories: ["NO_ISSUE"],
     });
   }
@@ -215,33 +215,33 @@ async function main() {
     const en = created[0];
     const bad = { ...ALL_CHECKS_PASS, numbers_consistent: false };
     const r = await recordReview({
-      translationId: en.translationId, revisionId: en.revisionId, reviewer: "t",
+      translationId: en.translationId, revisionId: en.revisionId, reviewer: { type: "AGENT", id: "publication-tests", name: "publication tests" },
       decision: "APPROVED", checklist: bad, issueCategories: ["NO_ISSUE"],
     });
     check("E1", "十项没全过不能标 APPROVED", !r.ok, r.ok ? "竟然通过了" : r.reason.slice(0, 60));
     check("E2", "failedChecks 能列出未过项", failedChecks(bad).length === 1);
 
     const r2 = await recordReview({
-      translationId: en.translationId, revisionId: en.revisionId, reviewer: "t",
+      translationId: en.translationId, revisionId: en.revisionId, reviewer: { type: "AGENT", id: "publication-tests", name: "publication tests" },
       decision: "APPROVED", checklist: ALL_CHECKS_PASS, issueCategories: ["TRUE_FACT_DRIFT"],
     });
     check("E3", "存在实质问题分类时不能 APPROVED", !r2.ok);
 
     const r3 = await recordReview({
-      translationId: en.translationId, revisionId: en.revisionId, reviewer: "",
+      translationId: en.translationId, revisionId: en.revisionId, reviewer: { type: "AGENT", id: "" },
       decision: "APPROVED", checklist: ALL_CHECKS_PASS, issueCategories: ["NO_ISSUE"],
     });
     check("E4", "必须记录审核人身份", !r3.ok);
 
     const other = await makeFamily();
     const r4 = await recordReview({
-      translationId: en.translationId, revisionId: other.created[0].revisionId, reviewer: "t",
+      translationId: en.translationId, revisionId: other.created[0].revisionId, reviewer: { type: "AGENT", id: "publication-tests", name: "publication tests" },
       decision: "APPROVED", checklist: ALL_CHECKS_PASS, issueCategories: ["NO_ISSUE"],
     });
     check("E5", "审核结论不能记到别人的 revision 上", !r4.ok);
 
     const r5 = await recordReview({
-      translationId: en.translationId, revisionId: en.revisionId, reviewer: "alice",
+      translationId: en.translationId, revisionId: en.revisionId, reviewer: { type: "HUMAN", id: "alice", name: "Alice" },
       decision: "APPROVED", checklist: ALL_CHECKS_PASS, issueCategories: ["NO_ISSUE"], notes: "ok",
     });
     check("E6", "合规审核被记录", r5.ok);

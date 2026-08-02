@@ -64,7 +64,17 @@ export async function listTrending(locale: DraftLanguage): Promise<TrendingListi
     include: {
       translations: {
         where: { locale },
-        include: { publications: { where: { status: "PUBLISHED" } } },
+        /*
+         * 只取**已发布**的记录，并按发布时间倒序。
+         *
+         * 一个译本可以有多条发布记录（内容更新过、每一版各发一次）。
+         * 不排序就是拿数据库返回的任意一条 —— 榜单会随机指向某个旧版本。
+         *
+         * 最新 revision 尚未发布时，这里自然还是上一版：
+         * 卡片继续展示实时榜单数据，链接则指向最近**已发布**的那一版，
+         * 草稿绝不出现在公开面上。
+         */
+        include: { publications: { where: { status: "PUBLISHED" }, orderBy: { published_at: "desc" } } },
       },
     },
   });

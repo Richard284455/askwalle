@@ -1,4 +1,7 @@
-import { Prisma, type DraftLanguage, type ReviewDecision, type ReviewIssueCategory } from "@prisma/client";
+import {
+  Prisma,
+  type DraftLanguage, type ReviewDecision, type ReviewIssueCategory, type ReviewerType,
+} from "@prisma/client";
 
 import { prisma } from "@/lib/prisma";
 
@@ -9,21 +12,56 @@ import { failedChecks, LOCALES, type ChecklistResult } from "./types";
  *
  * 批准以 family 为单位（四种语言要么一起放行，要么都不放行 ——
  * 少一种语言，hreflang 就会指向不存在的页面），但**逐语言留审核记录**：
- * 谁审的、审的哪一版、十项逐条结论、命中哪些问题分类。
+ * 谁审的、以什么身份审的、审的哪一版、十项逐条结论、命中哪些问题分类。
  *
  * 刻意不提供「一键全批」：每种语言都要显式给出结论，
  * 否则这道人工闸门只是形式。
  */
 
+/**
+ * 审核主体。
+ *
+ * type 由**调用方所在的信任边界**决定，不由用户输入决定 ——
+ * 后台 UI 传 HUMAN，脚本/agent 传 AGENT。
+ * 让请求体自己声明 HUMAN，等于把这道闸门交给被审核的一方。
+ */
+export type Reviewer = {
+  type: ReviewerType;
+  /** 稳定标识（账号名 / agent 标识） */
+  id: string;
+  name?: string;
+};
+
 export type ReviewInput = {
   translationId: number;
   revisionId: number;
-  reviewer: string;
+  reviewer: Reviewer;
   decision: ReviewDecision;
   checklist: ChecklistResult;
   issueCategories: ReviewIssueCategory[];
   notes?: string;
 };
+
+const AGENT_HINT = /(agent|claude|gpt|bot|llm|model)/i;
+
+/**
+ * AGENT 不得记成 HUMAN。
+ *
+ * 只能做到「标识看起来像 agent 却声明为 HUMAN 时拒绝」—— 这挡不住蓄意伪造，
+ * 但能挡住真正会发生的那种情况：脚本复用了后台的调用路径，
+ * 顺手把默认值带成了 HUMAN。
+ */
+export function reviewerIdentityIssue(reviewer: Reviewer): string | null {
+  const id = reviewer.id?.trim();
+  if (!id) return "必须记录审核人标识（reviewer.id）";
+  if (reviewer.type === "HUMAN" && AGENT_HINT.test(`${id} ${reviewer.name ?? ""}`)) {
+    return `标识「${id}」看起来是自动化主体，不能记为 HUMAN 审核`;
+  }
+  if (reviewer.type === "SYSTEM") {
+    return "SYSTEM 只用于迁移回填等系统痕迹，不具备批准效力，不能用于审核";
+  }
+  return null;
+}
 
 export type ReviewResult =
   | { ok: true; reviewId: number; translationId: number; locale: DraftLanguage; decision: ReviewDecision }
@@ -45,7 +83,8 @@ export async function recordReview(input: ReviewInput): Promise<ReviewResult> {
     return { ok: false, reason: "revision 不属于该译本 —— 审核结论不能记到别人的稿子上" };
   }
 
-  if (!input.reviewer?.trim()) return { ok: false, reason: "必须记录审核人身份" };
+  const identityIssue = reviewerIdentityIssue(input.reviewer);
+  if (identityIssue) return { ok: false, reason: identityIssue };
 
   // 十项没全过却给 APPROVED，是自相矛盾的记录，直接拒绝
   const failed = failedChecks(input.checklist);
@@ -60,8 +99,13 @@ export async function recordReview(input: ReviewInput): Promise<ReviewResult> {
     data: {
       translation_id: translation.id,
       revision_id: revision.id,
-      reviewer: input.reviewer.trim(),
+      reviewer: input.reviewer.id.trim(),
+      reviewer_type: input.reviewer.type,
+      reviewer_id: input.reviewer.id.trim(),
+      reviewer_name: input.reviewer.name?.trim() || null,
       decision: input.decision,
+      // 批准时记住批准的是哪一版；译本上的字段会被后续审核覆盖，这里不会
+      approved_revision_id: input.decision === "APPROVED" ? revision.id : null,
       notes: input.notes?.slice(0, 2000) ?? null,
       checklist_json: input.checklist as unknown as Prisma.InputJsonValue,
       issue_categories_json: input.issueCategories as unknown as Prisma.InputJsonValue,
@@ -94,7 +138,11 @@ export type FamilyReviewState = {
     /** 批准的是不是当前这一版。不是就说明批准之后又出了新稿 */
     approvedIsCurrent: boolean;
     lastReviewer: string | null;
+    lastReviewerType: ReviewerType | null;
+    lastReviewDecision: ReviewDecision | null;
+    lastReviewNotes: string | null;
     lastReviewedAt: Date | null;
+    reviewCount: number;
     issueCategories: ReviewIssueCategory[];
   }[];
 };
@@ -104,7 +152,7 @@ export async function familyReviewState(familyId: number): Promise<FamilyReviewS
     where: { id: familyId },
     include: {
       translations: {
-        include: { reviews: { orderBy: { reviewed_at: "desc" }, take: 1 } },
+        include: { reviews: { orderBy: { reviewed_at: "desc" } } },
       },
     },
   });
@@ -116,7 +164,9 @@ export async function familyReviewState(familyId: number): Promise<FamilyReviewS
       return {
         locale, translationId: 0, status: "MISSING", currentRevisionId: null,
         approvedRevisionId: null, approvedIsCurrent: false,
-        lastReviewer: null, lastReviewedAt: null, issueCategories: [] as ReviewIssueCategory[],
+        lastReviewer: null, lastReviewerType: null, lastReviewDecision: null,
+        lastReviewNotes: null, lastReviewedAt: null, reviewCount: 0,
+        issueCategories: [] as ReviewIssueCategory[],
       };
     }
     const last = t.reviews[0];
@@ -125,8 +175,12 @@ export async function familyReviewState(familyId: number): Promise<FamilyReviewS
       currentRevisionId: t.current_revision_id,
       approvedRevisionId: t.approved_revision_id,
       approvedIsCurrent: Boolean(t.approved_revision_id && t.approved_revision_id === t.current_revision_id),
-      lastReviewer: last?.reviewer ?? null,
+      lastReviewer: last?.reviewer_name ?? last?.reviewer_id ?? last?.reviewer ?? null,
+      lastReviewerType: last?.reviewer_type ?? null,
+      lastReviewDecision: last?.decision ?? null,
+      lastReviewNotes: last?.notes ?? null,
       lastReviewedAt: last?.reviewed_at ?? null,
+      reviewCount: t.reviews.length,
       issueCategories: (Array.isArray(last?.issue_categories_json)
         ? (last!.issue_categories_json as ReviewIssueCategory[]) : []),
     };

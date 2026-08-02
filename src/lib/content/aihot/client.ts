@@ -61,6 +61,17 @@ export function parseRetryAfter(raw: string | undefined, now = Date.now()): numb
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * 退避事件。定时任务的审计要能回答「这一轮到底被限流了几次」，
+ * 而计数只有客户端自己知道 —— 返回值里看不到中途重试过几轮。
+ */
+export type AihotRetryEvent = {
+  kind: "rate_limited" | "server_error" | "network_error";
+  status: number | null;
+  waitMs: number;
+  attempt: number;
+};
+
 export type AihotClientOptions = {
   transport?: AihotTransport;
   baseUrl?: string;
@@ -69,6 +80,8 @@ export type AihotClientOptions = {
   /** 条件请求用的 ETag；不传则不发 If-None-Match */
   etag?: string | null;
   maxAttempts?: number;
+  /** 只观察，不影响行为 */
+  observe?: (ev: AihotRetryEvent) => void;
 };
 
 /**
@@ -82,6 +95,7 @@ export async function fetchAihot(path: string, opts: AihotClientOptions = {}): P
   const wait = opts.wait ?? sleep;
   const base = opts.baseUrl ?? AIHOT_BASE_URL;
   const maxAttempts = opts.maxAttempts ?? MAX_ATTEMPTS;
+  const observe = opts.observe ?? (() => undefined);
 
   if (!path.startsWith("/api/v1/")) {
     return { ok: false, status: null, reason: `只允许 v1 端点，收到: ${path}` };
@@ -106,7 +120,9 @@ export async function fetchAihot(path: string, opts: AihotClientOptions = {}): P
     } catch (e) {
       lastStatus = null;
       lastReason = e instanceof Error ? e.message.slice(0, 160) : "请求失败";
-      if (attempt < maxAttempts) await wait(BACKOFF_BASE_MS * 2 ** (attempt - 1));
+      const backoff = BACKOFF_BASE_MS * 2 ** (attempt - 1);
+      observe({ kind: "network_error", status: null, waitMs: attempt < maxAttempts ? backoff : 0, attempt });
+      if (attempt < maxAttempts) await wait(backoff);
       continue;
     } finally {
       clearTimeout(timer);
@@ -128,6 +144,7 @@ export async function fetchAihot(path: string, opts: AihotClientOptions = {}): P
 
     if (res.status === 429) {
       const retryMs = parseRetryAfter(res.headers["retry-after"]) ?? BACKOFF_BASE_MS * 2 ** (attempt - 1);
+      observe({ kind: "rate_limited", status: 429, waitMs: retryMs, attempt });
       if (retryMs > MAX_RETRY_AFTER_MS) {
         return { ok: false, status: 429, reason: `限流要求等待 ${Math.round(retryMs / 1000)}s，超过单轮上限，本轮放弃` };
       }
@@ -138,7 +155,9 @@ export async function fetchAihot(path: string, opts: AihotClientOptions = {}): P
 
     if (res.status >= 500) {
       lastReason = `上游 ${res.status}`;
-      if (attempt < maxAttempts) { await wait(BACKOFF_BASE_MS * 2 ** (attempt - 1)); continue; }
+      const backoff = BACKOFF_BASE_MS * 2 ** (attempt - 1);
+      observe({ kind: "server_error", status: res.status, waitMs: attempt < maxAttempts ? backoff : 0, attempt });
+      if (attempt < maxAttempts) { await wait(backoff); continue; }
       return { ok: false, status: res.status, reason: lastReason };
     }
 

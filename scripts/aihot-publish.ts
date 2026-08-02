@@ -14,7 +14,7 @@
  * **不自动发布**：每个内容单元都要显式传 family id。
  * 不调用生成 provider，不新增 cron，不做事实核查。
  */
-import type { DraftLanguage, ReviewDecision, ReviewIssueCategory } from "@prisma/client";
+import type { DraftLanguage, ReviewDecision, ReviewIssueCategory, ReviewerType } from "@prisma/client";
 
 import { loadAllLatestMaterial } from "@/lib/content/publishing/eligibility";
 import { freezeUnit } from "@/lib/content/publishing/freeze";
@@ -122,12 +122,24 @@ async function cmdReview() {
   const locale = val("--locale") as DraftLanguage | undefined;
   const decision = (val("--decision") ?? "APPROVED") as ReviewDecision;
   const reviewer = val("--reviewer");
+  /*
+   * 审核主体类型必须显式给出，**默认是 AGENT**。
+   *
+   * 这是个命令行脚本：绝大多数调用来自自动化。默认成 HUMAN 会让
+   * 「这一版有人看过」在记录里变成一句空话，而那正是自动发布还没上线的原因。
+   * 真的是人在终端里审，就显式写 --reviewer-type HUMAN。
+   */
+  const reviewerType = (val("--reviewer-type") ?? "AGENT").toUpperCase() as ReviewerType;
   const issues = (val("--issues") ?? "NO_ISSUE").split(",").map((s) => s.trim()).filter(Boolean) as ReviewIssueCategory[];
   const notes = val("--notes");
   const failKeys = (val("--failed-checks") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
   if (!familyId || !locale || !reviewer) {
-    console.error("用法: review --family <id> --locale <EN_US|ES_ES|PT_BR|JA_JP> --decision <APPROVED|REJECTED|NEEDS_REVISION> --reviewer <name> [--issues a,b] [--failed-checks k1,k2] [--notes ...]");
+    console.error("用法: review --family <id> --locale <EN_US|ES_ES|PT_BR|JA_JP> --decision <APPROVED|REJECTED|NEEDS_REVISION> --reviewer <name> [--reviewer-type HUMAN|AGENT] [--issues a,b] [--failed-checks k1,k2] [--notes ...]");
+    process.exitCode = 1; return;
+  }
+  if (reviewerType !== "HUMAN" && reviewerType !== "AGENT") {
+    console.error("--reviewer-type 只能是 HUMAN 或 AGENT");
     process.exitCode = 1; return;
   }
 
@@ -145,10 +157,11 @@ async function cmdReview() {
 
   const r = await recordReview({
     translationId: t.id, revisionId: t.revisions[0].id,
-    reviewer, decision, checklist, issueCategories: issues, notes,
+    reviewer: { type: reviewerType, id: reviewer, name: reviewer },
+    decision, checklist, issueCategories: issues, notes,
   });
   if (!r.ok) { console.error(`❌ ${r.reason}`); process.exitCode = 1; return; }
-  console.log(`✅ ${locale} 审核已记录 #${r.reviewId} · ${decision} · 审核人 ${reviewer} · revision #${t.revisions[0].revision_number}`);
+  console.log(`✅ ${locale} 审核已记录 #${r.reviewId} · ${decision} · 审核人 ${reviewer}（${reviewerType}） · revision #${t.revisions[0].revision_number}`);
 
   const state = await familyReviewState(familyId);
   if (state) {

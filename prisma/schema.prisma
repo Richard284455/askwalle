@@ -1747,10 +1747,24 @@ model TranslationReview {
   translation    ArticleTranslation @relation(fields: [translation_id], references: [id], onDelete: Cascade)
   revision_id    Int
 
+  /// 兼容字段：早期只记了一个自由文本身份。新写入等于 reviewer_id
   reviewer    String
+  /// 审核主体类型。**AGENT 不得记成 HUMAN** —— 事后要能分清
+  /// 「这一版是人看过的」还是「是模型自己判过的」，混在一起这道闸门就没有意义
+  reviewer_type ReviewerType
+  /// 稳定标识（账号名 / agent 标识），用于追责与去重
+  reviewer_id   String
+  /// 展示名
+  reviewer_name String?
+
   reviewed_at DateTime       @default(now())
   decision    ReviewDecision
   notes       String?
+
+  /// 这次结论对应的批准版本。APPROVED 时等于 revision_id；退回/拒绝时为 null。
+  /// 与 ArticleTranslation.approved_revision_id 冗余是刻意的：
+  /// 译本上的那个字段会被后续审核覆盖，审核记录必须留住当时的事实
+  approved_revision_id Int?
 
   /// 十项逐条结论
   checklist_json        Json
@@ -1761,7 +1775,119 @@ model TranslationReview {
 
   @@index([translation_id, revision_id])
   @@index([decision])
+  @@index([reviewer_type])
   @@map("translation_reviews")
+}
+
+/// 审核主体。
+///
+/// 分开记不是形式：自动发布之所以还没实现，正是因为「谁批准的」必须可查。
+/// AGENT 冒充 HUMAN 会让这条记录变成自证清白的空话。
+enum ReviewerType {
+  HUMAN
+  AGENT
+  /// 系统自动写入的痕迹（如迁移回填），不具备批准效力
+  SYSTEM
+}
+
+// ---------------------------------------------------------------------------
+// AI HOT 定时抓取与草稿生成的运行时
+//
+// 三类内容各自独立调度、独立租约、独立审计：
+// 一类失败不得拖住另外两类。
+// ---------------------------------------------------------------------------
+
+enum AihotTaskType {
+  SELECTED
+  HOT_TOPICS
+  DAILY
+}
+
+enum AihotTaskStatus {
+  RUNNING
+  /// 取到内容并处理完
+  OK
+  /// 304：源端未变化，**零写入**
+  NOT_MODIFIED
+  /// 同类任务正在跑，本次不重复执行（不是错误）
+  SKIPPED_LOCKED
+  FAILED
+}
+
+/// 任务级租约：同一类任务同一时刻只允许一个 worker 推进。
+///
+/// 每类一行，task_type 唯一 —— 并发靠数据库条件更新收敛，
+/// 不靠「先查再写」：那两步之间的窗口一定会被撞上。
+model AihotTaskLease {
+  id        Int           @id @default(autoincrement())
+  task_type AihotTaskType @unique
+
+  locked_by    String?
+  locked_until DateTime?
+  heartbeat_at DateTime?
+
+  last_run_at     DateTime?
+  last_run_status AihotTaskStatus?
+
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  @@map("aihot_task_leases")
+}
+
+/// 一次定时任务运行的审计。
+///
+/// 只记计数与结论，**不记完整响应体**。
+model AihotTaskRun {
+  id        Int             @id @default(autoincrement())
+  task_type AihotTaskType
+  status    AihotTaskStatus @default(RUNNING)
+  worker_id String
+
+  started_at  DateTime  @default(now())
+  finished_at DateTime?
+  duration_ms Int?
+
+  // ── 抓取 ──
+  endpoint     String?
+  fetched      Int @default(0)
+  created      Int @default(0)
+  updated      Int @default(0)
+  reused       Int @default(0)
+  not_modified Int @default(0)
+  rate_limited Int @default(0)
+  server_error Int @default(0)
+
+  // ── 生成 ──
+  provider_calls       Int @default(0)
+  units_considered     Int @default(0)
+  units_generated      Int @default(0)
+  units_reused         Int @default(0)
+  translations_drafted Int @default(0)
+  qa_passed            Int @default(0)
+  qa_failed            Int @default(0)
+
+  // ── 入队 ──
+  families_touched  Int @default(0)
+  revisions_created Int @default(0)
+  queued_for_review Int @default(0)
+
+  /// 定时任务期间新增的发布数。**必须恒为 0** —— 非 0 即硬停止
+  publications_created Int @default(0)
+
+  /// 抢租约失败
+  lease_conflict Boolean @default(false)
+
+  error_code String?
+  message    String?
+  /// 逐单元的简要结果，不含来源正文
+  detail_json Json?
+
+  created_at DateTime @default(now())
+
+  @@index([task_type, started_at])
+  @@index([status, started_at])
+  @@map("aihot_task_runs")
 }
 
 /// 一次发布。

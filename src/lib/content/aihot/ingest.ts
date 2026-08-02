@@ -174,9 +174,30 @@ export async function ingestHotTopics(
           provider: AIHOT_PROVIDER, topic_id: dto.id, source_snapshot_hash: hash,
         },
       },
-      select: { id: true },
+      select: { id: true, rank: true },
     });
-    if (existing) { out.unchanged++; continue; }
+    if (existing) {
+      /*
+       * 内容没变、只是名次动了。
+       *
+       * 名次**不在**内容指纹里，所以这里不会造出新快照 —— 那正是我们要的：
+       * 榜单抖一下不该触发一次重写。但名次是榜单卡片要展示的实时数据，
+       * 必须就地更新，否则卡片会一直挂着第一次抓到时的名次。
+       *
+       * captured_at 刻意**不动**：它表示「这一版内容是什么时候抓到的」，
+       * 简报正文里写的也是这个日期。名次变动不是内容变动。
+       */
+      const newRank = i + 1;
+      if (existing.rank !== newRank) {
+        await prisma.aihotHotTopicSnapshot.update({
+          where: { id: existing.id }, data: { rank: newRank },
+        });
+        out.updated++;
+      } else {
+        out.unchanged++;
+      }
+      continue;
+    }
 
     await prisma.aihotHotTopicSnapshot.create({
       data: {

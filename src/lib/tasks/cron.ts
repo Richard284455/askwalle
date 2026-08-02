@@ -1,5 +1,6 @@
 import { CronJob } from "cron";
 import { updateWebsiteThumbnails } from "../utils/update-thumbnails";
+import { startAihotCronJobs } from "./aihot-cron";
 
 // 定时任务只在 instrumentation.ts 里启动一次。
 //
@@ -35,4 +36,7 @@ export function startCronJobs(): void {
   console.log(
     "[cron] 已注册定时任务: thumbnailUpdateJob (0 3 * * * Asia/Shanghai)"
   );
+
+  // AI HOT 三类内容各自独立注册，互不影响
+  startAihotCronJobs();
 }

@@ -12,12 +12,12 @@
  */
 import { httpUrlOrNull } from "@/lib/content/aihot/types";
 import { NEVER_BLOCKING_CODES } from "@/lib/content/multilingual/types";
+import {
+  captureProtectedBaseline, loadProtectedBaseline, readProtectedState, type ProtectedState,
+} from "@/lib/content/publishing/protected-baseline";
 import { LOCALES } from "@/lib/content/publishing/types";
 import { prisma } from "@/lib/prisma";
 
-import { createHash } from "crypto";
-
-const BASELINE_KEY = "aihot:protected-baseline";
 const CAPTURE = process.argv.includes("--capture-baseline");
 
 let pass = 0, fail = 0;
@@ -27,55 +27,11 @@ function check(name: string, ok: boolean, detail = "") {
   console.log(`  ${ok ? "✅" : "❌"}  ${name}${detail ? `  — ${detail}` : ""}`);
 }
 
-/**
- * 受保护状态：本任务**不允许**改动的东西。
- *
- * 刻意不含 MultilingualDraft / ArticleFamily / Publication / AI HOT 三张来源表 ——
- * 那些正是本链路该增长的地方，把它们锁死等于禁止工作本身。
- */
-async function protectedState() {
-  const ws = await prisma.website.findMany({
-    select: { id: true, url: true, status: true, active: true }, orderBy: { id: "asc" },
-  });
-  /*
-   * 逐个查，不并发 12 路。
-   * 连接池是共享的（本地还开着 dev server），一次打满会直接拿到 P1001，
-   * 而那个报错看起来像「数据库挂了」，其实只是我们自己把池占满了。
-   */
-  const factPacks = await prisma.sourceFactPack.count();
-  const factClaims = await prisma.sourceFactClaim.count();
-  const factEvidence = await prisma.sourceFactEvidence.count();
-  const runs = await prisma.eventClusteringRun.count();
-  const edges = await prisma.eventSimilarityEdge.count();
-  const candidates = await prisma.eventClusterCandidate.count();
-  const members = await prisma.eventClusterCandidateMember.count();
-  const lifecycle = await prisma.toolLifecycleState.count();
-  const resourceContent = await prisma.resourceContent.count();
-  const sourceItems = await prisma.sourceItem.count();
-  const contentSources = await prisma.contentSource.count();
-  const generatedArticles = await prisma.generatedArticle.count();
-  return {
-    websiteUrlFingerprint: createHash("sha256")
-      .update(ws.map((w) => `${w.id}|${w.url}`).join("\n")).digest("hex").slice(0, 16),
-    websiteStatusFingerprint: createHash("sha256")
-      .update(JSON.stringify(ws.map((w) => ({ id: w.id, status: w.status, active: w.active })))).digest("hex").slice(0, 16),
-    factPacks, factClaims, factEvidence,
-    clusteringRuns: runs, clusteringEdges: edges, clusterCandidates: candidates, clusterMembers: members,
-    lifecycle, resourceContent, sourceItems, contentSources, generatedArticles,
-  };
-}
-
-type Protected = Awaited<ReturnType<typeof protectedState>>;
-
 async function main() {
-  const now = await protectedState();
+  const now = await readProtectedState();
 
   if (CAPTURE) {
-    await prisma.setting.upsert({
-      where: { key: BASELINE_KEY },
-      create: { key: BASELINE_KEY, value: JSON.stringify(now) },
-      update: { value: JSON.stringify(now) },
-    });
+    await captureProtectedBaseline();
     console.log("已记录受保护状态基线：");
     for (const [k, v] of Object.entries(now)) console.log(`  ${k.padEnd(26)} ${v}`);
     console.log("\n后续运行 npm run aihot:verify 会与这份基线比对。");
@@ -84,14 +40,13 @@ async function main() {
 
   console.log("AI HOT 内容链路核对\n");
   console.log("一、受保护状态（与基线比对）");
-  const row = await prisma.setting.findUnique({ where: { key: BASELINE_KEY } });
-  if (!row) {
+  const base = await loadProtectedBaseline();
+  if (!base) {
     console.log("  ⚠ 尚无基线。先运行：npm run aihot:verify -- --capture-baseline");
     fail++;
     failures.push("缺少受保护状态基线");
   } else {
-    const base = JSON.parse(row.value) as Protected;
-    for (const key of Object.keys(now) as (keyof Protected)[]) {
+    for (const key of Object.keys(now) as (keyof ProtectedState)[]) {
       const b = base[key], n = now[key];
       check(`${key} 未变`, b === n, b === n ? String(n) : `基线 ${b} → 现在 ${n}`);
     }
@@ -104,17 +59,33 @@ async function main() {
   const drafts = await prisma.multilingualDraft.count();
   console.log(`  精选 ${selected} · 热点快照 ${topics} · 日报 ${dailies} · 多语言草稿 ${drafts}`);
 
-  const draftIssues = (await prisma.multilingualDraft.findMany({ select: { qa_issues_json: true } }))
-    .flatMap((d) => (Array.isArray(d.qa_issues_json) ? (d.qa_issues_json as { code?: string }[]) : []))
-    .map((i) => i.code ?? "");
+  const allDrafts = await prisma.multilingualDraft.findMany({
+    select: { status: true, qa_issues_json: true },
+  });
+  const codesOf = (raw: unknown) =>
+    (Array.isArray(raw) ? (raw as { code?: string }[]) : []).map((i) => i.code ?? "");
+  const draftIssues = allDrafts.flatMap((d) => codesOf(d.qa_issues_json));
+
+  /*
+   * 漂移分两种，只有**漏过去**的才算失败。
+   *
+   *   - QA_FAILED 的草稿上带着漂移问题码 —— 那是确定性 QA 接住了它，
+   *     内容并没有进入发布链路。把这算成失败，等于安全网每工作一次就报一次警。
+   *   - DRAFTED 的草稿上还带着漂移问题码 —— 这才是真出事：
+   *     它被标成可发布，却记着一条没解决的失真。
+   */
+  const escaped = allDrafts.filter((d) => d.status === "DRAFTED").flatMap((d) => codesOf(d.qa_issues_json));
   const tally = new Map<string, number>();
-  for (const c of draftIssues) tally.set(c, (tally.get(c) ?? 0) + 1);
-  check("数字漂移 0", !tally.get("NUMBER_MISMATCH"), String(tally.get("NUMBER_MISMATCH") ?? 0));
-  check("日期漂移 0", !tally.get("DATE_MISMATCH"), String(tally.get("DATE_MISMATCH") ?? 0));
-  check("模型版本漂移 0", !tally.get("MODEL_MISMATCH"), String(tally.get("MODEL_MISMATCH") ?? 0));
-  check("新增事实 0", !tally.get("ENTITY_MISMATCH") && !tally.get("UNSUPPORTED_DETAIL"),
+  for (const c of escaped) tally.set(c, (tally.get(c) ?? 0) + 1);
+  const blocked = draftIssues.length - escaped.length;
+  console.log(`  确定性 QA 已拦下 ${blocked} 项问题（拦下不算失败）`);
+
+  check("数字漂移未漏过 QA", !tally.get("NUMBER_MISMATCH"), String(tally.get("NUMBER_MISMATCH") ?? 0));
+  check("日期漂移未漏过 QA", !tally.get("DATE_MISMATCH"), String(tally.get("DATE_MISMATCH") ?? 0));
+  check("模型版本漂移未漏过 QA", !tally.get("MODEL_MISMATCH"), String(tally.get("MODEL_MISMATCH") ?? 0));
+  check("新增事实未漏过 QA", !tally.get("ENTITY_MISMATCH") && !tally.get("UNSUPPORTED_DETAIL"),
     `entity=${tally.get("ENTITY_MISMATCH") ?? 0} unsupported=${tally.get("UNSUPPORTED_DETAIL") ?? 0}`);
-  check("翻译事实漂移 0", !tally.get("TRANSLATION_FACT_DRIFT"), String(tally.get("TRANSLATION_FACT_DRIFT") ?? 0));
+  check("翻译事实漂移未漏过 QA", !tally.get("TRANSLATION_FACT_DRIFT"), String(tally.get("TRANSLATION_FACT_DRIFT") ?? 0));
   check("QA 从不产出重复/单一来源/未验证/低重要性结论",
     !draftIssues.some((c) => (NEVER_BLOCKING_CODES as readonly string[]).includes(c)));
 
@@ -138,10 +109,24 @@ async function main() {
   const badSrc = families.filter((f) => f.original_source_url !== null && !httpUrlOrNull(f.original_source_url));
   check("无效原始来源 URL 0", badSrc.length === 0, badSrc.map((f) => f.unit_key).slice(0, 3).join(", "));
 
-  // 每条发布记录都必须落在「已批准的那一版」上
-  const mismatched = families.flatMap((f) => f.translations.filter((t) =>
-    t.publications.some((p) => p.status === "PUBLISHED" && p.revision_id !== t.approved_revision_id)));
-  check("发布的都是已批准的那一版", mismatched.length === 0, `${mismatched.length} 条不符`);
+  /*
+   * 每条发布记录都必须落在「当时被批准过的那一版」上。
+   *
+   * 判据取审核记录里的 approved_revision_id，不取译本上的同名字段：
+   * 后者是可变指针，内容更新出新 revision 时会被**故意**清空
+   * （不让旧批准替新稿背书）。用它当判据，每次正常更新都会误报。
+   */
+  const approvedRevisionIds = new Set(
+    (await prisma.translationReview.findMany({
+      where: { decision: "APPROVED", approved_revision_id: { not: null } },
+      select: { approved_revision_id: true },
+    })).map((r) => r.approved_revision_id!)
+  );
+  const mismatched = (await prisma.articlePublication.findMany({
+    where: { status: "PUBLISHED" }, select: { revision_id: true, locale: true, path: true },
+  })).filter((p) => !approvedRevisionIds.has(p.revision_id));
+  check("发布的都是已批准的那一版", mismatched.length === 0,
+    mismatched.slice(0, 3).map((p) => `${p.locale}${p.path}`).join(", ") || "0 条不符");
 
   const dupPaths = await prisma.$queryRawUnsafe<{ locale: string; path: string; n: bigint }[]>(
     `SELECT locale::text, path, COUNT(*) AS n FROM article_publications
