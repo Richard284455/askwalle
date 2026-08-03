@@ -1,5 +1,8 @@
 import Link from "next/link";
 
+import { redirect } from "next/navigation";
+
+import { isAdminRequest } from "@/lib/auth/admin-auth";
 import { AihotQueueClient } from "@/components/admin/aihot-queue-client";
 import { resolveAttributionMode } from "@/lib/content/publishing/attribution";
 import { loadQueue } from "@/lib/content/publishing/queue";
@@ -21,6 +24,18 @@ export const revalidate = 0;
 export const metadata = { title: "AI HOT 编辑审核队列", robots: { index: false, follow: false } };
 
 export default async function AihotQueuePage() {
+  /*
+   * **在取数之前先验身份。**
+   *
+   * 布局里的 redirect 挡不住这件事：App Router 会**并行**渲染 layout 与 page，
+   * 页面的数据加载在 redirect 落地之前就已经发出去了。
+   * 于是每一个未登录请求照样跑三趟深层查询 —— 连接池就是这么被打满的，
+   * 报出来却是 P1001「数据库连不上」，看着像数据库的问题。
+   *
+   * 顺带也是一层纵深防御：未登录的调用方不该让服务器去算内部数据。
+   */
+  if (!(await isAdminRequest())) redirect("/login");
+
   /*
    * **逐个查，不并发。**
    *
