@@ -16,8 +16,16 @@ const globalForPrisma = globalThis as unknown as {
  *
  * 池小一点比池大一点安全：排队等连接只是慢，拿不到连接是整页报错。
  * 需要时用 DATABASE_CONNECTION_LIMIT 覆盖。
+ *
+ * 服务端与 CLI 分开取值：Web 服务要并发处理请求，需要一个池；
+ * CLI 脚本顺序执行，两三条就够。两边都按 8 条开的话，
+ * 本地一边跑着服务、一边跑脚本就顶穿额度 —— 实测就是这样：
+ * 服务一起来，脚本连不上库。NEXT_RUNTIME 只有 Next 服务进程会设，用它区分最准。
  */
-const CONNECTION_LIMIT = Number(process.env.DATABASE_CONNECTION_LIMIT ?? 8);
+const IS_NEXT_SERVER = Boolean(process.env.NEXT_RUNTIME);
+const CONNECTION_LIMIT = Number(
+  process.env.DATABASE_CONNECTION_LIMIT ?? (IS_NEXT_SERVER ? 5 : 3)
+);
 /** 等不到连接时的排队上限（秒）。宁可多等几秒，也别直接把请求判死 */
 const POOL_TIMEOUT = Number(process.env.DATABASE_POOL_TIMEOUT ?? 20);
 
