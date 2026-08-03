@@ -21,7 +21,8 @@ export async function GET(_request: Request, ctx: { params: Promise<{ id: string
   try {
     const detail = await familyDetail(familyId);
     if (!detail) return NextResponse.json(AjaxResponse.fail("family 不存在"), { status: 404 });
-    // preflight 是只读的：进详情页顺手跑一次，审核者才能提前看到「为什么发不了」
+    // preflight 是只读的：进详情页顺手跑一次，审核者才能提前看到「为什么发不了」。
+    // 串行执行 —— 与 familyDetail 并发会多占一条池连接，收益却只有几十毫秒
     const pre = await preflight(familyId);
     return NextResponse.json(AjaxResponse.ok({ ...detail, preflight: pre }));
   } catch (error) {

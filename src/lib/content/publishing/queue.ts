@@ -74,6 +74,10 @@ export type QueueRow = {
   sourceSnapshotHash: string;
   sourcePublishedAt: Date | null;
   capturedAt: Date | null;
+  /** 来源外键。带在行上，详情页就不必为了拿它们再查一次 family */
+  selectedItemId: number | null;
+  hotTopicSnapshotId: number | null;
+  dailyReportId: number | null;
   locales: LocaleState[];
   publishedCount: number;
   qaIssueCount: number;
@@ -97,21 +101,46 @@ export function tabOf(row: QueueRow): Exclude<QueueTab, "SELECTED" | "HOT_TOPICS
   return "NEEDS_REVIEW";
 }
 
-export async function listQueue(opts: { tab?: QueueTab; limit?: number } = {}): Promise<QueueRow[]> {
-  const tab = opts.tab ?? "NEEDS_REVIEW";
-  const kindFilter: AihotContentKind | undefined =
-    tab === "SELECTED" ? "SELECTED" : tab === "HOT_TOPICS" ? "HOT_TOPIC" : tab === "DAILY" ? "DAILY" : undefined;
-
+/**
+ * 把 family 行装配成队列行。**一次库读取，多处复用。**
+ *
+ * 以前列表、计数、详情各自读一遍全量 —— 打开一次审核台要跑三遍同样的
+ * 深层嵌套查询，加上并发的定时任务，连接池直接被打满，页面报 P1001，
+ * 看起来像「数据库挂了」，其实是我们自己把池占满了。
+ */
+async function loadRows(where: { content_kind?: AihotContentKind; id?: number }, limit: number): Promise<QueueRow[]> {
   const families = await prisma.articleFamily.findMany({
-    where: kindFilter ? { content_kind: kindFilter } : undefined,
+    where: Object.keys(where).length ? where : undefined,
     orderBy: { updated_at: "desc" },
-    take: opts.limit ?? 200,
+    take: limit,
     include: {
       translations: {
         include: {
-          revisions: { orderBy: { revision_number: "desc" }, take: 1 },
-          reviews: { orderBy: { reviewed_at: "desc" }, take: 1 },
-          publications: { where: { status: "PUBLISHED" }, orderBy: { published_at: "desc" } },
+          /*
+           * **只取列表用得到的字段。**
+           *
+           * 默认 include 会把整篇正文一起拉回来 —— 34 个家族 × 4 种语言
+           * 就是 136 篇全文，只为了在列表里显示一个版本号和 QA 结论。
+           * 实测这么一改，队列查询从 7 秒降到 1 秒出头，
+           * 连接也不会被长时间占着（那正是把池拖垮的原因之一）。
+           * 正文只在详情页按需读。
+           */
+          revisions: {
+            orderBy: { revision_number: "desc" }, take: 1,
+            select: { id: true, revision_number: true, headline: true, qa_verdict: true, qa_issues_json: true },
+          },
+          reviews: {
+            orderBy: { reviewed_at: "desc" }, take: 1,
+            select: {
+              reviewer: true, reviewer_type: true, reviewer_id: true, reviewer_name: true,
+              decision: true, notes: true, reviewed_at: true, issue_categories_json: true,
+            },
+          },
+          publications: {
+            where: { status: "PUBLISHED" }, orderBy: { published_at: "desc" }, take: 1,
+            select: { revision_id: true, path: true },
+          },
+          _count: { select: { reviews: true } },
         },
       },
     },
@@ -158,7 +187,7 @@ export async function listQueue(opts: { tab?: QueueTab; limit?: number } = {}): 
         lastDecision: review?.decision ?? null,
         lastReviewedAt: review?.reviewed_at ?? null,
         lastNotes: review?.notes ?? null,
-        reviewCount: t.reviews.length,
+        reviewCount: t._count.reviews,
       };
     });
 
@@ -172,6 +201,9 @@ export async function listQueue(opts: { tab?: QueueTab; limit?: number } = {}): 
       originalSourceName: f.original_source_name, originalSourceUrl: f.original_source_url,
       sourceSnapshotHash: f.source_snapshot_hash, sourcePublishedAt: f.source_published_at,
       capturedAt: f.hot_topic_snapshot_id ? capturedById.get(f.hot_topic_snapshot_id) ?? null : null,
+      selectedItemId: f.selected_item_id,
+      hotTopicSnapshotId: f.hot_topic_snapshot_id,
+      dailyReportId: f.daily_report_id,
       locales,
       publishedCount: locales.filter((l) => l.publishedPath).length,
       qaIssueCount: locales.reduce((n, l) => n + l.qaIssues.length, 0),
@@ -179,15 +211,18 @@ export async function listQueue(opts: { tab?: QueueTab; limit?: number } = {}): 
     };
   });
 
-  // 体裁栏目已经在 SQL 里筛过；状态栏目按派生状态筛
-  if (kindFilter || tab === "ALL") return rows;
-  return rows.filter((r) => tabOf(r) === tab);
+  return rows;
 }
 
-export async function queueCounts(): Promise<Record<QueueTab, number>> {
-  const all = await listQueue({ tab: "ALL", limit: 1000 });
+function kindOfTab(tab: QueueTab): AihotContentKind | undefined {
+  return tab === "SELECTED" ? "SELECTED"
+    : tab === "HOT_TOPICS" ? "HOT_TOPIC"
+    : tab === "DAILY" ? "DAILY" : undefined;
+}
+
+export function countRows(rows: QueueRow[]): Record<QueueTab, number> {
   const counts = Object.fromEntries(QUEUE_TABS.map((t) => [t, 0])) as Record<QueueTab, number>;
-  for (const r of all) {
+  for (const r of rows) {
     counts[tabOf(r)]++;
     counts.ALL++;
     if (r.contentKind === "SELECTED") counts.SELECTED++;
@@ -195,6 +230,41 @@ export async function queueCounts(): Promise<Record<QueueTab, number>> {
     else counts.DAILY++;
   }
   return counts;
+}
+
+export function filterByTab(rows: QueueRow[], tab: QueueTab): QueueRow[] {
+  const kind = kindOfTab(tab);
+  if (kind) return rows.filter((r) => r.contentKind === kind);
+  if (tab === "ALL") return rows;
+  return rows.filter((r) => tabOf(r) === tab);
+}
+
+/**
+ * 队列页需要的全部数据。
+ *
+ * **一次读取**同时得出当前栏目的行与所有栏目的计数 ——
+ * 计数不该再跑一遍全量查询：那是同一份数据读两遍，
+ * 而两遍之间还可能因为定时任务写入而对不上。
+ */
+export async function loadQueue(
+  opts: { tab?: QueueTab; limit?: number } = {}
+): Promise<{ tab: QueueTab; rows: QueueRow[]; counts: Record<QueueTab, number> }> {
+  const tab = opts.tab ?? "NEEDS_REVIEW";
+  const all = await loadRows({}, opts.limit ?? 500);
+  return { tab, rows: filterByTab(all, tab), counts: countRows(all) };
+}
+
+/** 兼容既有调用方；内部同样只读一次 */
+export async function listQueue(opts: { tab?: QueueTab; limit?: number } = {}): Promise<QueueRow[]> {
+  const tab = opts.tab ?? "NEEDS_REVIEW";
+  const kind = kindOfTab(tab);
+  // 体裁栏目能在 SQL 里直接筛，不必把全部家族拉回来
+  const rows = await loadRows(kind ? { content_kind: kind } : {}, opts.limit ?? 500);
+  return kind ? rows : filterByTab(rows, tab);
+}
+
+export async function queueCounts(): Promise<Record<QueueTab, number>> {
+  return countRows(await loadRows({}, 1000));
 }
 
 // ── 详情：四语言并排 + 来源事实 + 对照 ────────────────────────────────────
@@ -315,11 +385,12 @@ export function buildComparison(contents: LocaleContent[]): ComparisonRow[] {
 }
 
 async function loadSource(row: QueueRow): Promise<FamilyDetail["source"]> {
-  const fam = await prisma.articleFamily.findUnique({
-    where: { id: row.familyId },
-    select: { selected_item_id: true, hot_topic_snapshot_id: true, daily_report_id: true },
-  });
-  if (!fam) return null;
+  // 外键已经随行带过来了 —— 不再为了读三个 id 多跑一趟远程查询
+  const fam = {
+    selected_item_id: row.selectedItemId,
+    hot_topic_snapshot_id: row.hotTopicSnapshotId,
+    daily_report_id: row.dailyReportId,
+  };
 
   if (fam.selected_item_id) {
     const s = await prisma.aihotSelectedItem.findUnique({ where: { id: fam.selected_item_id } });
@@ -381,8 +452,9 @@ async function loadSource(row: QueueRow): Promise<FamilyDetail["source"]> {
 }
 
 export async function familyDetail(familyId: number): Promise<FamilyDetail | null> {
-  const rows = await listQueue({ tab: "ALL", limit: 1000 });
-  const row = rows.find((r) => r.familyId === familyId);
+  // 只查这一个 family —— 以前是把全部家族拉回来再 find，
+  // 每打开一次详情就重跑一遍全量深层嵌套查询
+  const row = (await loadRows({ id: familyId }, 1))[0];
   if (!row) return null;
 
   const revIds = row.locales.map((l) => l.currentRevisionId).filter((x): x is number => x !== null);

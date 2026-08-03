@@ -2,7 +2,7 @@ import Link from "next/link";
 
 import { AihotQueueClient } from "@/components/admin/aihot-queue-client";
 import { resolveAttributionMode } from "@/lib/content/publishing/attribution";
-import { listQueue, queueCounts } from "@/lib/content/publishing/queue";
+import { loadQueue } from "@/lib/content/publishing/queue";
 import { recentRuns } from "@/lib/content/aihot/scheduler";
 import { residualLeases } from "@/lib/content/aihot/lease";
 import { resolveNewsroomModel } from "@/lib/content/multilingual/model-settings";
@@ -21,14 +21,18 @@ export const revalidate = 0;
 export const metadata = { title: "AI HOT 编辑审核队列", robots: { index: false, follow: false } };
 
 export default async function AihotQueuePage() {
+  /*
+   * **逐个查，不并发。**
+   *
+   * 连接池是共享的（定时任务也在用），四路深层嵌套查询同时打出去会直接
+   * 拿到 P1001 —— 而那个报错长得像「数据库挂了」，其实是我们自己把池占满了。
+   * 这一页不是热路径，串行多花的几十毫秒没人察觉，打满连接池却会让整页报错。
+   */
   const mode = await resolveAttributionMode();
   const model = await resolveNewsroomModel();
-  const [rows, counts, runs, residual] = await Promise.all([
-    listQueue({ tab: "NEEDS_REVIEW" }),
-    queueCounts(),
-    recentRuns(undefined, 12),
-    residualLeases(),
-  ]);
+  const { rows, counts } = await loadQueue({ tab: "NEEDS_REVIEW" });
+  const runs = await recentRuns(undefined, 12);
+  const residual = await residualLeases();
 
   return (
     <>
