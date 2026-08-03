@@ -45,7 +45,12 @@ export default async function AihotQueuePage() {
    */
   const mode = await resolveAttributionMode();
   const model = await resolveNewsroomModel();
-  const { rows, counts } = await loadQueue({ tab: "NEEDS_REVIEW" });
+  /*
+   * 默认栏目是「已发布·待复核」，不是「待发布」。
+   * 内容改成自动审核后自动上线，需要人处理的不再是「等着被批准的」，
+   * 而是「已经在外面、还没人看过的」—— 默认打开的那一栏必须是后者。
+   */
+  const { rows, counts } = await loadQueue({ tab: "AWAITING_HUMAN" });
   const runs = await recentRuns(undefined, 12);
   const residual = await residualLeases();
 
@@ -54,7 +59,7 @@ export default async function AihotQueuePage() {
       <AihotQueueClient
         initialRows={rows}
         initialCounts={counts}
-        initialTab="NEEDS_REVIEW"
+        initialTab="AWAITING_HUMAN"
         attributionMode={{
           mode: mode.mode,
           requested: mode.requested,

@@ -29,6 +29,8 @@ function gate(name: string, ok: boolean, detail = "") {
 }
 
 async function main() {
+  // 记下起点：末尾要验「本次生成期间这些热点没有冒出新发布」
+  const startedAt = new Date();
   const material = await loadAllLatestMaterial();
   const unitKeys = material.map((m) => hotTopicUnitKey(m.topicId));
 
@@ -202,11 +204,26 @@ async function main() {
     !issueCodes.some((c) => (HOT_TOPIC_FORBIDDEN_CODES as readonly string[]).includes(c)),
     [...new Set(issueCodes)].join(",") || "无问题码");
 
-  const autoPublished = await prisma.articlePublication.count({
-    where: { status: "PUBLISHED", translation: { family: { content_form: "HOT_TOPIC_BRIEF" } },
-             created_at: { gt: new Date(Date.now() - 60_000) } },
-  });
-  gate("自动发布：0", autoPublished === 0, `近一分钟新增发布 ${autoPublished}`);
+  /*
+   * **生成链路自己不发布。**
+   *
+   * 内容策略改成「自动审核通过即发布」之后，「一分钟内没有新发布」
+   * 这条已经不成立了 —— 定时任务真的会发。但生成这一步仍然不该发：
+   * 发布只能由审核之后那一步做。
+   *
+   * 所以口径改成：**这个脚本刚刚重新生成的那些热点**，
+   * 不允许在同一时间窗内冒出新的发布记录。
+   * 换成全局计数的话，一次撞上 cron 的 canary 就会误报停机。
+   */
+  const touchedUnitKeys = [...new Set(unitKeys)];
+  const autoPublished = touchedUnitKeys.length ? await prisma.articlePublication.count({
+    where: {
+      status: "PUBLISHED",
+      translation: { family: { unit_key: { in: touchedUnitKeys } } },
+      created_at: { gt: startedAt },
+    },
+  }) : 0;
+  gate("生成链路未发布任何内容", autoPublished === 0, `本次生成的热点新增发布 ${autoPublished}`);
 
   gate("AIEvent 调用：0（该模型不存在）", !Object.keys(prisma).some((k) => /^ai[eE]vent$/.test(k)));
   if (!baseline) {

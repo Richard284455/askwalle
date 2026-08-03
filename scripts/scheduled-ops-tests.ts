@@ -27,8 +27,8 @@ import { resolveNewsroomModel, saveNewsroomModel } from "@/lib/content/multiling
 import { hotTopicFactFingerprint, type HotTopicMaterial } from "@/lib/content/publishing/eligibility";
 import { diffProtectedState, type ProtectedState } from "@/lib/content/publishing/protected-baseline";
 import { buildComparison, tabOf, QUEUE_TABS, type LocaleContent, type QueueRow } from "@/lib/content/publishing/queue";
-import { reviewerIdentityIssue } from "@/lib/content/publishing/review";
-import { LOCALES, publicPath } from "@/lib/content/publishing/types";
+import { recordReview, reviewerIdentityIssue } from "@/lib/content/publishing/review";
+import { ALL_CHECKS_PASS, LOCALES, publicPath, REVIEW_CHECKLIST } from "@/lib/content/publishing/types";
 import { prisma } from "@/lib/prisma";
 
 import { readFileSync } from "fs";
@@ -287,7 +287,7 @@ async function main() {
     });
     check("S25", "未筛选流只入库、不出稿", r.unitsConsidered === 0 && g.seen.length === 0 && r.providerCalls === 0,
       `候选 ${r.unitsConsidered} · 生成 ${g.seen.length}`);
-    check("S26", "未筛选流同样零发布", r.publicationsCreated === 0);
+    check("S26", "未筛选流不出稿也不发布", r.publicationsCreated === 0);
   }
 
   {
@@ -437,7 +437,7 @@ async function main() {
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  section("三、一轮运行：状态、审计、零发布");
+  section("三、一轮运行：状态、审计、未审不发");
 
   {
     const { transport } = scripted([{ status: 200, headers: { etag: 'W/"x"' }, body: { items: [] } }]);
@@ -447,7 +447,7 @@ async function main() {
     check("C1", "dry-run 正常结束", r.status === "OK", r.message ?? "");
     check("C2", "写出运行审计", r.runId !== null);
     check("C3", "本轮零 provider 调用", r.providerCalls === 0);
-    check("C4", "本轮零发布", r.publicationsCreated === 0);
+    check("C4", "dry-run 不发布", r.publicationsCreated === 0);
     check("C5", "跑完不留租约", (await residualLeases()).filter((l) => l.locked_by?.startsWith(TEST_WORKER)).length === 0);
   }
 
@@ -498,7 +498,7 @@ async function main() {
       check("C10", "生成异常被兜住", r.status === "FAILED" && r.errorCode === "UNEXPECTED",
         `${r.status}/${r.errorCode} 候选 ${r.unitsConsidered}`);
       check("C11", "异常不回显完整堆栈", (r.message ?? "").length <= 300);
-      check("C12", "异常轮次同样零发布", r.publicationsCreated === 0);
+      check("C12", "异常轮次不发布", r.publicationsCreated === 0);
     } finally {
       await prisma.aihotDailyReport.deleteMany({ where: { report_date: probeDate } });
     }
@@ -532,9 +532,26 @@ async function main() {
     check("D6", "各类调度周期互不相同",
       new Set(ALL_TASKS.map((t) => TASK_SCHEDULE[t].cron)).size === ALL_TASKS.length,
       ALL_TASKS.map((t) => `${t}=${TASK_SCHEDULE[t].cron}`).join(" "));
-    check("D7", "热点 5 分钟", TASK_SCHEDULE.HOT_TOPICS.cron === "*/5 * * * *");
-    check("D8", "精选 10 分钟", TASK_SCHEDULE.SELECTED.cron === "*/10 * * * *");
-    check("D9", "日报 30 分钟", TASK_SCHEDULE.DAILY.cron === "*/30 * * * *");
+    const HOUR = 60 * 60_000;
+    check("D7", "热点 6 小时", TASK_SCHEDULE.HOT_TOPICS.everyMs === 6 * HOUR, TASK_SCHEDULE.HOT_TOPICS.cron);
+    check("D8", "精选 12 小时", TASK_SCHEDULE.SELECTED.everyMs === 12 * HOUR, TASK_SCHEDULE.SELECTED.cron);
+    check("D9", "日报 24 小时", TASK_SCHEDULE.DAILY.everyMs === 24 * HOUR, TASK_SCHEDULE.DAILY.cron);
+    /*
+     * 未筛选流不跟着这三条一起放慢。
+     * 它没有增量契约，只能整段重取最近 window —— 掉出窗口的条目
+     * 永远补不回来，所以它的周期是接口契约给死的，不是产品节奏。
+     */
+    check("D9b", "未筛选流仍在窗口内（≤24h）", TASK_SCHEDULE.ITEMS_ALL.everyMs <= 24 * HOUR,
+      `${TASK_SCHEDULE.ITEMS_ALL.everyMs / HOUR}h`);
+    /*
+     * 失败冷却必须长于最短抓取间隔，否则每一轮都会把上一轮的失败
+     * 原样重演一遍，这道闸门就等于不存在。
+     */
+    const sched = readFileSync("src/lib/content/aihot/scheduler.ts", "utf8");
+    const cooldownH = Number(/FAILURE_COOLDOWN_MS = (\d+) \* 60 \* 60_000/.exec(sched)?.[1] ?? "0");
+    const minIntervalH = Math.min(...ALL_TASKS.map((t) => TASK_SCHEDULE[t].everyMs)) / HOUR;
+    check("D9c", "失败冷却长于最短抓取间隔", cooldownH >= minIntervalH,
+      `冷却 ${cooldownH}h vs 最短间隔 ${minIntervalH}h`);
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -653,11 +670,29 @@ async function main() {
 
   {
     const sched = codeOnly(readFileSync("src/lib/content/aihot/scheduler.ts", "utf8"));
-    check("F4", "调度器不含发布调用", !/publishFamily|publishTranslation/.test(sched));
+    /*
+     * 「调度器一律不得发布」这条已经被产品决定取消了 —— 现在改成
+     * 「自动审核通过才发布」。所以断言换了口径，但没有放宽：
+     * 发布必须走 publishFamily，且必须挂在 status === "APPROVED" 之下。
+     * 直接删掉这几条，等于把这段代码交给下一个人自由发挥。
+     */
+    check("F4", "发布只能在自动审核判过之后发生",
+      /r\.status === "APPROVED"/.test(sched) && /await publish\(f\.familyId\)/.test(sched));
+    check("F4b", "审核异常按未通过处理，不放行",
+      /reviewSafely/.test(sched) && /status: "BLOCKED"/.test(sched));
+    check("F4c", "有不改代码就能停发的开关", /autoPublishEnabled/.test(sched) && /AIHOT_AUTO_PUBLISH/.test(sched));
+    /*
+     * 「取消上线」必须扛得住下一次来源变动。
+     * 没有这道判断，源端一改就会重新生成、重新审核、又发出去 ——
+     * 人做过的判断被定时任务无声推翻，而且没有任何痕迹。
+     */
+    check("F4d", "人工撤下过的内容不会被自动链路重新发布",
+      /status: "WITHDRAWN"/.test(sched) && /SKIPPED_WITHDRAWN/.test(sched));
     check("F5", "调度器不碰 event clustering", !/eventClustering|clusterCandidate|EventSimilarity/i.test(sched));
     check("F6", "调度器不创建 AIEvent", !/aiEvent/i.test(sched));
-    check("F7", "调度器每轮核对发布记录数",
-      /publicationsBefore/.test(sched) && /AUTO_PUBLICATION_DETECTED/.test(sched));
+    check("F7", "调度器每轮与「有意发布数」对账",
+      /publicationsBefore/.test(sched) && /UNEXPECTED_PUBLICATION/.test(sched)
+      && /publicationsCreated !== out\.publicationsIntended/.test(sched));
   }
 
   // ────────────────────────────────────────────────────────────────────────
@@ -696,8 +731,9 @@ async function main() {
   section("八、编辑队列：栏目、对照、授权");
 
   {
-    check("H1", "八个内容栏目齐全",
-      ["NEEDS_REVIEW", "QA_FAILED", "APPROVED", "PUBLISHED", "REJECTED", "SELECTED", "HOT_TOPICS", "DAILY"]
+    check("H1", "十个内容栏目齐全（含待复核与已撤下）",
+      ["AWAITING_HUMAN", "NEEDS_REVIEW", "QA_FAILED", "APPROVED", "PUBLISHED", "WITHDRAWN",
+       "REJECTED", "SELECTED", "HOT_TOPICS", "DAILY"]
         .every((t) => (QUEUE_TABS as readonly string[]).includes(t)));
 
     const baseRow = {
@@ -712,8 +748,9 @@ async function main() {
     const loc = (over: Record<string, unknown>) => LOCALES.map((l) => ({
       locale: l, translationId: 1, status: "DRAFTED", currentRevisionId: 1, currentRevisionNumber: 1,
       approvedRevisionId: null, approvedIsCurrent: false, publishedRevisionId: null, publishedPath: null,
+      withdrawnPath: null, withdrawnAt: null, withdrawnBy: null, withdrawnReason: null,
       qaVerdict: "PASSED", qaIssues: [], lastReviewerType: null, lastReviewerId: null, lastReviewerName: null,
-      lastDecision: null, lastReviewedAt: null, lastNotes: null, reviewCount: 0, ...over,
+      lastDecision: null, lastReviewedAt: null, lastNotes: null, reviewCount: 0, humanReviewCount: 0, ...over,
     })) as QueueRow["locales"];
 
     check("H2", "默认落在待审核", tabOf({ ...baseRow, locales: loc({}) }) === "NEEDS_REVIEW");
@@ -723,8 +760,25 @@ async function main() {
       tabOf({ ...baseRow, locales: loc({ status: "REJECTED" }) }) === "REJECTED");
     check("H5", "四语言都批准当前版本才算已批准",
       tabOf({ ...baseRow, locales: loc({ approvedIsCurrent: true }) }) === "APPROVED");
-    check("H6", "四语言都发布才算已发布",
-      tabOf({ ...baseRow, publishedCount: 4, locales: loc({ approvedIsCurrent: true, publishedPath: "/en/x" }) }) === "PUBLISHED");
+    /*
+     * 已发布分两栏：有没有**人**看过。
+     * 自动审核会给每一版盖 AGENT 的章，如果不分主体，
+     * 「还剩多少没人看过」这个数永远是 0 —— 那正是新流程下唯一要紧的数字。
+     */
+    check("H6", "已发布但只有 AI 审过 → 待复核",
+      tabOf({ ...baseRow, publishedCount: 4,
+        locales: loc({ approvedIsCurrent: true, publishedPath: "/en/x", reviewCount: 1, humanReviewCount: 0 }) }) === "AWAITING_HUMAN");
+    check("H6b", "有人工复核记录才算已复核",
+      tabOf({ ...baseRow, publishedCount: 4,
+        locales: loc({ approvedIsCurrent: true, publishedPath: "/en/x", reviewCount: 2, humanReviewCount: 1 }) }) === "PUBLISHED");
+    /*
+     * 撤下会把译本状态一并打成 REJECTED（为了让 preflight 挡住重发），
+     * 所以判定顺序必须让 WITHDRAWN 走在 REJECTED 前面 ——
+     * 否则「发出去过又撤回来」会和「从没发出去过」混成一栏。
+     */
+    check("H6c", "撤下优先于被拒",
+      tabOf({ ...baseRow, publishedCount: 0,
+        locales: loc({ status: "REJECTED", withdrawnPath: "/en/x", withdrawnAt: new Date() }) }) === "WITHDRAWN");
   }
 
   {
@@ -774,10 +828,11 @@ async function main() {
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  section("九、不自动发布 / 草稿隐私");
+  section("九、发布边界 / 草稿隐私");
 
   {
     const publicationsNow = await prisma.articlePublication.count();
+    // 测试自己不许发布：这套用例全程走 dry-run 与注入桩，一条都不该落到公开页
     check("I1", "整套测试期间发布记录未变",
       publicationsNow === publicationsAtStart, `${publicationsAtStart} → ${publicationsNow}`);
 
@@ -828,7 +883,87 @@ async function main() {
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  section("十一、收尾：没有留下任何越权写入");
+  section("十一、自动审核：只能否决，不能放行");
+
+  {
+    const gate = readFileSync("src/lib/content/publishing/auto-review.ts", "utf8");
+    const code = codeOnly(gate);
+
+    check("L1", "自动审核身份恒为 AGENT",
+      /type: "AGENT"/.test(code) && !/type: "HUMAN"/.test(code));
+    check("L2", "十项清单逐项都有判定",
+      REVIEW_CHECKLIST.every((c) => new RegExp(`fail\\("${c.key}"`).test(code)));
+    /*
+     * 方向性断言 —— 这一条是整套自动审核里最要紧的：
+     * 模型只能把「过」改成「不过」，反向那条路必须**根本不存在**。
+     * 一旦有人写了「模型说没问题就放行」，这道闸门就名存实亡了。
+     */
+    check("L3", "模型否决只会把结论改成不通过",
+      /llm\.verdict === "BLOCK"/.test(code) && /g\.checklist\[key\] = false/.test(code)
+      && !/checklist\[[^\]]+\] = true/.test(code));
+    check("L4", "确定性闸门已拦下时不再花钱找模型", /gateAllPassed/.test(code));
+    check("L5", "模型不可用时不阻断，但也不因此放行不合格内容",
+      /verdict: "UNAVAILABLE"/.test(code) && /确定性闸门此刻仍然全程有效/.test(gate));
+    check("L6", "复用生成侧的忠实度 QA，不另写一份比对",
+      /checkMasterFaithfulness/.test(code) && /checkTranslationDrift/.test(code));
+    check("L7", "审核对的是此刻重新装配的来源",
+      /assembleSelected/.test(code) && /sourceUnchanged/.test(code));
+    check("L8", "有失败项即不批准", /g\.failures\.length \? "NEEDS_REVISION" : "APPROVED"/.test(code));
+    check("L9", "四种语言全过才算整族通过",
+      /out\.every\(\(o\) => o\.decision === "APPROVED"\)/.test(code));
+  }
+
+  {
+    // recordReview 那一层的硬约束仍在：自动审核也绕不过去
+    const t = await prisma.articleTranslation.findFirst({
+      where: { current_revision_id: { not: null } },
+      select: { id: true, current_revision_id: true },
+    });
+    if (t?.current_revision_id) {
+      const partial = Object.fromEntries(REVIEW_CHECKLIST.map((c, i) => [c.key, i === 0]));
+      const r = await recordReview({
+        translationId: t.id, revisionId: t.current_revision_id,
+        reviewer: { type: "AGENT", id: "agent:test-probe" },
+        decision: "APPROVED", checklist: partial as never, issueCategories: [],
+      });
+      check("L10", "AGENT 同样不能十项没过就批准", r.ok === false);
+      const r2 = await recordReview({
+        translationId: t.id, revisionId: t.current_revision_id,
+        reviewer: { type: "AGENT", id: "agent:test-probe" },
+        decision: "APPROVED", checklist: ALL_CHECKS_PASS, issueCategories: ["TRUE_FACT_DRIFT"],
+      });
+      check("L11", "AGENT 同样不能带着实质问题批准", r2.ok === false);
+    } else {
+      check("L10", "AGENT 同样不能十项没过就批准", false, "库里没有可用于探针的译本");
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  section("十二、取消上线：人工复核的实权");
+
+  {
+    const w = readFileSync("src/lib/content/publishing/withdraw.ts", "utf8");
+    const code = codeOnly(w);
+    check("M1", "撤下以 family 为单位，没有单语言入口",
+      /family_id: family\.id/.test(code) && !/locale: input\.locale/.test(code));
+    check("M2", "撤下不删记录，只改状态并留时间",
+      /status: "WITHDRAWN"/.test(code) && /unpublished_at/.test(code)
+      && !/articlePublication\.delete/.test(code));
+    check("M3", "撤下必须留名留因",
+      /withdrawn_by/.test(code) && /withdrawn_reason/.test(code) && /必须填写撤下理由/.test(code));
+    check("M4", "撤下会清掉批准指针，挡住自动重发", /approved_revision_id: null/.test(code));
+    check("M5", "先下线再补记录", /先下线，后补记录/.test(w));
+
+    const route = readFileSync("src/app/api/admin/content/aihot/family/[id]/unpublish/route.ts", "utf8");
+    check("M6", "撤下路由由服务端定身份类型", /type: "HUMAN"/.test(route) && !/body\.reviewerType/.test(route));
+    check("M7", "撤下路由要求管理员", /requireAdmin/.test(route));
+
+    const q = readFileSync("src/lib/content/publishing/query.ts", "utf8");
+    check("M8", "公开页只认 PUBLISHED，撤下即 404", /pub\.status !== "PUBLISHED"/.test(q));
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  section("十三、收尾：没有留下任何越权写入");
 
   await cleanupRuns();
 

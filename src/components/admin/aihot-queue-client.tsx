@@ -14,6 +14,10 @@ import { REVIEW_CHECKLIST } from "@/lib/content/publishing/types";
  *
  * **不提供任何编辑 AI HOT 原始输入的入口** —— 来源区块全是只读的。
  * 内容要改只能重新生成，那会造出新 revision 并作废旧的批准。
+ *
+ * 流程已改为「AI 自动审核并发布，人工事后复核」，所以这一页的重心变了：
+ * 以前是「批准它才能上线」，现在是「它已经上线了，看看该不该留着」。
+ * 默认栏目因此是**已发布·待复核**，主按钮是**取消上线**。
  */
 
 const LOCALE_LABEL: Record<string, string> = {
@@ -95,7 +99,8 @@ export function AihotQueueClient({
     <div className="mx-auto w-full max-w-[1400px] px-4 py-8">
       <h1 className="text-2xl font-semibold">AI HOT 编辑审核队列</h1>
       <p className="mt-2 rounded-md border border-amber-400/60 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-        Internal source metadata — not displayed publicly · 自动发布未启用，发布只能在本页手工触发
+        Internal source metadata — not displayed publicly ·
+        自动审核通过即上线，本页用于事后复核；复核不通过请用「取消上线」
       </p>
 
       <div className="mt-3 rounded-md border border-border/70 p-3 text-sm">
@@ -185,13 +190,29 @@ export function AihotQueueClient({
                 <td className="py-2 pr-3 text-xs">
                   {r.qaIssueCount ? <span className="text-red-600">{r.qaIssueCount} 项</span> : "通过"}
                 </td>
+                {/*
+                  * 人审与机审分开显示。
+                  * 自动审核会给每一版都盖 AGENT 的章，只显示一个「4/4 已审」
+                  * 会让整页看起来全都审过了 —— 而实际上一个人都还没看。
+                  */}
                 <td className="py-2 pr-3 text-xs">
-                  {r.locales.filter((l) => l.reviewCount > 0).length}/4
-                  {r.locales[0]?.lastReviewerType ? (
-                    <div className="text-muted-foreground">{r.locales[0].lastReviewerType}</div>
-                  ) : null}
+                  {r.locales.some((l) => l.humanReviewCount > 0) ? (
+                    <span className="text-emerald-700 dark:text-emerald-400">
+                      人工 {r.locales.filter((l) => l.humanReviewCount > 0).length}/4
+                    </span>
+                  ) : r.locales.some((l) => l.reviewCount > 0) ? (
+                    <span className="text-amber-700 dark:text-amber-400">仅 AI 审核</span>
+                  ) : (
+                    <span className="text-muted-foreground">未审</span>
+                  )}
                 </td>
-                <td className="py-2 pr-3 text-xs">{r.publishedCount}/4</td>
+                <td className="py-2 pr-3 text-xs">
+                  {r.locales.some((l) => l.withdrawnPath) ? (
+                    <span className="text-red-600" title={r.locales.find((l) => l.withdrawnReason)?.withdrawnReason ?? ""}>
+                      已撤下
+                    </span>
+                  ) : `${r.publishedCount}/4`}
+                </td>
                 <td className="py-2 pr-3">
                   <button
                     onClick={() => (openId === r.familyId ? setOpenId(null) : void openDetail(r.familyId))}
@@ -228,6 +249,7 @@ function FamilyPanel({
   const [notes, setNotes] = useState("");
   const [checks, setChecks] = useState<Record<string, boolean>>({});
   const [categories, setCategories] = useState<string[]>([]);
+  const [withdrawReason, setWithdrawReason] = useState("");
 
   if (!detail) {
     return <div className="mt-6 rounded-md border border-border/70 p-4 text-sm text-muted-foreground">加载详情…</div>;
@@ -235,6 +257,8 @@ function FamilyPanel({
 
   const { row, source, contents, comparison } = detail;
   const allApproved = row.locales.every((l) => l.approvedIsCurrent);
+  const isLive = row.locales.some((l) => l.publishedPath);
+  const withdrawn = row.locales.filter((l) => l.withdrawnPath);
 
   function review(locale: string, decision: "APPROVED" | "REJECTED" | "NEEDS_REVISION") {
     onAct("review", {
@@ -432,6 +456,14 @@ function FamilyPanel({
 
       {/* ── family 级动作 ── */}
       <section className="mt-5 flex flex-wrap items-center gap-2">
+        <button disabled={busy} onClick={() => onAct("auto-review", { dryRun: true, publish: false })}
+          className="rounded border border-border/70 px-3 py-1.5 text-sm disabled:opacity-50">
+          试跑自动审核（只看结论，不留记录）
+        </button>
+        <button disabled={busy} onClick={() => onAct("auto-review")}
+          className="rounded border border-blue-500/60 px-3 py-1.5 text-sm text-blue-700 disabled:opacity-50 dark:text-blue-400">
+          自动审核并发布
+        </button>
         <button disabled={busy} onClick={() => onAct("regenerate")}
           className="rounded border border-border/70 px-3 py-1.5 text-sm disabled:opacity-50">
           重新生成（造新 revision）
@@ -445,9 +477,58 @@ function FamilyPanel({
           手工发布已批准 revision
         </button>
         {!allApproved ? (
-          <span className="text-xs text-muted-foreground">四种语言全部批准当前版本后才能发布</span>
+          <span className="text-xs text-muted-foreground">四种语言全部批准当前版本后才能手工发布</span>
         ) : null}
       </section>
+
+      {/* ── 人工复核不通过：取消上线 ── */}
+      {isLive ? (
+        <section className="mt-4 rounded border border-red-400/60 bg-red-50/60 p-3 dark:bg-red-950/20">
+          <h3 className="text-sm font-semibold text-red-700 dark:text-red-400">复核不通过 → 取消上线</h3>
+          <p className="mt-1 text-xs text-muted-foreground">
+            四种语言**一起**撤下 —— 只撤一种，剩下三种的语言互链就会指向 404。
+            发布记录保留（状态转为 WITHDRAWN），不删除；撤下后需重新生成或重新批准才能再上线。
+          </p>
+          <div className="mt-2 flex flex-wrap items-end gap-2">
+            <label className="text-xs">
+              撤下理由（必填）
+              <input
+                value={withdrawReason}
+                onChange={(e) => setWithdrawReason(e.target.value)}
+                placeholder="例如：正文里的参数信源没有提到"
+                className="mt-1 w-[360px] max-w-full rounded border border-border/70 bg-transparent px-2 py-1 text-sm"
+              />
+            </label>
+            <button
+              disabled={busy || !reviewerName.trim() || !withdrawReason.trim()}
+              onClick={() => onAct("unpublish", {
+                reviewerName, reason: withdrawReason,
+                issueCategories: categories.filter((c) => c !== "NO_ISSUE"),
+              })}
+              className="rounded border border-red-500/70 px-3 py-1.5 text-sm text-red-700 disabled:opacity-50 dark:text-red-400"
+            >
+              取消上线
+            </button>
+            {!reviewerName.trim() ? (
+              <span className="text-xs text-muted-foreground">先在上面填写复核人姓名</span>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+
+      {/* ── 已撤下的痕迹 ── */}
+      {withdrawn.length ? (
+        <section className="mt-4 rounded border border-border/70 p-3 text-xs">
+          <h3 className="text-sm font-semibold">已撤下</h3>
+          {withdrawn.map((l) => (
+            <div key={l.locale} className="mt-1">
+              <span className="text-muted-foreground">{LOCALE_LABEL[l.locale]}</span>{" "}
+              {l.withdrawnPath} · {l.withdrawnAt ? String(l.withdrawnAt).slice(0, 16) : "?"} ·{" "}
+              {l.withdrawnBy ?? "?"}：{l.withdrawnReason ?? ""}
+            </div>
+          ))}
+        </section>
+      ) : null}
     </div>
   );
 }

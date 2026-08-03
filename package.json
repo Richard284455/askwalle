@@ -47,7 +47,8 @@
     "aihot:schedule": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-schedule.ts",
     "aihot:backfill": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-backfill.ts",
     "aihot:ops": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-ops-canary.ts",
-    "test:scheduled": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/scheduled-ops-tests.ts"
+    "test:scheduled": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/scheduled-ops-tests.ts",
+    "aihot:auto": "ts-node --project tsconfig.script.json -r tsconfig-paths/register scripts/aihot-auto-review.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

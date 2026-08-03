@@ -6,15 +6,15 @@ import { AjaxResponse } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 
-// GET /api/admin/content/aihot/queue?tab=NEEDS_REVIEW — 编辑审核队列
+// GET /api/admin/content/aihot/queue?tab=AWAITING_HUMAN — 编辑审核队列
 export async function GET(request: Request) {
   const unauthorized = await requireAdmin();
   if (unauthorized) return unauthorized;
 
   try {
     const url = new URL(request.url);
-    const raw = url.searchParams.get("tab") ?? "NEEDS_REVIEW";
-    const tab = (QUEUE_TABS as readonly string[]).includes(raw) ? (raw as QueueTab) : "NEEDS_REVIEW";
+    const raw = url.searchParams.get("tab") ?? "AWAITING_HUMAN";
+    const tab = (QUEUE_TABS as readonly string[]).includes(raw) ? (raw as QueueTab) : "AWAITING_HUMAN";
     // 一次读取同时得出行与计数：并发两路深层查询会打满共享连接池
     return NextResponse.json(AjaxResponse.ok(await loadQueue({ tab })));
   } catch (error) {

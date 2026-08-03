@@ -234,7 +234,12 @@ export function parseDraft(raw: string): ParsedDraft | null {
   return { headline, summary, body, sections };
 }
 
-async function callProvider(
+/**
+ * 一次 provider 调用。**导出**给自动审核复用 ——
+ * 审核与生成必须走同一条通道：同一份服务商配置、同一个超时、
+ * 同一种「不回显 payload」的错误处理。各写一份迟早会有一份漏掉其中一条。
+ */
+export async function callProvider(
   providerKey: ProviderKey, model: string | undefined, prompt: string
 ): Promise<{ ok: true; content: string; model: string } | { ok: false; message: string }> {
   const runtime = await resolveProviderRuntime(providerKey, model);

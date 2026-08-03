@@ -36,7 +36,9 @@ export const aihotJobs: Record<AihotTaskType, CronJob> = Object.fromEntries(
           console.log(
             `[aihot-cron] ${taskType} ${r.status} ${r.durationMs}ms ` +
             `取${r.fetched} 新${r.created} 复用${r.reused} 304=${r.notModified} ` +
-            `provider=${r.providerCalls} 新版本${r.revisionsCreated} 入队${r.queuedForReview}` +
+            `provider=${r.providerCalls} 新版本${r.revisionsCreated} ` +
+            `自动审核${r.autoReviewed}(过${r.autoApproved}/拦${r.autoBlocked}/模型否决${r.llmVetoed}) ` +
+            `发布${r.publicationsCreated}` +
             (r.errorCode ? ` [${r.errorCode}] ${r.message ?? ""}` : "")
           );
         } catch (e) {

@@ -156,7 +156,13 @@ async function main() {
     humanReviews: await prisma.translationReview.count({ where: { reviewer_type: "HUMAN" } }),
     agentReviews: await prisma.translationReview.count({ where: { reviewer_type: "AGENT" } }),
     manualPublications: publications,
+    // 自动审核
+    autoReviewed: sum(runs, "auto_reviewed"),
+    autoApproved: sum(runs, "auto_approved"),
+    autoBlocked: sum(runs, "auto_blocked"),
+    llmVetoed: sum(runs, "llm_vetoed"),
     autoPublications: sum(runs, "publications_created"),
+    autoPublicationsIntended: sum(runs, "publications_intended"),
     perLocaleFailure,
   };
 
@@ -173,9 +179,59 @@ async function main() {
 
   console.log("\n二、硬停止条件");
 
-  gate("自动发布 = 0", metrics.autoPublications === 0, `定时任务期间发布记录变化 ${metrics.autoPublications}`);
-  const autoPublishRuns = runs.filter((r) => r.error_code === "AUTO_PUBLICATION_DETECTED");
-  gate("无 AUTO_PUBLICATION_DETECTED 运行", autoPublishRuns.length === 0, `${autoPublishRuns.length} 轮`);
+  /*
+   * 「定时任务一律不得发布」这条硬停止已经作废 —— 产品决定改成
+   * 「自动审核通过即发布」。但它没有被删掉，只是换了口径：
+   *
+   *   发布记录的增量 **必须等于** 本轮有意发布的条数。
+   *
+   * 多出来的那些不是「自动发布」，是**绕过审核**的发布 —— 那才是真正
+   * 要停机的事。把这条整个删掉，等于以后再也没人看着这条边界。
+   */
+  /*
+   * **逐轮对账，不按天求和。**
+   *
+   * 求和会把「某一轮多发了 4 条」和「另一轮少发了 4 条」抵消掉，
+   * 而这两件事都得有人看。逐轮比对还能直接指出是哪一轮出的问题。
+   *
+   * 跳过带着已废弃错误码的行：那些是改契约之前写下的运行记录，
+   * 当时根本没有 publications_intended 这个概念（列默认 0）。
+   * 拿新规矩去判旧记录，只会得到一条永远红、也永远修不好的告警 ——
+   * 而一条修不好的告警，用不了几天就没人看了。
+   */
+  const RETIRED_CODE = "AUTO_PUBLICATION_DETECTED";
+  const legacyRuns = runs.filter((r) => r.error_code === RETIRED_CODE);
+  const mismatched = runs
+    .filter((r) => r.error_code !== RETIRED_CODE)
+    .filter((r) => r.publications_created !== r.publications_intended);
+  gate("每一轮的发布数都等于有意发布数", mismatched.length === 0,
+    mismatched.slice(0, 3).map((r) => `#${r.id} ${r.task_type} 发布${r.publications_created}/有意${r.publications_intended}`).join("；")
+      || `${runs.length - legacyRuns.length} 轮全部对账一致`);
+  if (legacyRuns.length) {
+    console.log(`  ℹ 跳过 ${legacyRuns.length} 轮改契约之前的旧记录（错误码 ${RETIRED_CODE} 已废弃）`);
+  }
+  const strayRuns = runs.filter((r) => r.error_code === "UNEXPECTED_PUBLICATION");
+  gate("无 UNEXPECTED_PUBLICATION 运行", strayRuns.length === 0, `${strayRuns.length} 轮`);
+
+  /*
+   * 发布出去的必须真的被审过。
+   *
+   * 自动审核之后这条比以前更要紧：以前发布要人点按钮，天然有人经手；
+   * 现在没有任何人参与，「有没有审核记录」是唯一还能事后验证的东西。
+   */
+  const publishedNoReview = families.flatMap((f) => f.translations)
+    .filter((t) => t.publications.some((p) => p.status === "PUBLISHED") && t.reviews.length === 0);
+  gate("已发布内容均有审核记录", publishedNoReview.length === 0, `${publishedNoReview.length} 条缺审核`);
+
+  /*
+   * 闸门必须真的在拦东西。
+   *
+   * 这不是硬停止 —— 某一天确实可能一条都不用拦。但**长期**为 0
+   * 和闸门坏掉在指标上长得一模一样，所以要打出来让人看见。
+   */
+  if (metrics.autoReviewed > 0 && metrics.autoBlocked === 0) {
+    console.log(`  ⚠ 今日自动审核 ${metrics.autoReviewed} 次、拦下 0 次 —— 留意闸门是否失效`);
+  }
 
   /*
    * 「相同输入重复调用 provider」的可测形式：

@@ -1643,6 +1643,13 @@ enum PublishStatus {
   /// 被更新的 revision 取代；历史保留，不删
   SUPERSEDED
   PUBLICATION_FAILED
+  /// 曾经公开过，被人工复核撤下。
+  ///
+  /// 与 REJECTED 分开是刻意的：REJECTED 是「从没发出去过」，
+  /// WITHDRAWN 是「发出去过、外面可能已经有人看过、已被撤回」。
+  /// 事后要回答「这个页面对外存在过多久」，混成一个状态就答不了。
+  /// 记录本身不删 —— 撤下不等于抹掉发生过的事。
+  WITHDRAWN
 }
 
 enum ReviewDecision {
@@ -1892,8 +1899,25 @@ model AihotTaskRun {
   revisions_created Int @default(0)
   queued_for_review Int @default(0)
 
-  /// 定时任务期间新增的发布数。**必须恒为 0** —— 非 0 即硬停止
+  // ── 自动审核 ──
+  /// 走完自动审核的 family 数
+  auto_reviewed Int @default(0)
+  /// 自动审核判通过（四种语言全过）的 family 数
+  auto_approved Int @default(0)
+  /// 自动审核拦下的 family 数 —— 这个数字长期为 0 才该警惕：
+  /// 说明闸门什么都没拦住，多半是它坏了，而不是稿子都完美
+  auto_blocked  Int @default(0)
+  /// 模型复看行使否决权的次数
+  llm_vetoed    Int @default(0)
+
+  /// 本轮新增的发布数。
+  ///
+  /// 语义已变：内容策略改为「自动审核后自动发布」，这里不再恒为 0。
+  /// 但它仍然是硬对账口径 —— 必须等于本轮**有意**发布的条数，
+  /// 对不上就是有别的路径在写发布记录，照样硬失败
   publications_created Int @default(0)
+  /// 本轮有意发布的条数。与 publications_created 对账用
+  publications_intended Int @default(0)
 
   /// 抢租约失败
   lease_conflict Boolean @default(false)
@@ -1931,6 +1955,12 @@ model ArticlePublication {
   published_at   DateTime      @default(now())
   unpublished_at DateTime?
   failure_reason String?
+
+  /// 撤下的执行人与理由。**人工复核撤下必须留名留因** ——
+  /// 自动审核会放行内容，那么把它撤回来的那个判断就是唯一的人类痕迹，
+  /// 不记下来，事后没人能说清这页为什么消失了
+  withdrawn_by     String?
+  withdrawn_reason String?
 
   created_at DateTime @default(now())
   updated_at DateTime @updatedAt

@@ -21,15 +21,24 @@ import { LOCALES, publicPath } from "./types";
  * 唯独不能改信源给的字段：那等于一边引用别人，一边替别人改口。
  */
 
+/**
+ * 栏目。
+ *
+ * 内容策略改成「AI 自动审核并发布，人工事后复核」之后，最要紧的一栏
+ * 不再是「待审核」，而是 **AWAITING_HUMAN：已经公开、但还没有任何人看过**。
+ * 那才是这套流程里唯一会持续堆积、且真的需要人去看的东西。
+ * 把它和「人工已复核过的已发布」混在一栏，就等于看不出还剩多少没人看。
+ */
 export const QUEUE_TABS = [
-  "NEEDS_REVIEW", "QA_FAILED", "APPROVED", "PUBLISHED", "REJECTED",
+  "AWAITING_HUMAN", "NEEDS_REVIEW", "QA_FAILED", "APPROVED", "PUBLISHED",
+  "WITHDRAWN", "REJECTED",
   "SELECTED", "HOT_TOPICS", "DAILY", "ALL",
 ] as const;
 export type QueueTab = (typeof QUEUE_TABS)[number];
 
 export const TAB_LABEL: Record<QueueTab, string> = {
-  NEEDS_REVIEW: "待审核", QA_FAILED: "QA 未过", APPROVED: "已批准",
-  PUBLISHED: "已发布", REJECTED: "已拒绝",
+  AWAITING_HUMAN: "已发布·待复核", NEEDS_REVIEW: "待发布", QA_FAILED: "QA 未过",
+  APPROVED: "已批准", PUBLISHED: "已复核", WITHDRAWN: "已撤下", REJECTED: "已拒绝",
   SELECTED: "精选", HOT_TOPICS: "热点", DAILY: "日报", ALL: "全部",
 };
 
@@ -43,6 +52,11 @@ export type LocaleState = {
   approvedIsCurrent: boolean;
   publishedRevisionId: number | null;
   publishedPath: string | null;
+  /** 曾经公开、已被人工撤下的那一条 */
+  withdrawnPath: string | null;
+  withdrawnAt: Date | null;
+  withdrawnBy: string | null;
+  withdrawnReason: string | null;
   qaVerdict: string | null;
   qaIssues: { code: string; detail: string }[];
   lastReviewerType: ReviewerType | null;
@@ -52,6 +66,13 @@ export type LocaleState = {
   lastReviewedAt: Date | null;
   lastNotes: string | null;
   reviewCount: number;
+  /**
+   * 有没有**人**看过这一版。
+   *
+   * 只算 HUMAN 的审核记录，而且只算落在当前版本上的：自动审核会给每一版
+   * 都盖一个 AGENT 的章，把它算进来，「还有多少没人看过」就永远是 0。
+   */
+  humanReviewCount: number;
 };
 
 export type QueueRow = {
@@ -92,11 +113,22 @@ function parseIssues(raw: unknown): { code: string; detail: string }[] {
   }));
 }
 
-/** 队列行的分类：一个 family 只落在一个「状态」栏目里，按最坏情况取 */
+/**
+ * 队列行的分类：一个 family 只落在一个「状态」栏目里，按最坏情况取。
+ *
+ * 顺序有讲究。撤下之后译本状态也会被打成 REJECTED（那是刻意的，
+ * 为了让 preflight 挡住重发），所以 WITHDRAWN 必须**先于** REJECTED 判 ——
+ * 反过来的话，撤下的内容会全部落进「已拒绝」，
+ * 而「发出去过又撤回来」和「从没发出去过」是两件不同的事。
+ */
 export function tabOf(row: QueueRow): Exclude<QueueTab, "SELECTED" | "HOT_TOPICS" | "DAILY" | "ALL"> {
+  if (row.locales.some((l) => l.withdrawnPath)) return "WITHDRAWN";
   if (row.locales.some((l) => l.status === "REJECTED")) return "REJECTED";
   if (row.locales.some((l) => l.qaVerdict && l.qaVerdict !== "PASSED")) return "QA_FAILED";
-  if (row.publishedCount === LOCALES.length) return "PUBLISHED";
+  if (row.publishedCount === LOCALES.length) {
+    // 已经公开、但一个人都没看过 —— 这才是新流程下真正需要人处理的一栏
+    return row.locales.some((l) => l.humanReviewCount > 0) ? "PUBLISHED" : "AWAITING_HUMAN";
+  }
   if (row.locales.every((l) => l.status !== "MISSING" && l.approvedIsCurrent)) return "APPROVED";
   return "NEEDS_REVIEW";
 }
@@ -136,15 +168,44 @@ async function loadRows(where: { content_kind?: AihotContentKind; id?: number },
               decision: true, notes: true, reviewed_at: true, issue_categories_json: true,
             },
           },
+          /*
+           * 已发布与已撤下都要拿。
+           *
+           * 以前这里只查 status: PUBLISHED —— 撤下之后那条记录就从视图里
+           * 彻底消失了，队列上只剩一个 REJECTED 的译本，看不出它曾经公开过。
+           * take 4：同一译本可能有多版发布记录，取最近几条足够判出当前状态。
+           */
           publications: {
-            where: { status: "PUBLISHED" }, orderBy: { published_at: "desc" }, take: 1,
-            select: { revision_id: true, path: true },
+            where: { status: { in: ["PUBLISHED", "WITHDRAWN"] } },
+            orderBy: { published_at: "desc" }, take: 4,
+            select: {
+              revision_id: true, path: true, status: true,
+              unpublished_at: true, withdrawn_by: true, withdrawn_reason: true,
+            },
           },
           _count: { select: { reviews: true } },
         },
       },
     },
   });
+
+  /*
+   * 「有没有人看过」单独查一次。
+   *
+   * 塞不进上面那个 include：同一个 relation 不能在一次 include 里既取
+   * 「最近一条」又取「HUMAN 的条数」。而这个数字不能省 ——
+   * 自动审核会给每一版都盖 AGENT 的章，不区分主体的话，
+   * 「还有多少没人看过」永远算出来是 0。
+   */
+  const translationIds = families.flatMap((f) => f.translations.map((t) => t.id));
+  const humanReviews = translationIds.length
+    ? await prisma.translationReview.groupBy({
+        by: ["translation_id"],
+        where: { reviewer_type: "HUMAN", translation_id: { in: translationIds } },
+        _count: { _all: true },
+      })
+    : [];
+  const humanByTranslation = new Map(humanReviews.map((r) => [r.translation_id, r._count._all]));
 
   const snapIds = families.map((f) => f.hot_topic_snapshot_id).filter((x): x is number => x !== null);
   const snaps = snapIds.length
@@ -163,14 +224,18 @@ async function loadRows(where: { content_kind?: AihotContentKind; id?: number },
           currentRevisionId: null, currentRevisionNumber: null,
           approvedRevisionId: null, approvedIsCurrent: false,
           publishedRevisionId: null, publishedPath: null,
+          withdrawnPath: null, withdrawnAt: null, withdrawnBy: null, withdrawnReason: null,
           qaVerdict: null, qaIssues: [],
           lastReviewerType: null, lastReviewerId: null, lastReviewerName: null,
           lastDecision: null, lastReviewedAt: null, lastNotes: null, reviewCount: 0,
+          humanReviewCount: 0,
         };
       }
       const rev = t.revisions[0];
       const review = t.reviews[0];
-      const pub = t.publications[0];
+      const pub = t.publications.find((p) => p.status === "PUBLISHED");
+      // 仍在公开中就不算撤下 —— 撤下之后又重新发出来的，当前状态是「已发布」
+      const gone = pub ? null : t.publications.find((p) => p.status === "WITHDRAWN");
       return {
         locale, translationId: t.id, status: t.status,
         currentRevisionId: t.current_revision_id,
@@ -179,6 +244,10 @@ async function loadRows(where: { content_kind?: AihotContentKind; id?: number },
         approvedIsCurrent: Boolean(t.approved_revision_id && t.approved_revision_id === t.current_revision_id),
         publishedRevisionId: pub?.revision_id ?? null,
         publishedPath: pub?.path ?? null,
+        withdrawnPath: gone?.path ?? null,
+        withdrawnAt: gone?.unpublished_at ?? null,
+        withdrawnBy: gone?.withdrawn_by ?? null,
+        withdrawnReason: gone?.withdrawn_reason ?? null,
         qaVerdict: rev?.qa_verdict ?? null,
         qaIssues: parseIssues(rev?.qa_issues_json),
         lastReviewerType: review?.reviewer_type ?? null,
@@ -188,6 +257,7 @@ async function loadRows(where: { content_kind?: AihotContentKind; id?: number },
         lastReviewedAt: review?.reviewed_at ?? null,
         lastNotes: review?.notes ?? null,
         reviewCount: t._count.reviews,
+        humanReviewCount: humanByTranslation.get(t.id) ?? 0,
       };
     });
 
