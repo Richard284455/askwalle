@@ -4,6 +4,7 @@ import ThemeProvider from "@/components/providers/theme-provider";
 import { StoreProvider } from "@/components/providers/store-provider";
 import { Toaster } from "@/ui/common/sonner";
 import Header from "@/components/header/header";
+import { SiteChrome } from "@/components/layout/site-chrome";
 import Footer from "@/components/footer/index";
 import SWRProvider from "@/components/providers/swr-provider";
 import { Analytics as VercelAnalytics } from "@vercel/analytics/react";
@@ -56,9 +57,10 @@ export default function RootLayout({
           disableTransitionOnChange
         >
           <StoreProvider>
-            <Header />
-            <main className="flex-1">{children}</main>
-            <Footer />
+            {/* 后台与登录页不套前台外壳 —— 后台有自己的常驻导航 */}
+            <SiteChrome header={<Header />} footer={<Footer />}>
+              {children}
+            </SiteChrome>
             <Toaster />
           </StoreProvider>
         </ThemeProvider>

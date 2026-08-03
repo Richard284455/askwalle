@@ -60,7 +60,7 @@ export function NewsroomModelSettings({
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
       <h1 className="text-2xl font-semibold">Newsroom 使用的模型</h1>
       <p className="mt-2 text-sm text-muted-foreground">
-        Trending / AI Updates / Daily Briefing 三个板块在**改写、翻译、撰写摘要**时使用的模型。
+        Trending / AI Updates / Daily Briefing 三个板块在<strong>改写、翻译、撰写摘要</strong>时使用的模型。
         忠实度 QA 不使用模型（数字、日期、型号、实体是确定性比对），换模型不影响它。
       </p>
 
@@ -79,7 +79,7 @@ export function NewsroomModelSettings({
           <div className="mt-1 text-xs text-red-600">
             不可用：{current.unavailableReason}
             <div className="mt-1">
-              生成会**如实失败并留下记录**，不会自动换成别的模型 ——
+              生成会<strong>如实失败并留下记录</strong>，不会自动换成别的模型 ——
               悄悄换掉意味着某天的稿子是另一个模型写的，而审计里看不出痕迹。
             </div>
           </div>
@@ -149,7 +149,7 @@ export function NewsroomModelSettings({
       <div className="mt-8 rounded-md border border-border/70 p-4 text-xs text-muted-foreground">
         <div className="font-medium text-foreground">改了之后会发生什么</div>
         <ul className="mt-2 list-disc space-y-1 pl-5">
-          <li>下一次生成立即使用新模型；**已生成的草稿与已发布内容不受影响**。</li>
+          <li>下一次生成立即使用新模型；<strong>已生成的草稿与已发布内容不受影响</strong>。</li>
           <li>已发布页面要换模型重写，需要在审核台上显式点「重新生成」，那会造出新 revision 并作废旧的批准。</li>
           <li>母版与三种译文始终用同一个模型 —— 两端不一致会让翻译漂移的判定失去基准。</li>
         </ul>
