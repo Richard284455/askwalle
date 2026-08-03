@@ -11,7 +11,15 @@ import {
 interface WebsiteThumbnailProps {
   url: string;
   thumbnail: string | null;
-  thumbnail_base64: string | null;
+  /**
+   * @deprecated 这个组件**从不使用它** —— 下面解构完就再没引用过，
+   * 图片实际走的是 thumbnailCacheMap。留着只是为了不改动一堆调用点。
+   *
+   * **不要为了它去查库。** thumbnail_base64 是 website 表最重的一列
+   * （429 行 3.4MB），后台首页整表取它一次要 112 秒、占满一条连接，
+   * 直接把只有 5 条的连接池拖垮 —— 表现出来是「登录后后台打不开」。
+   */
+  thumbnail_base64?: string | null;
   title: string;
   className?: string;
 }
