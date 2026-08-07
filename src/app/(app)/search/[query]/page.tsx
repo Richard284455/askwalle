@@ -81,7 +81,6 @@ export default async function SearchPage({ params, searchParams }: SearchPagePro
           description: true,
           category_id: true,
           thumbnail: true,
-          thumbnail_base64: true,
           status: true,
           visits: true,
           likes: true,

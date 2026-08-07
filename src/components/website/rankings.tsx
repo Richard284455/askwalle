@@ -86,7 +86,6 @@ function RankingRow({
         <WebsiteThumbnail
           url={website.url}
           thumbnail={website.thumbnail}
-          thumbnail_base64={website.thumbnail_base64}
           title={website.title}
           className="h-9 w-9 shrink-0 rounded-md sm:h-10 sm:w-10"
         />

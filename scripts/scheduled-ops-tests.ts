@@ -552,6 +552,34 @@ async function main() {
     const minIntervalH = Math.min(...ALL_TASKS.map((t) => TASK_SCHEDULE[t].everyMs)) / HOUR;
     check("D9c", "失败冷却长于最短抓取间隔", cooldownH >= minIntervalH,
       `冷却 ${cooldownH}h vs 最短间隔 ${minIntervalH}h`);
+
+    /*
+     * 节奏现在写在两个地方：TASK_SCHEDULE（长驻进程用）与 vercel.json 的
+     * crons（无服务器平台用）。**必须一致。**
+     * 改了一处忘了另一处，线上跑的节奏会和代码里写的悄悄不同 ——
+     * 而那种不一致只有等到内容该更新却没更新时才会被发现。
+     */
+    const vercel = JSON.parse(readFileSync("vercel.json", "utf8")) as
+      { crons?: { path: string; schedule: string }[] };
+    const crons = vercel.crons ?? [];
+    check("D9d", "vercel.json 为每类任务都配了 cron",
+      ALL_TASKS.every((t) => crons.some((c) => c.path.includes(`task=${t}`))),
+      crons.map((c) => c.path).join(" ") || "（没有 crons）");
+    const drift = ALL_TASKS.filter((t) => {
+      const c = crons.find((x) => x.path.includes(`task=${t}`));
+      return !c || c.schedule !== TASK_SCHEDULE[t].cron;
+    });
+    check("D9e", "vercel.json 的节奏与 TASK_SCHEDULE 一致", drift.length === 0,
+      drift.map((t) => `${t}: 代码 ${TASK_SCHEDULE[t].cron} vs vercel ${crons.find((x) => x.path.includes(`task=${t}`))?.schedule ?? "无"}`).join("；"));
+
+    const cronRoute = readFileSync("src/app/api/cron/aihot/route.ts", "utf8");
+    check("D9f", "定时路由必须带 secret 才放行，且没配 secret 时拒绝",
+      /CRON_SECRET/.test(cronRoute) && /if \(!secret\) return false/.test(cronRoute));
+    check("D9g", "定时路由带时间预算，不会被平台拦腰杀掉",
+      /deadlineAt/.test(cronRoute) && /maxDuration/.test(cronRoute));
+    const instr = readFileSync("src/instrumentation.ts", "utf8");
+    check("D9h", "无服务器环境不再注册进程内定时器",
+      /process\.env\.VERCEL/.test(instr));
   }
 
   // ────────────────────────────────────────────────────────────────────────

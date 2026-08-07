@@ -37,7 +37,6 @@ export default async function NewToolsPage() {
           description: true,
           category_id: true,
           thumbnail: true,
-          thumbnail_base64: true,
           status: true,
           visits: true,
           likes: true,

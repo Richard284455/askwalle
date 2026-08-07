@@ -159,7 +159,6 @@ export function WebsiteCard({
             <WebsiteThumbnail
               url={website.url}
               thumbnail={website.thumbnail}
-              thumbnail_base64={website.thumbnail_base64}
               title={website.title}
               className="h-11 w-11 shrink-0 rounded-md"
             />

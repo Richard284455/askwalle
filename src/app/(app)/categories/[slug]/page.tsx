@@ -57,7 +57,6 @@ export default async function CategoryPage({ params }: CategoryPageProps) {
           description: true,
           category_id: true,
           thumbnail: true,
-          thumbnail_base64: true,
           active: true,
           status: true,
           visits: true,
@@ -119,7 +118,6 @@ export default async function CategoryPage({ params }: CategoryPageProps) {
                   <WebsiteThumbnail
                     url={website.url}
                     thumbnail={website.thumbnail}
-                    thumbnail_base64={website.thumbnail_base64}
                     title={website.title}
                     className="h-11 w-11 shrink-0 rounded-md"
                   />

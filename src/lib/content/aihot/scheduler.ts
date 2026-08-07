@@ -145,9 +145,22 @@ export type ScheduledRunOptions = {
    * 环境变量 AIHOT_AUTO_PUBLISH=off 是同一个开关的运维入口。
    */
   autoPublish?: boolean;
+  /**
+   * 本轮的收工时刻（epoch 毫秒）。到点就不再开新单元，已开的做完。
+   *
+   * 无服务器平台会**硬杀**超时的函数：没有这个预算，进程会在某个单元
+   * 做到一半时消失，留下一条永远停在 RUNNING 的审计行和一个白花的
+   * provider 调用。租约 TTL 事后能回收，但那是善后，不是避免。
+   *
+   * 长驻进程里不传即可，不设上限。
+   */
+  deadlineAt?: number;
   leaseTtlMs?: number;
   heartbeatMs?: number;
 };
+
+/** 留给收尾（写审计、放租约）的余量 */
+const DEADLINE_RESERVE_MS = 8_000;
 
 /** 自动发布的运维开关。设成 off/0/false/no 即只生成、不发布 */
 export function autoPublishEnabled(): boolean {
@@ -532,6 +545,15 @@ export async function runScheduledTask(
       if (leaseLost) {
         out.errorCode = "LEASE_LOST";
         out.message = "租约已被接管，本轮提前收尾";
+        break;
+      }
+      /*
+       * 时间预算到了就收工。**不是失败** —— 剩下的单元下一轮接着做，
+       * 候选是按「还没做完」算出来的，本来就会重新选中它们。
+       * 记成 FAILED 会让正常的分批推进看起来像一直在出错。
+       */
+      if (opts.deadlineAt && Date.now() > opts.deadlineAt - DEADLINE_RESERVE_MS) {
+        out.message = `本轮时间预算用尽，已完成 ${out.details.length}/${candidates.length} 个单元，其余留给下一轮`;
         break;
       }
       const g = await generate({ kind: KIND_OF[taskType], id: c.id });

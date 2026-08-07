@@ -168,7 +168,6 @@ export function WebsiteList({
                 <WebsiteThumbnail
                   url={website.url}
                   thumbnail={website.thumbnail}
-                  thumbnail_base64={website.thumbnail_base64}
                   title={website.title}
                   className="w-12 h-12 rounded-lg shrink-0 shadow-sm transition-transform duration-200 group-hover:scale-105"
                 />

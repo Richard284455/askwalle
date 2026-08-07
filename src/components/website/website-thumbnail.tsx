@@ -8,18 +8,22 @@ import {
   thumbnailPlaceholder,
 } from "@/lib/website/thumbnail-cache-map";
 
+/**
+ * 缩略图。
+ *
+ * **没有 thumbnail_base64 这个 prop。**
+ *
+ * 曾经有，但组件从来没用过它：解构完就再没引用，图片一直走
+ * thumbnailCacheMap。代价却是实打实的 —— website 表里那一列
+ * 429 行占 3.4MB（全表的 95%），后台首页整表取一次要 112 秒、
+ * 占满一条连接，把只有 5 条的池拖垮，表现出来是「登录后后台打不开」。
+ *
+ * 所以连同各处查询里的 `thumbnail_base64: true` 一起清掉了。
+ * 以后要用内联 base64，请先想清楚谁来渲染它、以及列表页要不要为它买单。
+ */
 interface WebsiteThumbnailProps {
   url: string;
   thumbnail: string | null;
-  /**
-   * @deprecated 这个组件**从不使用它** —— 下面解构完就再没引用过，
-   * 图片实际走的是 thumbnailCacheMap。留着只是为了不改动一堆调用点。
-   *
-   * **不要为了它去查库。** thumbnail_base64 是 website 表最重的一列
-   * （429 行 3.4MB），后台首页整表取它一次要 112 秒、占满一条连接，
-   * 直接把只有 5 条的连接池拖垮 —— 表现出来是「登录后后台打不开」。
-   */
-  thumbnail_base64?: string | null;
   title: string;
   className?: string;
 }

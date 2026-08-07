@@ -535,7 +535,6 @@ async function ToolDetailPage({ slug }: { slug: string }) {
                 <WebsiteThumbnail
                   url={website.url}
                   thumbnail={website.thumbnail}
-                  thumbnail_base64={website.thumbnail_base64}
                   title={website.title}
                   className="h-20 w-20 shrink-0 rounded-xl border border-border/80 bg-white shadow-sm dark:bg-background"
                 />
@@ -977,7 +976,6 @@ const websiteSelect = {
   description: true,
   category_id: true,
   thumbnail: true,
-  thumbnail_base64: true,
   status: true,
   visits: true,
   likes: true,
