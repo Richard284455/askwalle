@@ -21,10 +21,28 @@ import { schedulerEnabled } from "@/lib/tasks/aihot-cron";
  */
 
 export const dynamic = "force-dynamic";
-/** 与 vercel.json 的 crons 一起决定单次能干多少活。Hobby 计划封顶 60s */
+/**
+ * 函数时长上限。**这是个静态值，构建时就定死了。**
+ *
+ * 平台按计划封顶：Hobby 只有 60 秒，声明再大也没用 —— 到 60 秒照杀。
+ * 所以真正的收工时刻不从这里推算，走 AIHOT_CRON_BUDGET_SECONDS，
+ * 换计划或换平台时改环境变量即可，不必改代码重新部署。
+ */
 export const maxDuration = 300;
 
-/** 单次调用最多推进几个单元。宁可少做几个，也不要被平台拦腰杀掉 */
+/** 实际时间预算（秒）。Hobby 计划请设成 45 左右，别用默认值 */
+function budgetSeconds(): number {
+  const n = Number(process.env.AIHOT_CRON_BUDGET_SECONDS);
+  return Number.isFinite(n) && n > 10 ? n : maxDuration - 20;
+}
+
+/**
+ * 单次调用最多推进几个单元。
+ *
+ * 宁可少做几个也不要被平台拦腰杀掉：真正决定停在哪的是时间预算，
+ * 这个数只是上限。积压不会丢 —— 候选是按「还没做完」算的，
+ * 这一轮没轮到的，下一轮自然还在队里。
+ */
 const UNITS_PER_INVOCATION: Record<AihotTaskType, number> = {
   HOT_TOPICS: 3,
   SELECTED: 3,
@@ -65,8 +83,8 @@ export async function GET(request: Request) {
     );
   }
 
-  // 留出余量：平台在 maxDuration 那一刻硬杀，收尾也需要时间
-  const deadlineAt = Date.now() + (maxDuration - 20) * 1000;
+  // 留出余量：平台到点硬杀，写审计与放租约也需要时间
+  const deadlineAt = Date.now() + budgetSeconds() * 1000;
 
   const r = await runScheduledTask(task, {
     workerId: `vercel-cron-${task.toLowerCase()}-${Date.now().toString(36)}`,
