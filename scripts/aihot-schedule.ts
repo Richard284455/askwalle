@@ -8,10 +8,16 @@
  *   npm run aihot:schedule -- --retry-failed      # 忽略失败冷却，立刻重试卡住的单元
  *   npm run aihot:schedule -- --runs 10           # 只看最近的运行审计，不执行
  *
- * 进程内 cron 之外还留这个入口，是因为多实例部署时常常改用外部调度
- * （K8s CronJob / 平台定时器）。租约保证两边同时来也只有一个能推进。
+ * 进程内 cron 之外还留这个入口，是因为多实例部署时常常改用外部调度。
+ * 租约保证两边同时来也只有一个能推进。
  *
- * **不发布。** 任何一轮跑出发布记录变化都会被记成 AUTO_PUBLICATION_DETECTED。
+ * **线上就是走这条路。** 站点部署在无服务器平台上，那里的函数有硬性时长
+ * 上限（Hobby 60 秒），而实测单个内容单元要 65–245 秒 —— 一个都放不下。
+ * 所以调度交给 GitHub Actions（见 .github/workflows/aihot-schedule.yml），
+ * 由它按节奏跑这个脚本；平台那边只服务页面。
+ *
+ * 会发布：自动审核判过之后就上线。发布数与「有意发布数」逐轮对账，
+ * 对不上记 UNEXPECTED_PUBLICATION。
  */
 import type { AihotTaskType } from "@prisma/client";
 
@@ -25,6 +31,8 @@ const val = (f: string) => { const i = argv.indexOf(f); return i >= 0 ? argv[i +
 
 const TASK_ALIAS: Record<string, AihotTaskType> = {
   selected: "SELECTED", "hot-topics": "HOT_TOPICS", hot: "HOT_TOPICS", daily: "DAILY",
+  // 未筛选流也要能单独触发 —— 它的周期由接口窗口决定，与另外三类不同步
+  "items-all": "ITEMS_ALL", items: "ITEMS_ALL", all: "ITEMS_ALL",
 };
 
 function parseTasks(): AihotTaskType[] {

@@ -554,29 +554,60 @@ async function main() {
       `冷却 ${cooldownH}h vs 最短间隔 ${minIntervalH}h`);
 
     /*
-     * 节奏现在写在两个地方：TASK_SCHEDULE（长驻进程用）与 vercel.json 的
-     * crons（无服务器平台用）。**必须一致。**
-     * 改了一处忘了另一处，线上跑的节奏会和代码里写的悄悄不同 ——
-     * 而那种不一致只有等到内容该更新却没更新时才会被发现。
+     * 节奏写在两个地方：TASK_SCHEDULE（Asia/Shanghai）与 GitHub Actions
+     * 的 workflow（**UTC**）。必须一致 —— 改了一处忘了另一处，
+     * 线上跑的节奏会和代码里写的悄悄不同，而那种不一致只有等到内容
+     * 该更新却没更新时才会被发现。
+     *
+     * 不是字符串相等：两边时区不同，要先把北京时间换算成 UTC 再比。
      */
-    const vercel = JSON.parse(readFileSync("vercel.json", "utf8")) as
-      { crons?: { path: string; schedule: string }[] };
-    const crons = vercel.crons ?? [];
-    check("D9d", "vercel.json 为每类任务都配了 cron",
-      ALL_TASKS.every((t) => crons.some((c) => c.path.includes(`task=${t}`))),
-      crons.map((c) => c.path).join(" ") || "（没有 crons）");
+    const wf = readFileSync(".github/workflows/aihot-schedule.yml", "utf8");
+    const wfCrons = [...wf.matchAll(/- cron: "([^"]+)"/g)].map((m) => m[1]);
+
+    /** 把 Asia/Shanghai 的 cron 小时位换算成 UTC（减 8 小时） */
+    const toUtcHours = (hourField: string): number[] => {
+      const shanghai = hourField.startsWith("*/")
+        ? Array.from({ length: 24 / Number(hourField.slice(2)) }, (_, i) => i * Number(hourField.slice(2)))
+        : hourField.split(",").map(Number);
+      return shanghai.map((h) => (h - 8 + 24) % 24).sort((a, b) => a - b);
+    };
+    const parseCron = (c: string) => {
+      const [min, hour] = c.split(/\s+/);
+      return { min, hours: hour.startsWith("*/") || hour.includes(",") || hour !== "*"
+        ? (hour.startsWith("*/")
+            ? Array.from({ length: 24 / Number(hour.slice(2)) }, (_, i) => i * Number(hour.slice(2)))
+            : hour.split(",").map(Number)).sort((a, b) => a - b)
+        : [] };
+    };
+
     const drift = ALL_TASKS.filter((t) => {
-      const c = crons.find((x) => x.path.includes(`task=${t}`));
-      return !c || c.schedule !== TASK_SCHEDULE[t].cron;
+      const want = parseCron(TASK_SCHEDULE[t].cron);
+      const wantUtc = toUtcHours(TASK_SCHEDULE[t].cron.split(/\s+/)[1]);
+      // 找一条分钟位相同、且小时位正好是换算结果的 workflow cron
+      return !wfCrons.some((c) => {
+        const got = parseCron(c);
+        return got.min === want.min && JSON.stringify(got.hours) === JSON.stringify(wantUtc);
+      });
     });
-    check("D9e", "vercel.json 的节奏与 TASK_SCHEDULE 一致", drift.length === 0,
-      drift.map((t) => `${t}: 代码 ${TASK_SCHEDULE[t].cron} vs vercel ${crons.find((x) => x.path.includes(`task=${t}`))?.schedule ?? "无"}`).join("；"));
+    check("D9d", "workflow 为每类任务都配了 cron", wfCrons.length >= ALL_TASKS.length,
+      `${wfCrons.length} 条：${wfCrons.join(" | ")}`);
+    check("D9e", "workflow 的节奏（UTC）与 TASK_SCHEDULE（北京时间）一致", drift.length === 0,
+      drift.map((t) => `${t}: 代码 ${TASK_SCHEDULE[t].cron} 北京时间，workflow 里找不到对应的 UTC 版本`).join("；"));
+
+    /*
+     * Vercel 上**不该**再配 crons：那边是 Hobby 计划，函数 60 秒封顶，
+     * 而实测单个内容单元要 65–245 秒 —— 一个都放不下，配了也只是每次
+     * 白跑一个被杀掉的函数，还会在审计里留下一串没做完的运行。
+     */
+    const vercel = JSON.parse(readFileSync("vercel.json", "utf8")) as { crons?: unknown[] };
+    check("D9d2", "vercel.json 不再承担定时调度", !vercel.crons?.length,
+      vercel.crons?.length ? `仍配着 ${vercel.crons.length} 条` : "已移交 GitHub Actions");
 
     const cronRoute = readFileSync("src/app/api/cron/aihot/route.ts", "utf8");
     check("D9f", "定时路由必须带 secret 才放行，且没配 secret 时拒绝",
       /CRON_SECRET/.test(cronRoute) && /if \(!secret\) return false/.test(cronRoute));
     check("D9g", "定时路由带时间预算，不会被平台拦腰杀掉",
-      /deadlineAt/.test(cronRoute) && /maxDuration/.test(cronRoute));
+      /deadlineAt/.test(cronRoute) && /AIHOT_CRON_BUDGET_SECONDS/.test(cronRoute));
     const instr = readFileSync("src/instrumentation.ts", "utf8");
     check("D9h", "无服务器环境不再注册进程内定时器",
       /process\.env\.VERCEL/.test(instr));

@@ -20,7 +20,7 @@ GitHub 已与 Vercel 项目连接，**推送即部署**：推 `main` 出生产�
 
 | 变量 | 说明 |
 |---|---|
-| `CRON_SECRET` | **定时任务必需**。不配的话 `/api/cron/aihot` 一律 401，Newsroom 完全不更新 |
+| `CRON_SECRET` | 只给 `/api/cron/aihot` 手工触发用；定时调度不走 Vercel（见第三节），所以不配也不影响更新 |
 | `DEEPSEEK_API_KEY` 等 | 改写 / 翻译 / 摘要要用；缺了自动审核会记 `UNAVAILABLE` 但不阻断 |
 | `NEXT_PUBLIC_SITE_ORIGIN` | 站点正式域名。缺了 canonical / hreflang / sitemap 会指向默认值 |
 | `OSS_*` | 备份同步，可选 |
@@ -32,7 +32,7 @@ GitHub 已与 Vercel 项目连接，**推送即部署**：推 `main` 出生产�
 | `AIHOT_SCHEDULER` | 开 | 设 `off` 完全停掉抓取与生成 |
 | `AIHOT_AUTO_PUBLISH` | 开 | 设 `off` 只生成入队、不对外发布 |
 | `AIHOT_MAX_UNITS_SELECTED` 等 | 见代码 | 单轮产能上限 |
-| `AIHOT_CRON_BUDGET_SECONDS` | 280 | **Hobby 计划请设成 45** |
+| `AIHOT_CRON_BUDGET_SECONDS` | 280 | 只影响 `/api/cron/aihot`。Hobby 计划设 45 |
 | `DATABASE_CONNECTION_LIMIT` | 5 | 见下 |
 
 ## 二、连接池：Vercel 上必须换连接串
@@ -50,30 +50,40 @@ GitHub 已与 Vercel 项目连接，**推送即部署**：推 `main` 出生产�
 
 `DIRECT_URL` 仍然用直连（端口 `5432`）—— 迁移不能走 pooler。
 
-## 三、定时任务
+## 三、定时任务跑在 GitHub Actions，不在 Vercel
 
-`vercel.json` 里已经配好四条 cron，节奏与代码里的 `TASK_SCHEDULE` 一致
-（有测试比对二者，改一处忘了另一处会红）。
+**为什么不用 Vercel Cron：** 项目是 Hobby 计划，函数 60 秒硬性封顶，
+而实测生成一个内容单元要 **65–245 秒**（中位数约 76 秒）—— 一个都放不下。
+Hobby 还限制全账号只有 2 条 cron、每天只触发一次。那条路不是慢，是产能为零。
+
+所以 `vercel.json` 里没有 `crons`，调度全在
+`.github/workflows/aihot-schedule.yml`：单个 job 最长 6 小时，跑一整批绰绰有余。
+
+节奏（workflow 里写 UTC，下面是北京时间）：
 
 ```
-HOT_TOPICS  5 */6 * * *     每 6 小时
-SELECTED    25 */12 * * *   每 12 小时
-DAILY       45 7 * * *      每天一次
-ITEMS_ALL   17 */6 * * *    每 6 小时（窗口所限，不能再稀）
+热点      每 6 小时   00/06/12/18 点过 5 分
+未筛选流  每 6 小时   00/06/12/18 点过 17 分
+精选      每 12 小时  00/12 点过 25 分
+日报      每天一次    07:45
 ```
 
-**计划限制要注意：**
+有测试比对 workflow 的 UTC 时间与代码里 `TASK_SCHEDULE` 的北京时间是否等价，
+改一处忘了另一处会红。
 
-- **Hobby**：全账号只能有 2 条 cron，而且每天只触发一次。上面四条跑不起来 ——
-  要么升 Pro，要么把 Newsroom 的调度留在能跑长任务的机器上。
-- **Hobby 的函数上限是 60 秒**，`maxDuration = 300` 声明了也没用。
-  这种情况务必设 `AIHOT_CRON_BUDGET_SECONDS=45`，否则函数会在做到一半时被杀，
-  留下停在 RUNNING 的审计行（租约 TTL 事后会回收，但那是善后）。
+### 要在 GitHub 仓库里配的（Settings → Secrets and variables → Actions）
 
-单次调用只推进 3 个单元，做不完的下一轮接着做 —— 候选是按「还没做完」算的，
-不会丢。但这也意味着：**积压的消化速度由 cron 频率决定**。源端每天新增约
-300 条精选，12 小时一轮 × 3 条 = 每天 6 条。要跟上就得加密频率或调大
-`AIHOT_MAX_UNITS_SELECTED` 并相应加大时间预算。
+**Secrets**：`DATABASE_URL`、`DIRECT_URL`、`DEEPSEEK_API_KEY`、
+`NEXT_PUBLIC_SITE_ORIGIN`（其余按用到的服务商补）。
+
+**Variables**（可选，应急用）：`AIHOT_AUTO_PUBLISH=off` 只生成不发布、
+`AIHOT_SCHEDULER=off` 完全停摆。改完立即生效，不用改代码。
+
+出问题不想等下一个整点：Actions 页面 → 该 workflow → **Run workflow**，
+可以指定只跑某一类、以及本轮最多做几个单元。
+
+`/api/cron/aihot` 这个路由保留着（要带 `CRON_SECRET`），用于手工触发，
+或者将来升级计划后改回平台调度。
 
 ## 四、数据库迁移
 

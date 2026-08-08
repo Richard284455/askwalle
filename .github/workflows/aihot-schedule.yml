@@ -1,0 +1,105 @@
+# AI HOT 内容链路的定时调度。
+#
+# **为什么不在 Vercel 上跑：** 站点部署在 Hobby 计划，函数硬性 60 秒封顶，
+# 而实测生成一个内容单元要 65–245 秒（中位数约 76 秒）—— 一个都放不下。
+# Hobby 还限制全账号只有 2 条 cron、每天只触发一次。
+# 也就是说那条路不是"慢"，是产能为零。
+#
+# Actions 这边单个 job 最长 6 小时，跑一整批绰绰有余。
+# 平台那边只服务页面；/api/cron/aihot 保留着，用于手工触发或将来换计划。
+#
+# 并发安全由数据库租约保证：万一这里和别处同时跑，第二个拿不到租约，
+# 会如实记成 SKIPPED_LOCKED，不会重复消耗 provider。
+
+name: AI HOT 定时内容
+
+on:
+  schedule:
+    # cron 一律是 UTC。下面按 Asia/Shanghai 的目标时间换算（UTC = 北京时间 − 8）
+    # 热点：北京 00/06/12/18 点过 5 分  →  UTC 16/22/04/10
+    - cron: "5 4,10,16,22 * * *"
+    # 未筛选流：北京 00/06/12/18 点过 17 分  →  UTC 16/22/04/10
+    - cron: "17 4,10,16,22 * * *"
+    # 精选：北京 00/12 点过 25 分  →  UTC 16/04
+    - cron: "25 4,16 * * *"
+    # 日报：北京 07:45  →  UTC 23:45（前一天）
+    - cron: "45 23 * * *"
+  # 手工触发：出问题时不用等下一个整点
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "跑哪一类（留空=四类都跑）"
+        required: false
+        type: choice
+        options: ["", "hot-topics", "selected", "daily", "items-all"]
+      max_units:
+        description: "本轮最多生成几个内容单元"
+        required: false
+        default: ""
+
+concurrency:
+  # 同一时刻只允许一条在跑。租约本来也能挡住，但让排队发生在这里更省事：
+  # 拿不到租约的那次只会白启动一个 runner
+  group: aihot-schedule
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    # 单元最慢的一次实测 245 秒，留足余量；Actions 上限是 360 分钟
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      - name: 按触发方式决定跑哪一类
+        id: pick
+        run: |
+          # 定时触发时，github.event.schedule 就是命中的那条 cron 表达式，
+          # 用它区分四类任务 —— 否则四条 schedule 会各跑一遍全部四类
+          case "${{ github.event.schedule }}" in
+            "5 4,10,16,22 * * *")  echo "task=hot-topics" >> "$GITHUB_OUTPUT" ;;
+            "17 4,10,16,22 * * *") echo "task=items-all"  >> "$GITHUB_OUTPUT" ;;
+            "25 4,16 * * *")       echo "task=selected"   >> "$GITHUB_OUTPUT" ;;
+            "45 23 * * *")         echo "task=daily"      >> "$GITHUB_OUTPUT" ;;
+            *)                     echo "task=${{ inputs.task }}" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: 抓取 → 生成 → 自动审核 → 发布
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
+          KIMI_BASE_URL: ${{ secrets.KIMI_BASE_URL }}
+          NEXT_PUBLIC_SITE_ORIGIN: ${{ secrets.NEXT_PUBLIC_SITE_ORIGIN }}
+          # runner 是独占的短命进程，但库那头的额度是共享的，别开太多
+          DATABASE_CONNECTION_LIMIT: "3"
+          # 应急开关：仓库变量设成 off 就只生成不发布，改完不用动代码
+          AIHOT_AUTO_PUBLISH: ${{ vars.AIHOT_AUTO_PUBLISH }}
+          AIHOT_SCHEDULER: ${{ vars.AIHOT_SCHEDULER }}
+        run: |
+          ARGS=""
+          [ -n "${{ steps.pick.outputs.task }}" ] && ARGS="$ARGS --task ${{ steps.pick.outputs.task }}"
+          [ -n "${{ inputs.max_units }}" ] && ARGS="$ARGS --max-units ${{ inputs.max_units }}"
+          echo "运行：npm run aihot:schedule -- $ARGS"
+          npm run aihot:schedule -- $ARGS
+
+      - name: 核对受保护状态未被改动
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DIRECT_URL: ${{ secrets.DIRECT_URL }}
+          DATABASE_CONNECTION_LIMIT: "3"
+        # 每轮跑完都验一遍：event clustering / AIEvent / 已发布页面这些
+        # 不该被这条链路碰的东西，有没有被碰过
+        run: npm run aihot:verify
